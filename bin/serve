@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Run a throwaway local forklift-server over a dev warehouse (.dev/server,
+# gitignored) so you can test lift / lower / franchise against a real remote.
+#
+# usage: serve [addr]     (default 127.0.0.1:9418)
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+addr=${1:-127.0.0.1:9418}
+root=".dev/server"
+
+echo "── building forklift-server"
+cargo build --quiet -p forklift-server
+
+mkdir -p "$root"
+# Idempotent: prepare only creates what is missing, so the warehouse persists.
+./target/debug/forklift-server prepare --root "$root" >/dev/null 2>&1 || true
+
+echo "serving \"$root\" at http://$addr"
+echo "  point a warehouse at it:  forklift config remote.url http://$addr"
+echo "  (Ctrl-C to stop; the warehouse persists under .dev/ between runs)"
+exec ./target/debug/forklift-server serve --root "$root" --addr "$addr"

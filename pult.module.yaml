@@ -1,0 +1,16 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/lonic-software/pult/v0.2.1/pult.schema.json
+# pult module — run it without cloning:  pult x github.com/lonic-software/forklift install
+# authoring guide: https://github.com/lonic-software/pult/blob/v0.2.1/docs/authoring.md
+version: 1
+name: forklift
+description: Install the forklift VCS from the latest release (CLI, server, or both).
+
+commands:
+  - id: install
+    title: Install forklift from the latest release
+    params:
+      # cli = the forklift CLI (default) · server = the forklift-server head · all = both
+      component: { pick: { options: [cli, server, all] } }
+    # One entry point; bin/install picks install.sh (POSIX) or, on Windows,
+    # install.ps1 (native install location + persistent PATH). See bin/install.
+    run: "${module.dir}/bin/install {component}"

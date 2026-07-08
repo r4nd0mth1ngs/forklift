@@ -1,0 +1,9 @@
+# Keep the build context small and reproducible: the build needs only the workspace
+# sources + Cargo.toml/Cargo.lock, never build output, VCS metadata or scratch state.
+/target
+/.git
+/.dev
+/.forklift
+/.idea
+/.github
+*.log

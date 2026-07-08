@@ -1,0 +1,188 @@
+use serde::Serialize;
+use forklift_core::util::remote_utils::{LiftResult, RemoteClient};
+use forklift_core::util::{file_utils, merge_utils, object_utils, pallet_utils, remote_utils};
+use crate::commands::consolidate::{self, MergeStatus};
+use crate::output::{self, CommandOutput};
+
+/// The most times a single lift will auto-merge a diverged remote before giving up (a
+/// safety bound on a pathological fleet where the pallet keeps moving under us).
+const MAX_AUTO_MERGES: usize = 5;
+
+/// Handle the lift command (git's "push"): upload the current pallet's new parcels to
+/// the configured remote and move the remote's ref with a compare-and-swap.
+///
+/// When trust is established locally, the trust anchor and the office pallet are lifted
+/// first — the key registry must be on the remote before the signed parcels arrive,
+/// because the remote audits every ref update.
+///
+/// # Returns
+/// * `Ok(())`      - If the lift completed (or there was nothing to lift).
+/// * `Err(String)` - If no remote is configured, the remote is ahead, or a transfer
+///                   failed.
+pub async fn handle_command() -> Result<(), String> {
+    let mut auto_merged = 0usize;
+
+    // Optimistic lift (§7.7): a diverged push whose merge is clean auto-lowers,
+    // consolidates and retries, so a fleet stacking to one pallet stops serializing
+    // through a human. True overlaps still stop with the diverged error.
+    loop {
+        let client = RemoteClient::from_config()?;
+        let info = client.fetch_info().await?;
+
+        let office_new_parcels = match remote_utils::push_local_trust(&client, &info).await? {
+            Some(LiftResult::Lifted(stats)) => Some(stats.new_parcels),
+            _ => None,
+        };
+
+        // The office carries the keys, so it lifts first (above); the manifest and any
+        // other meta pallet follow, once the remote can verify their signatures.
+        let meta_pallets: Vec<String> = remote_utils::lift_meta_pallets(&client, &info).await?
+            .into_iter()
+            .filter(|lift| matches!(lift.result, LiftResult::Lifted(_)))
+            .map(|lift| lift.pallet)
+            .collect();
+
+        let pallet = pallet_utils::get_current_pallet_name()?;
+
+        let Some(head) = pallet_utils::get_pallet_head(&pallet)? else {
+            return Err(format!(
+                "Pallet \"{}\" has nothing stacked yet; there is nothing to lift.",
+                pallet
+            ));
+        };
+
+        let remote_head = info.pallets.get(&pallet).cloned();
+
+        // If the remote diverged and the merge is clean, auto-merge and retry rather than
+        // stopping. Overlapping changes fall through to the diverged error below.
+        if let Some(remote) = &remote_head {
+            if remote != &head && auto_merged < MAX_AUTO_MERGES && try_auto_merge(&client, &pallet, &head, remote).await? {
+                auto_merged += 1;
+                continue;
+            }
+        }
+
+        let mut report = LiftReport {
+            office_new_parcels,
+            meta_pallets,
+            auto_merged,
+            pallet: pallet.clone(),
+            up_to_date: false,
+            head: head.clone(),
+            new_parcels: 0,
+            uploaded_objects: 0,
+            uploaded_signatures: 0,
+        };
+
+        match remote_utils::lift_pallet(&client, &pallet, &head, remote_head.as_deref()).await? {
+            LiftResult::UpToDate => report.up_to_date = true,
+            LiftResult::Lifted(stats) => {
+                report.new_parcels = stats.new_parcels;
+                report.uploaded_objects = stats.uploaded_objects;
+                report.uploaded_signatures = stats.uploaded_signatures;
+            }
+        }
+
+        output::emit("lift", &report);
+
+        return Ok(());
+    }
+}
+
+/// If the remote head has genuinely diverged from ours and a clean auto-merge is possible,
+/// perform it (fetch their work, consolidate, stack the merge parcel) and report `true` so
+/// the caller retries the lift. Report `false` when the remote is not diverged (it is our
+/// ancestor or descendant — the ordinary lift handles those), the warehouse is dirty, or
+/// the merge would conflict — so the caller falls through to the ordinary lift, which
+/// reports the diverged error for a true overlap.
+async fn try_auto_merge(client: &RemoteClient,
+                        pallet: &str,
+                        head: &str,
+                        remote_head: &str) -> Result<bool, String> {
+    // Their work must be local before we can compare ancestry or merge it.
+    if !file_utils::does_object_exist(remote_head)? {
+        remote_utils::fetch_history(client, remote_head).await?;
+    }
+
+    let diverged = !merge_utils::is_ancestor(remote_head, head)?   // we do not already contain them
+        && !merge_utils::is_ancestor(head, remote_head)?;          // they do not already contain us
+
+    if !diverged {
+        return Ok(false);
+    }
+
+    // Merging materializes into the working directory, so only a clean warehouse qualifies.
+    let our_tree = object_utils::load_parcel(head)?.tree_hash;
+
+    if !consolidate::is_warehouse_clean(&our_tree).await? {
+        return Ok(false);
+    }
+
+    match consolidate::merge_head_into_current(pallet, head, remote_head, "remote", false).await? {
+        MergeStatus::Merged(_) => Ok(true),
+        MergeStatus::Conflicts(_) => Ok(false),
+    }
+}
+
+/// The result of a lift: the pallet's outcome, plus the office lift when trust
+/// required its keys to reach the remote first.
+#[derive(Serialize)]
+struct LiftReport {
+    /// The parcels the office lift uploaded, when one happened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    office_new_parcels: Option<usize>,
+
+    /// The meta pallets (e.g. `@manifest`) lifted with new parcels.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    meta_pallets: Vec<String>,
+
+    /// How many times the lift auto-merged a diverged remote before it went through
+    /// (optimistic lift, §7.7).
+    #[serde(skip_serializing_if = "is_zero")]
+    auto_merged: usize,
+
+    pallet: String,
+
+    /// Whether the remote already had the local head.
+    up_to_date: bool,
+
+    head: String,
+    new_parcels: usize,
+    uploaded_objects: usize,
+    uploaded_signatures: usize,
+}
+
+/// Whether a count is zero (for skipping it in the JSON envelope).
+fn is_zero(count: &usize) -> bool {
+    *count == 0
+}
+
+impl CommandOutput for LiftReport {
+    fn render_human(&self) {
+        if let Some(new_parcels) = self.office_new_parcels {
+            println!("Lifted the office pallet: {} new parcel(s).", new_parcels);
+        }
+
+        for pallet in &self.meta_pallets {
+            println!("Lifted the {} pallet.", pallet);
+        }
+
+        if self.auto_merged > 0 {
+            println!(
+                "The remote had moved; auto-merged it {} time(s) and retried (optimistic lift).",
+                self.auto_merged
+            );
+        }
+
+        if self.up_to_date {
+            println!("Already up to date: the remote has pallet \"{}\" at {}.", self.pallet, self.head);
+        } else {
+            println!(
+                "Lifted pallet \"{}\" to {}: {} new parcel(s), {} object(s) and {} \
+                signature(s) uploaded.",
+                self.pallet, self.head, self.new_parcels, self.uploaded_objects,
+                self.uploaded_signatures
+            );
+        }
+    }
+}

@@ -1,0 +1,458 @@
+//! The protocol handler: one method per `REMOTE_PROTOCOL.md` endpoint, generic over the
+//! two stores. This is the "real handler logic" the whole protocol suite exercises — the
+//! same code the AWS Lambda control-plane function calls, only over S3 + DynamoDB instead
+//! of the in-memory fakes.
+//!
+//! The methods return provider-agnostic outcomes ([`Status`](crate::Status) via
+//! [`HeadError`](crate::HeadError), or a redirect URL); the runtime adapter — `lambda_http`
+//! for AWS — maps them onto HTTP. Byte-plane endpoints (`GET`/`PUT` object) can answer
+//! with a `307` redirect to a presigned storage URL when the [`ObjectStore`] is S3-backed,
+//! exactly as the protocol's redirect room allows.
+//!
+//! Authentication and the transport-level FORK-10 role/grant checks are the adapter's
+//! concern (the API Gateway authorizer decides *who* the caller is, then the same office
+//! roles the server head consults gate *what* they may move). This type enforces the
+//! provider-independent content invariants: hash-verified objects, a fast-forward-only CAS,
+//! and — on a trusted warehouse — the full offline audit before a ref moves.
+
+use std::collections::{BTreeMap, HashSet};
+
+use forklift_core::model::remote::{
+    RefUpdateRequest, TrustAnchorDto, WarehouseInfo, MAX_MISSING_BATCH, PROTOCOL_VERSION,
+};
+use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
+use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
+use forklift_core::util::{audit_utils, bundle_utils, merge_utils, object_utils, sign_utils};
+
+use crate::error::{HeadError, HeadResult};
+use crate::scratch::{materialize, Scratch};
+use crate::store::{
+    CasOutcome, ObjectAccess, ObjectStore, PutTarget, RefStore, SignatureOutcome, TrustOutcome,
+};
+
+/// How the head answers a byte read: the bytes, or a redirect to a storage URL.
+#[derive(Debug)]
+pub enum ObjectReadResult {
+    /// The object bytes (the head serves them itself).
+    Bytes(Vec<u8>),
+    /// Follow this presigned URL for the bytes (`307`).
+    Redirect(String),
+}
+
+/// How the head answers an object upload: it was stored, or the bytes go to a storage URL.
+#[derive(Debug)]
+pub enum ObjectWriteResult {
+    /// The head stored the bytes directly; `true` if newly created.
+    Stored { created: bool },
+    /// Upload the bytes to this presigned URL (`307`).
+    Redirect(String),
+}
+
+/// The outcome of establishing (or resetting) trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustResult {
+    /// A new anchor was planted, or a re-genesis replaced the old one (`201`).
+    Established,
+    /// The identical anchor was already present (`200`).
+    Unchanged,
+}
+
+/// The serverless protocol handler over an [`ObjectStore`] and a [`RefStore`].
+pub struct Head<O: ObjectStore, R: RefStore> {
+    pub objects: O,
+    pub refs: R,
+}
+
+impl<O: ObjectStore, R: RefStore> Head<O, R> {
+    /// Assemble a head over the two stores.
+    pub fn new(objects: O, refs: R) -> Head<O, R> {
+        Head { objects, refs }
+    }
+
+    /// `GET /v1/warehouse` — the handshake: protocol version, refs and trust.
+    pub fn handshake(&self) -> HeadResult<WarehouseInfo> {
+        let mut pallets = BTreeMap::new();
+
+        for (pallet_ref, head) in self.refs.list_refs().map_err(HeadError::internal)? {
+            pallets.insert(pallet_ref.to_wire(), head);
+        }
+
+        Ok(WarehouseInfo {
+            protocol: PROTOCOL_VERSION.to_string(),
+            default_pallet: self.refs.default_pallet().map_err(HeadError::internal)?,
+            pallets,
+            trust: self
+                .refs
+                .get_trust()
+                .map_err(HeadError::internal)?
+                .map(|anchor| TrustAnchorDto::from(&anchor)),
+        })
+    }
+
+    /// `POST /v1/objects/missing` — which of these hashes does the store lack?
+    pub fn missing(&self, hashes: &[String]) -> HeadResult<Vec<String>> {
+        self.reject_oversized_batch(hashes.len())?;
+
+        let mut missing = Vec::new();
+
+        for hash in hashes {
+            if !self.objects.exists(hash).map_err(HeadError::internal)? {
+                missing.push(hash.clone());
+            }
+        }
+
+        Ok(missing)
+    }
+
+    /// `GET /v1/objects/{hash}` — the raw object bytes, or a redirect to storage.
+    pub fn object_get(&self, hash: &str) -> HeadResult<ObjectReadResult> {
+        match self.objects.access(hash).map_err(HeadError::internal)? {
+            Some(ObjectAccess::Direct(bytes)) => Ok(ObjectReadResult::Bytes(bytes)),
+            Some(ObjectAccess::Redirect(url)) => Ok(ObjectReadResult::Redirect(url)),
+            None => Err(HeadError::not_found(format!("No object {} exists.", hash))),
+        }
+    }
+
+    /// `PUT /v1/objects/{hash}` — store the object (hash-verified before it is fetchable),
+    /// or redirect the upload to a presigned storage URL.
+    pub fn object_put(&self, hash: &str, bytes: &[u8]) -> HeadResult<ObjectWriteResult> {
+        match self.objects.put_target(hash).map_err(HeadError::internal)? {
+            PutTarget::Redirect(url) => Ok(ObjectWriteResult::Redirect(url)),
+            PutTarget::Direct => {
+                // A hash mismatch is a client error (`422`): nothing unverified is stored.
+                let outcome =
+                    self.objects.put_verified(hash, bytes).map_err(HeadError::unprocessable)?;
+
+                Ok(ObjectWriteResult::Stored {
+                    created: outcome == crate::store::PutOutcome::Created,
+                })
+            }
+        }
+    }
+
+    /// `GET /v1/signatures/{hash}` — a parcel's signature sidecar.
+    pub fn signature_get(&self, parcel_hash: &str) -> HeadResult<Vec<u8>> {
+        self.objects
+            .get_signature(parcel_hash)
+            .map_err(HeadError::internal)?
+            .ok_or_else(|| HeadError::not_found("The parcel carries no signature.".to_string()))
+    }
+
+    /// `PUT /v1/signatures/{hash}` — store a signature sidecar. The structure is validated
+    /// here (`422` when malformed); whether it *verifies* is decided at ref-update time.
+    /// A conflicting sidecar for an already-signed parcel is refused (`409`).
+    pub fn signature_put(&self, parcel_hash: &str, bytes: &[u8]) -> HeadResult<SignatureOutcome> {
+        sign_utils::validate_raw_parcel_signature(bytes, parcel_hash)
+            .map_err(HeadError::unprocessable)?;
+
+        let outcome =
+            self.objects.put_signature(parcel_hash, bytes).map_err(HeadError::internal)?;
+
+        if outcome == SignatureOutcome::Conflict {
+            return Err(HeadError::conflict(format!(
+                "Parcel {} already carries a different signature; signatures are immutable.",
+                parcel_hash
+            )));
+        }
+
+        Ok(outcome)
+    }
+
+    /// `PUT /v1/trust` — establish the trust anchor (the same one-way door it is locally),
+    /// with the one sanctioned replacement: a re-genesis (§8.7). The static-token
+    /// authority a re-genesis requires is enforced by the runtime adapter, exactly as the
+    /// server head restricts it to its static token.
+    pub fn put_trust(&self, anchor: &TrustAnchorDto) -> HeadResult<TrustResult> {
+        let existing = self.refs.get_trust().map_err(HeadError::internal)?;
+
+        let Some(existing) = existing else {
+            return match self
+                .refs
+                .put_trust_if_absent(&anchor.to_anchor())
+                .map_err(HeadError::internal)?
+            {
+                TrustOutcome::Established => Ok(TrustResult::Established),
+                TrustOutcome::AlreadyIdentical => Ok(TrustResult::Unchanged),
+                TrustOutcome::Conflict => Err(self.trust_one_way_door()),
+            };
+        };
+
+        let existing_dto = TrustAnchorDto::from(&existing);
+
+        if existing_dto == *anchor {
+            return Ok(TrustResult::Unchanged);
+        }
+
+        // A re-genesis anchor names the current genesis as its prior and adopts the office
+        // head exactly as it stands — nothing of the old chain may be silently dropped.
+        let is_regenesis = anchor.prior_genesis.as_deref() == Some(existing.genesis.as_str());
+
+        if !is_regenesis {
+            return Err(self.trust_one_way_door());
+        }
+
+        let office_head = self
+            .refs
+            .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
+            .map_err(HeadError::internal)?;
+
+        if anchor.adopts.as_deref() != office_head.as_deref() {
+            return Err(HeadError::unprocessable(format!(
+                "The re-genesis anchor adopts office head {}, but this warehouse's office \
+                head is {}. The reset would drop history; re-run the re-genesis from a \
+                warehouse in sync with this one.",
+                anchor.adopts.as_deref().unwrap_or("(none)"),
+                office_head.as_deref().unwrap_or("(unborn)")
+            )));
+        }
+
+        self.refs.replace_trust(&anchor.to_anchor()).map_err(HeadError::internal)?;
+
+        Ok(TrustResult::Established)
+    }
+
+    /// `POST /v1/pallets/{name}` — the CAS ref update, the commit point of a lift and the
+    /// place the head enforces everything (DESIGN.html §4.2 step 6): closure presence,
+    /// fast-forward-ness, and — on a trusted warehouse — the same audit the CLI runs
+    /// offline. The audit runs against a scratch warehouse mirrored from the object store;
+    /// the atomic CAS is the DynamoDB conditional write of [`RefStore::compare_and_set_head`].
+    pub fn ref_update(&self, name: &str, request: &RefUpdateRequest) -> HeadResult<()> {
+        let pallet_ref = PalletRef::parse(name).map_err(HeadError::unprocessable)?;
+        let namespace = pallet_ref.namespace;
+        let bare = pallet_ref.name.clone();
+        let is_meta = namespace == PalletNamespace::Meta;
+        let is_office = is_meta && bare == OFFICE_PALLET_NAME;
+
+        // Fail fast on an obviously stale request; the conditional write below is the
+        // authoritative gate that also catches a head that moves during the audit.
+        let current = self.refs.get_head(namespace, &bare).map_err(HeadError::internal)?;
+
+        if current.as_deref() != request.old_head.as_deref() {
+            return Err(self.moved(&current, &request.old_head));
+        }
+
+        // The new head must be present — a ref never points at a missing parcel.
+        if !self.objects.exists(&request.new_head).map_err(HeadError::internal)? {
+            return Err(HeadError::unprocessable(format!(
+                "The new head {} has not been uploaded.",
+                request.new_head
+            )));
+        }
+
+        let anchor = self.refs.get_trust().map_err(HeadError::internal)?;
+        let office_head = self
+            .refs
+            .get_head(PalletNamespace::Meta, OFFICE_PALLET_NAME)
+            .map_err(HeadError::internal)?;
+
+        // Mirror the objects the audit reads into a scratch `.forklift`, then run the exact
+        // `forklift_core` audit inside its scope. Working blobs are never mirrored — their
+        // presence is answered by the object store (an S3 HEAD).
+        let scratch = Scratch::new().map_err(HeadError::internal)?;
+
+        scratch.scoped(|| -> HeadResult<()> {
+            let mut mirrored: HashSet<String> = HashSet::new();
+
+            // On a trusted warehouse the office chain must be readable (it carries the keys
+            // that verify every other pallet). Its "blobs" are tracked-metadata records the
+            // audit reads, so they are mirrored too.
+            if anchor.is_some() {
+                if let Some(office_head) = &office_head {
+                    materialize(&self.objects, office_head, true, &mut mirrored)
+                        .map_err(HeadError::internal)?;
+                }
+            }
+
+            // The target closure: a meta pallet's blobs are records (mirror them); a
+            // working pallet's blobs are file content (leave them in the object store).
+            materialize(&self.objects, &request.new_head, is_meta, &mut mirrored)
+                .map_err(HeadError::internal)?;
+
+            // 1. Closure presence. Working blobs are checked via the object store.
+            let blob_exists = |hash: &str| self.objects.exists(hash);
+            audit_utils::verify_parcel_closure_with(
+                &request.new_head,
+                request.old_head.as_deref(),
+                &blob_exists,
+            )
+            .map_err(HeadError::unprocessable)?;
+
+            // 2. Fast-forward, with the one sanctioned exception: the office lift right
+            // after a re-genesis, moving away from the anchor's adopted pin (§8.7).
+            if let Some(old_head) = &request.old_head {
+                let adopted_reset = is_office
+                    && anchor.as_ref().and_then(|a| a.adopts.as_deref()) == Some(old_head.as_str());
+
+                if !adopted_reset
+                    && !merge_utils::is_ancestor(old_head, &request.new_head)
+                        .map_err(HeadError::internal)?
+                {
+                    return Err(HeadError::conflict(
+                        "The update is not a fast-forward; the protocol has no force push. \
+                        Lower, consolidate, and lift the merge."
+                            .to_string(),
+                    ));
+                }
+            }
+
+            // 3. Trust: a trusted warehouse accepts nothing a local audit would reject.
+            if let Some(anchor) = &anchor {
+                if is_office {
+                    // The office chain carries the keys; verify it against the anchor, and
+                    // that every new parcel stayed within its signer's privileges.
+                    audit_utils::verify_office_chain(anchor, &request.new_head)
+                        .map_err(HeadError::unprocessable)?;
+
+                    audit_utils::verify_office_privileges(
+                        anchor,
+                        request.old_head.as_deref(),
+                        &request.new_head,
+                    )
+                    .map_err(HeadError::forbidden)?;
+                } else {
+                    // A user pallet: audit its new history against the office state.
+                    let office_head = office_head.as_deref().ok_or_else(|| {
+                        HeadError::unprocessable(
+                            "Trust is established but the office pallet is missing; lift the \
+                            office first."
+                                .to_string(),
+                        )
+                    })?;
+
+                    let office_state = audit_utils::verify_office_chain(anchor, office_head)
+                        .map_err(HeadError::unprocessable)?;
+
+                    audit_utils::verify_pallet_history(
+                        &request.new_head,
+                        anchor,
+                        &office_state,
+                        request.old_head.as_deref(),
+                    )
+                    .map_err(HeadError::unprocessable)?;
+                }
+            }
+
+            Ok(())
+        })?;
+
+        // The commit: a conditional write that fails if the head moved during the audit.
+        match self
+            .refs
+            .compare_and_set_head(namespace, &bare, request.old_head.as_deref(), &request.new_head)
+            .map_err(HeadError::internal)?
+        {
+            CasOutcome::Committed => Ok(()),
+            CasOutcome::Conflict { current } => Err(self.moved(&current, &request.old_head)),
+        }
+    }
+
+    /// `POST /v1/objects/batch` — many objects in one bundle-format stream (forklift's
+    /// packfile moment). Objects the store lacks are simply absent; the client falls back
+    /// to loose fetches. Built by mirroring the requested objects into a scratch and
+    /// reusing `bundle_utils::build_partial_bundle`.
+    pub fn batch(&self, hashes: &[String]) -> HeadResult<Vec<u8>> {
+        self.reject_oversized_batch(hashes.len())?;
+
+        let scratch = Scratch::new().map_err(HeadError::internal)?;
+
+        scratch.scoped(|| -> HeadResult<Vec<u8>> {
+            let mut mirrored: HashSet<String> = HashSet::new();
+
+            for hash in hashes {
+                if !mirrored.insert(hash.clone()) {
+                    continue;
+                }
+
+                if let Some(bytes) = self.objects.get(hash).map_err(HeadError::internal)? {
+                    object_utils::store_object_bytes(hash, &bytes).map_err(HeadError::internal)?;
+                }
+
+                if let Some(sidecar) = self.objects.get_signature(hash).map_err(HeadError::internal)?
+                {
+                    sign_utils::store_raw_parcel_signature(hash, &sidecar)
+                        .map_err(HeadError::internal)?;
+                }
+            }
+
+            bundle_utils::build_partial_bundle(hashes).map_err(HeadError::internal)
+        })
+    }
+
+    /// `GET /v1/bundles/latest` — the whole-warehouse bundle. Building it is periodic ECS
+    /// work in the hosted deployment (DESIGN.html §4.3/§4.6); until a builder runs, this
+    /// is a spec-compliant `404` and clients fall back to loose/batch fetches.
+    pub fn bundle_latest(&self) -> HeadResult<Vec<u8>> {
+        Err(HeadError::not_found("No bundle has been built.".to_string()))
+    }
+
+    /// `POST /lift/{session}/commit` — the additive session-commit step (the split-verify
+    /// decision, 2026-07-06). In the AWS deployment the client uploads straight to S3, so
+    /// the control plane never saw the bytes; before the ref update, this verifies that the
+    /// small control-plane objects it staged are present *and* hash-correct (synchronously),
+    /// while large blobs — verified asynchronously by the staging verifier — are only
+    /// checked for presence. A corrupt control-plane object stops the lift here.
+    pub fn commit_lift(&self, control_plane: &[String], blobs: &[String]) -> HeadResult<()> {
+        for hash in control_plane {
+            match self.objects.get(hash).map_err(HeadError::internal)? {
+                None => {
+                    return Err(HeadError::unprocessable(format!(
+                        "Object {} was not uploaded; the lift session is not ready to commit.",
+                        hash
+                    )))
+                }
+                Some(bytes) => {
+                    let actual = object_utils::hash_object_bytes(&bytes);
+
+                    if actual != *hash {
+                        return Err(HeadError::unprocessable(format!(
+                            "Staged object {} is corrupt (it hashes to {}); it will not be \
+                            committed.",
+                            hash, actual
+                        )));
+                    }
+                }
+            }
+        }
+
+        for hash in blobs {
+            if !self.objects.exists(hash).map_err(HeadError::internal)? {
+                return Err(HeadError::unprocessable(format!(
+                    "Blob {} was not uploaded; the lift session is not ready to commit.",
+                    hash
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The `422` for a batch request over the protocol cap.
+    fn reject_oversized_batch(&self, count: usize) -> HeadResult<()> {
+        if count > MAX_MISSING_BATCH {
+            return Err(HeadError::unprocessable(format!(
+                "At most {} hashes per request; batch larger sets.",
+                MAX_MISSING_BATCH
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// The `409` for a ref that is not where the client expected it.
+    fn moved(&self, current: &Option<String>, expected: &Option<String>) -> HeadError {
+        HeadError::conflict(format!(
+            "The pallet moved: its head is {}, not {}. Lower and retry.",
+            current.as_deref().unwrap_or("unborn"),
+            expected.as_deref().unwrap_or("unborn")
+        ))
+    }
+
+    /// The `409` for trying to replace an established trust anchor.
+    fn trust_one_way_door(&self) -> HeadError {
+        HeadError::conflict(
+            "This warehouse already has a different trust anchor; trust is a one-way door \
+            and cannot be replaced."
+                .to_string(),
+        )
+    }
+}

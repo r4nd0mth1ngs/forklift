@@ -1,0 +1,8 @@
+/target
+.idea/
+.forklift/
+.claude/
+# Scratch dev warehouse used by `bin/serve` (pult serve).
+.dev/
+# macOS Finder metadata.
+.DS_Store

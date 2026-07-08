@@ -1,0 +1,39 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/lonic-software/pult/v0.2.1/pult.schema.json
+# pult manifest — the operational commands for forklift maintainers.
+# Authoring guide: https://github.com/lonic-software/pult/blob/v0.2.1/docs/authoring.md
+#
+# Run `pult` for the guided menu, or `pult <id>`. Real logic lives in ./bin.
+version: 1
+name: lonic-forklift
+
+commands:
+  - id: check
+    title: Run what CI runs — build, test, clippy
+    run: "./bin/check"
+
+  - id: test
+    title: Run the test suite (fast loop)
+    run: "cargo test --workspace"
+
+  - id: release
+    title: Cut a release (bump → tag → push; CI builds and publishes both heads)
+    params:
+      # next patch / minor / major from the latest v* tag; patch is the default
+      version: { pick: { from: "./bin/release-candidates" } }
+    run: "./bin/release {version}"
+
+  - id: install
+    title: Build this checkout and install the forklift CLI + server locally
+    run:
+      - "cargo install --path crates/forklift --locked"
+      - "cargo install --path crates/forklift-server --locked"
+
+  - id: serve
+    title: Run a throwaway local forklift-server (test lift / lower / franchise)
+    params:
+      addr: { input: { default: "127.0.0.1:9418" } }
+    run: "./bin/serve {addr}"
+
+  - id: design
+    title: Open the design doc (the source of truth) in your browser
+    run: "./bin/design"

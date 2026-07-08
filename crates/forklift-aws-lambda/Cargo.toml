@@ -1,0 +1,14 @@
+[package]
+name = "forklift-aws-lambda"
+description = "Forklift — the AWS serverless head: Lambda functions so anyone can host forklift on AWS serverless infrastructure."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+# Server head: source-available under the Functional Source License 1.1 (converts to
+# Apache-2.0 after two years). Not the workspace MIT/Apache — see LICENSING.md.
+license-file = "../../LICENSE-FSL"
+
+[dependencies]
+forklift-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

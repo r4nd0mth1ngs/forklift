@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Open the design doc in your browser. docs/DESIGN.html is the source of truth
+# for forklift's design, roadmap and changelog.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+doc="docs/DESIGN.html"
+
+if command -v open >/dev/null 2>&1; then
+    exec open "$doc"          # macOS
+elif command -v xdg-open >/dev/null 2>&1; then
+    exec xdg-open "$doc"      # Linux
+elif command -v start >/dev/null 2>&1; then
+    exec start "" "$doc"      # Windows (Git Bash)
+else
+    echo "open \"$doc\" in your browser"
+fi

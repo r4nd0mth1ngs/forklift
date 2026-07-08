@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+# Benchmark forklift against git on a real repository.
+#
+# What it does, end to end:
+#   1. Clones the target repo once (a local mirror), then makes two working copies:
+#        A/  a plain `git clone --local`   (git is measured here)
+#        B/  a copy of A + `forklift import-git .`   (forklift is measured here)
+#      B is then *compacted* before the table runs, so both stores are packed for the
+#      comparison — git ships packed (`clone --local` copies packfiles) and a real
+#      `import-git` packs on the way out, so the packed store is the state users
+#      actually operate in. The loose store is a transient (it exists only between an
+#      import and its auto-compaction), so measuring read-only ops there would compare
+#      git-packed to forklift-loose and understate forklift.
+#      Both copies hold the same working tree, so every read-only comparison is
+#      apples-to-apples: identical files, identical history, one tool each.
+#   2. Times the operations people actually run — onboard, status, log, diff,
+#      commit — for both tools and prints a markdown table with the ratio. The
+#      loose→packed win from compaction is reported separately, as forklift's own
+#      before/after (git has no equivalent — it packs during clone/gc).
+#
+# It is dependency-free (no hyperfine required) and honest about its limits; see
+# docs/BENCHMARK.md for the fairness caveats and how to go deeper.
+#
+# Usage:  bin/benchmark [--repo git|linux|<url>|<path>] [--runs N] [--work DIR] [--keep] [--out FILE] [--markdown]
+#
+# Output is an aligned text table by default; pass --markdown for a table you can paste
+# into a doc. Onboarding (clone vs import-git) is reported separately, never as a ratio.
+set -euo pipefail
+
+# ── defaults ────────────────────────────────────────────────────────────────
+REPO="git"                         # git | linux | any git URL or local path
+RUNS=5                             # iterations for the fast, read-only ops
+COMMIT_RUNS=3                      # iterations for the commit/stack op
+WORK=""                            # working dir (default: a fresh temp dir)
+KEEP=0                             # keep the work dir on exit
+OUT=""                            # also append the results table here
+MARKDOWN=0                         # render a markdown table instead of aligned text
+
+usage() { sed -n '2,/^set /{ /^set /d; s/^# \{0,1\}//; p; }' "$0"; exit "${1:-0}"; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --repo)  REPO="$2"; shift 2;;
+        --runs)  RUNS="$2"; shift 2;;
+        --work)  WORK="$2"; shift 2;;
+        --out)   OUT="$2"; shift 2;;
+        --keep)  KEEP=1; shift;;
+        --markdown) MARKDOWN=1; shift;;
+        -h|--help) usage 0;;
+        *) echo "unknown argument: $1" >&2; usage 2;;
+    esac
+done
+
+# ── resolve tools ───────────────────────────────────────────────────────────
+command -v git      >/dev/null || { echo "error: git not on PATH" >&2; exit 1; }
+command -v forklift >/dev/null || { echo "error: forklift not on PATH — install it first" >&2; exit 1; }
+
+FORKLIFT_VERSION=$(forklift version 2>/dev/null || echo "forklift ?")
+GIT_VERSION=$(git --version)
+
+# ── portable millisecond clock ──────────────────────────────────────────────
+# macOS `date` has no %N, so pick the best available high-resolution source once.
+if date +%s%N 2>/dev/null | grep -qE '^[0-9]{16,}$'; then
+    _now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+elif command -v gdate >/dev/null 2>&1 && gdate +%s%N 2>/dev/null | grep -qE '^[0-9]{16,}$'; then
+    _now_ms() { echo $(( $(gdate +%s%N) / 1000000 )); }
+elif command -v python3 >/dev/null 2>&1; then
+    _now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+elif command -v perl >/dev/null 2>&1; then
+    _now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000'; }
+else
+    echo "error: need one of GNU date, python3, or perl for timing" >&2; exit 1
+fi
+
+# ── resolve the repo URL ────────────────────────────────────────────────────
+case "$REPO" in
+    git)   REPO_URL="https://github.com/git/git.git";        REPO_NAME="git";;
+    linux) REPO_URL="https://github.com/torvalds/linux.git";  REPO_NAME="linux"
+           echo "!! linux is huge (~5 GB history, ~90k files). Two working copies means"
+           echo "!! ~20+ GB of disk and a long import. Ctrl-C now if that's not what you want."
+           ;;
+    *)     REPO_URL="$REPO";  REPO_NAME=$(basename "${REPO%.git}");;
+esac
+
+# ── set up the workspace ────────────────────────────────────────────────────
+if [ -z "$WORK" ]; then
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/forklift-bench.XXXXXX")
+else
+    mkdir -p "$WORK"
+fi
+MIRROR="$WORK/mirror"
+A="$WORK/A"          # git working copy
+B="$WORK/B"          # forklift working copy
+
+cleanup() { [ "$KEEP" -eq 1 ] || rm -rf "$WORK"; }
+trap cleanup EXIT
+
+echo "Forklift vs git benchmark"
+echo "  repo:     $REPO_NAME ($REPO_URL)"
+echo "  work dir: $WORK  (keep=$KEEP)"
+echo "  $GIT_VERSION"
+echo "  $FORKLIFT_VERSION"
+echo
+
+echo "→ fetching mirror (not timed; network-bound)…"
+git clone --quiet "$REPO_URL" "$MIRROR"
+
+echo "→ building the git working copy (A)…"
+git clone --quiet --local "$MIRROR" "$A"
+MAIN_REF=$(git -C "$A" symbolic-ref --short HEAD)
+
+echo "→ building the forklift working copy (B = copy of A + import-git)…"
+cp -a "$A" "$B"
+( cd "$B" && forklift prepare >/dev/null )
+
+# ── repo shape (context for the report) ─────────────────────────────────────
+N_COMMITS=$(git -C "$A" rev-list --count HEAD)
+N_FILES=$(git -C "$A" ls-files | wc -l | tr -d ' ')
+GIT_SIZE=$(du -sh "$A/.git" 2>/dev/null | cut -f1)
+
+# ── the timing core ─────────────────────────────────────────────────────────
+# time_cmd <runs> <dir> <setup> <cmd>  → echoes "mean_ms min_ms"
+#   setup empty  → read-only op: the whole loop is timed once and divided (low
+#                  timer overhead), min == mean.
+#   setup given  → run before each timed iteration and NOT counted; each run is
+#                  timed individually so the mean/min reflect the command alone.
+time_cmd() {
+    local runs="$1" dir="$2" setup="$3" cmd="$4"
+    local i t0 t1 dt sum=0 min=""
+    if [ -z "$setup" ]; then
+        t0=$(_now_ms)
+        for ((i=0; i<runs; i++)); do ( cd "$dir" && eval "$cmd" ) >/dev/null 2>&1 || true; done
+        t1=$(_now_ms)
+        local per=$(( (t1 - t0) / runs ))
+        echo "$per $per"
+    else
+        for ((i=0; i<runs; i++)); do
+            ( cd "$dir" && eval "$setup" ) >/dev/null 2>&1 || true
+            t0=$(_now_ms)
+            ( cd "$dir" && eval "$cmd" ) >/dev/null 2>&1 || true
+            t1=$(_now_ms)
+            dt=$(( t1 - t0 ))
+            sum=$(( sum + dt ))
+            if [ -z "$min" ] || [ "$dt" -lt "$min" ]; then min=$dt; fi
+        done
+        echo "$(( sum / runs )) $min"
+    fi
+}
+
+fmt_ms()  { awk -v ms="$1" 'BEGIN{ if (ms>=1000) printf "%.2f s", ms/1000; else printf "%d ms", ms }'; }
+ratio()   { awk -v g="$1" -v f="$2" 'BEGIN{ if (g>0) printf "%.2fx", f/g; else print "n/a" }'; }
+
+# Rows are stored field-delimited (US, 0x1f) so the report can render them either as an
+# aligned text table (default) or a markdown table (--markdown) from the same data.
+US=$(printf '\037')
+ROWS=""
+add_row() { # name  git_mean  fork_mean  note
+    local name="$1" g="$2" f="$3" note="${4:-}"
+    ROWS="${ROWS}${name}${US}$(fmt_ms "$g")${US}$(fmt_ms "$f")${US}$(ratio "$g" "$f")${US}${note}"$'\n'
+}
+
+rule() { printf '%*s' "$1" '' | tr ' ' '-'; }   # N dashes
+
+render_table_aligned() {
+    printf '  %-22s  %-9s  %-9s  %-13s  %s\n' "Operation" "git" "forklift" "forklift/git" "Notes"
+    printf '  %-22s  %-9s  %-9s  %-13s  %s\n' "$(rule 22)" "$(rule 9)" "$(rule 9)" "$(rule 13)" "$(rule 34)"
+    printf '%s' "$ROWS" | while IFS="$US" read -r name g f r note; do
+        [ -z "$name" ] && continue
+        printf '  %-22s  %-9s  %-9s  %-13s  %s\n' "$name" "$g" "$f" "$r" "$note"
+    done
+}
+
+render_table_markdown() {
+    echo "| Operation | git | forklift | forklift/git | Notes |"
+    echo "|-----------|-----|----------|--------------|-------|"
+    printf '%s' "$ROWS" | while IFS="$US" read -r name g f r note; do
+        [ -z "$name" ] && continue
+        printf '| %s | %s | %s | %s | %s |\n' "$name" "$g" "$f" "$r" "$note"
+    done
+}
+
+# ── 1. onboard cost (single run; one-shot by nature) ────────────────────────
+echo "→ [1/5] onboard cost…"
+# git: a fresh local clone from the mirror. forklift: import-git on an existing
+# checkout. Different work, same question — "time to bring this history under the
+# VCS" — so the note flags that they are not byte-identical operations.
+t0=$(_now_ms); git clone --quiet --local "$MIRROR" "$WORK/_gc" >/dev/null 2>&1; t1=$(_now_ms)
+GIT_ONBOARD=$(( t1 - t0 )); rm -rf "$WORK/_gc"
+# import-git can legitimately fail (e.g. a git object git itself accepts but the importer
+# rejects). Capture its output and surface it — a swallowed error here reads as a silent
+# crash, and every later benchmark would run against a half-imported warehouse.
+#
+# Real imports pack the store on the way out (auto-compact), which is the right default
+# for users. But this benchmark's job is to *measure* that optimization, so it imports
+# with --no-compact to leave the loose baseline in place — the compaction pass (step 6)
+# then packs it and reports the before/after. (--no-compact is probed so an older forklift
+# that lacks it still runs; there the store is loose anyway.)
+IMPORT_ARGS="."
+LOOSE_BASELINE=0
+if forklift import-git --help 2>/dev/null | grep -q -- '--no-compact'; then
+    IMPORT_ARGS=". --no-compact"
+    LOOSE_BASELINE=1
+fi
+t0=$(_now_ms)
+if ! import_log=$( cd "$B" && forklift import-git $IMPORT_ARGS 2>&1 ); then
+    echo "error: 'forklift import-git .' failed — the benchmark cannot continue." >&2
+    echo "── forklift said ──────────────────────────────────────────────" >&2
+    echo "$import_log" | tail -20 >&2
+    echo "───────────────────────────────────────────────────────────────" >&2
+    echo "Re-run with --keep and reproduce by hand in: $B" >&2
+    exit 1
+fi
+t1=$(_now_ms)
+FORK_ONBOARD=$(( t1 - t0 ))
+# Onboarding is NOT added to the ratio table: `git clone --local` (copy a pack) and
+# `forklift import-git` (re-encode every object) are different operations, so a ratio
+# between them is misleading. They are reported on their own, below the table.
+GIT_SIZE_K=$(du -sk "$A/.git" 2>/dev/null | cut -f1)
+
+# The store is loose right now (we imported --no-compact). Capture the loose baseline —
+# on-disk size and a whole-history walk — for the compaction payoff callout, THEN pack it,
+# so every read-only comparison below runs against the PACKED store. This is the fairness
+# fix: git is always measured packed (git clone --local copies existing packfiles) and a real
+# import-git compacts on the way out, so the packed store is the steady state a user operates
+# in. The loose store exists only in the seconds between an import and its auto-compaction —
+# measuring log/diff there compares git-packed to forklift-loose, understating forklift.
+FORK_SIZE_LOOSE=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1)
+
+COMPACT_DONE=0
+if [ "$LOOSE_BASELINE" -eq 1 ] && ( cd "$B" && forklift compact --help ) >/dev/null 2>&1; then
+    echo "→ measuring the loose baseline, then compacting (so the table runs packed)…"
+    # Before: a whole-history walk against the loose store (the "before" for the payoff).
+    read -r HIST_LOOSE _ <<< "$(time_cmd "$RUNS" "$B" "" 'forklift history')"
+    # Pack the loose objects (a one-shot maintenance pass; time it once).
+    t0=$(_now_ms)
+    if ! COMPACT_OUT=$( cd "$B" && forklift compact 2>&1 ); then
+        COMPACT_OUT="(forklift compact failed: $COMPACT_OUT)"
+    fi
+    t1=$(_now_ms); COMPACT_MS=$(( t1 - t0 ))
+    COMPACT_DONE=1
+fi
+
+# Size in the header/ratio is the packed store when we packed (the steady state); otherwise
+# whatever import produced (older forklift with no compact — the table then runs loose).
+FORK_SIZE_K=$(du -sk "$B/.forklift" 2>/dev/null | cut -f1)
+FORK_SIZE=$(du -sh "$B/.forklift" 2>/dev/null | cut -f1)
+
+# From here B is a fully imported, packed warehouse whose current pallet is '$MAIN_REF'.
+
+# ── 2. status on a clean tree ───────────────────────────────────────────────
+echo "→ [2/5] status…"
+read -r GM _        <<< "$(time_cmd "$RUNS" "$A" "" 'git status')"
+read -r FM _        <<< "$(time_cmd "$RUNS" "$B" "" 'forklift stocktake --summary')"
+add_row "status (clean tree)" "$GM" "$FM" "git status vs forklift stocktake --summary"
+
+# ── 3. full-history log walk ────────────────────────────────────────────────
+echo "→ [3/5] log…"
+read -r GM _        <<< "$(time_cmd "$RUNS" "$A" "" 'git log')"
+read -r FM _        <<< "$(time_cmd "$RUNS" "$B" "" 'forklift history')"
+HIST_PACKED="$FM"   # the packed-store walk — also the "after" for the compaction payoff
+add_row "log (whole history)" "$GM" "$FM" "$N_COMMITS commits walked"
+
+# ── 4. diff of a dirty tree ─────────────────────────────────────────────────
+echo "→ [4/5] diff…"
+# Dirty the same handful of tracked files in both copies, then diff read-only.
+# (Portable array read — macOS bash 3.2 has no `mapfile`.)
+DIRTY=()
+while IFS= read -r f; do DIRTY+=("$f"); done \
+    < <(git -C "$A" ls-files | grep -E '\.(c|h|rs|py|js|md|txt)$' | head -20)
+if [ "${#DIRTY[@]}" -eq 0 ]; then
+    while IFS= read -r f; do DIRTY+=("$f"); done < <(git -C "$A" ls-files | head -20)
+fi
+for f in "${DIRTY[@]}"; do
+    printf '\n// benchmark edit\n' >> "$A/$f"
+    printf '\n// benchmark edit\n' >> "$B/$f"
+done
+( cd "$B" && forklift load . ) >/dev/null 2>&1 || true   # so forklift diff --staged has something too
+read -r GM _        <<< "$(time_cmd "$RUNS" "$A" "" 'git diff')"
+read -r FM _        <<< "$(time_cmd "$RUNS" "$B" "" 'forklift diff --staged')"
+add_row "diff (${#DIRTY[@]} files changed)" "$GM" "$FM" "git diff vs forklift diff --staged"
+# restore both trees to clean before the commit benchmark
+git -C "$A" checkout -- . 2>/dev/null || true
+( cd "$B" && forklift restore . ) >/dev/null 2>&1 || true
+
+# ── 5. commit / stack (per-run setup: make + stage a one-line change) ───────
+echo "→ [5/5] commit…"
+BENCH_FILE="${DIRTY[0]:-BENCHMARK_SCRATCH.txt}"
+GIT_SETUP="printf '\n// commit bench %s\n' \"\$RANDOM\" >> '$BENCH_FILE'; git add '$BENCH_FILE'"
+FORK_SETUP="printf '\n// commit bench %s\n' \"\$RANDOM\" >> '$BENCH_FILE'; forklift load '$BENCH_FILE'"
+read -r GM _        <<< "$(time_cmd "$COMMIT_RUNS" "$A" "$GIT_SETUP"  'git commit -q -m bench')"
+read -r FM _        <<< "$(time_cmd "$COMMIT_RUNS" "$B" "$FORK_SETUP" 'forklift stack bench')"
+add_row "commit (1 file)" "$GM" "$FM" "git add+commit vs forklift load+stack; mean of $COMMIT_RUNS"
+
+# Compaction already happened up front (right after import), so the table above ran on the
+# packed store. Its loose→packed before/after is reported below as a forklift-only payoff.
+
+# ── report ──────────────────────────────────────────────────────────────────
+SIZE_NOTE=$(awk -v g="${GIT_SIZE_K:-0}" -v f="${FORK_SIZE_K:-0}" 'BEGIN{
+    if (g>0 && f>0) {
+        if (f >= g) printf "  (forklift %.1fx larger)", f/g;
+        else        printf "  (forklift %.1fx smaller)", g/f;
+    }
+}')
+
+build_report() {
+    if [ "$MARKDOWN" -eq 1 ]; then
+        echo
+        echo "## Benchmark: forklift vs git — $REPO_NAME"
+        echo
+        echo "- **Repo:** $REPO_NAME — $N_COMMITS commits, $N_FILES tracked files"
+        echo "- **On-disk:** git \`.git\` = ${GIT_SIZE:-?}, forklift \`.forklift\` = ${FORK_SIZE:-?}${SIZE_NOTE}"
+        echo "- **Tools:** $GIT_VERSION · $FORKLIFT_VERSION"
+        echo "- **Method:** read-only ops = mean of $RUNS runs, commit = mean of $COMMIT_RUNS; warm cache. Ratio < 1 means forklift is faster."
+        if [ "$COMPACT_DONE" -eq 1 ]; then
+            echo "- **Store:** both packed — forklift compacted after import, as git ships packed. The loose→packed win is the payoff callout below."
+        fi
+        echo
+        render_table_markdown
+        echo
+        echo "**Onboarding** — different operations, reported without a ratio:"
+        echo "- \`git clone --local\`: $(fmt_ms "$GIT_ONBOARD") (copies an existing packfile)"
+        echo "- \`forklift import-git\`: $(fmt_ms "$FORK_ONBOARD") (re-encodes every commit/tree/blob into the store)"
+        if [ "$COMPACT_DONE" -eq 1 ]; then
+            echo
+            echo "**Compaction payoff** — forklift's own before/after, *not* a comparison against git (git has no equivalent; it packs during clone/gc). The table above already runs on the packed store; this is what packing bought:"
+            echo "- $COMPACT_OUT"
+            echo "- On-disk: \`.forklift\` ${FORK_SIZE_LOOSE:-?} loose → ${FORK_SIZE:-?} packed"
+            echo "- log (whole history): $(fmt_ms "$HIST_LOOSE") loose → $(fmt_ms "$HIST_PACKED") packed ($(ratio "$HIST_LOOSE" "$HIST_PACKED") once packed)"
+            echo "- compacted in $(fmt_ms "$COMPACT_MS") — a real \`import-git\` folds this into onboarding automatically"
+        fi
+        echo
+        echo "> Quick comparison on one machine, not a published benchmark. For tighter"
+        echo "> statistics wrap the same commands in \`hyperfine\`. See docs/BENCHMARK.md."
+    else
+        echo
+        echo "Benchmark: forklift vs git — $REPO_NAME"
+        echo
+        printf '  Repo:      %s — %s commits, %s tracked files\n' "$REPO_NAME" "$N_COMMITS" "$N_FILES"
+        printf '  On-disk:   git .git = %s   forklift .forklift = %s%s\n' "${GIT_SIZE:-?}" "${FORK_SIZE:-?}" "$SIZE_NOTE"
+        printf '  Tools:     %s · %s\n' "$GIT_VERSION" "$FORKLIFT_VERSION"
+        printf '  Method:    read-only ops = mean of %s runs, commit = mean of %s; warm cache.\n' "$RUNS" "$COMMIT_RUNS"
+        printf '             A ratio below 1.00 means forklift is faster.\n'
+        if [ "$COMPACT_DONE" -eq 1 ]; then
+            printf '             Table runs on the packed store (compacted after import), as git ships packed.\n'
+        fi
+        echo
+        render_table_aligned
+        echo
+        echo "  Onboarding — measured separately; NOT a ratio (different operations):"
+        printf '    git clone --local     %-10s (copies an existing packfile)\n' "$(fmt_ms "$GIT_ONBOARD")"
+        printf '    forklift import-git   %-10s (re-encodes every commit/tree/blob)\n' "$(fmt_ms "$FORK_ONBOARD")"
+        if [ "$COMPACT_DONE" -eq 1 ]; then
+            echo
+            echo "  Compaction payoff (forklift's own before/after — no git equivalent):"
+            echo "  The table above runs packed; this is what packing bought over the loose store."
+            printf '    %s\n' "$COMPACT_OUT"
+            printf '    on-disk:  .forklift %s loose -> %s packed\n' "${FORK_SIZE_LOOSE:-?}" "${FORK_SIZE:-?}"
+            printf '    log walk: %s loose -> %s packed   (%s once packed)\n' "$(fmt_ms "$HIST_LOOSE")" "$(fmt_ms "$HIST_PACKED")" "$(ratio "$HIST_LOOSE" "$HIST_PACKED")"
+            printf '    compacted in %s   (a real import-git folds this in automatically)\n' "$(fmt_ms "$COMPACT_MS")"
+        fi
+        echo
+        echo "  Quick comparison on one machine — for tighter stats use hyperfine."
+        echo "  See docs/BENCHMARK.md for the fairness caveats."
+    fi
+}
+
+REPORT=$(build_report)
+echo "$REPORT"
+if [ -n "$OUT" ]; then echo "$REPORT" >> "$OUT"; echo; echo "→ appended to $OUT"; fi
+echo
+if [ "$KEEP" -eq 1 ]; then echo "→ work dir kept at $WORK"; fi
+exit 0

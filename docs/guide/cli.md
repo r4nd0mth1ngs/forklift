@@ -1,0 +1,865 @@
+# The forklift CLI — user guide
+
+Every command forklift ships, organized by what you're trying to do. If you know
+git, the [terminology map](README.md#the-warehouse-model-in-one-minute) will get
+you oriented fast.
+
+Conventions in this guide:
+- `forklift <command>` — most commands have a short alias, shown in the reference
+  table at the end and in each command's `forklift help <command>`.
+- Three global flags apply to every command: `-v`/`--verbose` (more detail),
+  `--json` (machine output — see [Machine & agent output](#machine--agent-output)),
+  and `--no-pager` (see [Paging](#paging) below).
+- `forklift help` lists everything; `forklift help <command>` explains one command
+  (subcommands work too: `forklift help office admit`).
+
+Contents:
+1. [Getting started](#1-getting-started)
+2. [Tracking changes](#2-tracking-changes)
+3. [Inspecting history](#3-inspecting-history)
+4. [Branching and merging](#4-branching-and-merging)
+5. [Parking work in progress](#5-parking-work-in-progress)
+6. [Working with remotes](#6-working-with-remotes)
+7. [Identity, signing, and agents](#7-identity-signing-and-agents)
+8. [Machine & agent output](#8-machine--agent-output)
+9. [Configuration reference](#9-configuration-reference)
+10. [Command & alias reference](#10-command--alias-reference)
+11. [Exit codes](#11-exit-codes)
+
+---
+
+## 1. Getting started
+
+### `prepare` — create a warehouse
+
+```sh
+forklift prepare
+```
+
+Creates `.forklift/` in the current directory: the object store, the inventory,
+the config folder, the pallets folder, the default pallet `main` (unborn until
+your first `stack`), a warehouse config file, and an ignore file. Idempotent —
+running it in an existing warehouse only creates what's missing. `-v` lists each
+piece created.
+
+### `import-git` — migrate a git repository (§7.8)
+
+```sh
+cd my-git-repo
+forklift prepare
+forklift import-git .
+```
+
+One-way migration of a git repo's history into the warehouse: git commits become
+parcels, trees become trees, blobs become blobs, and each **local branch becomes a
+pallet** (git's author/committer split maps onto forklift's author/stack). Git's HEAD
+branch is checked out, and `.git/` is added to `.forkliftignore` so a colocated repo
+reads clean. Requires `git` on your PATH. The imported history is **unsigned** (it
+predates trust) — import into a fresh warehouse, then `office enroll` to anchor it as the
+legacy boundary (a later `audit` then tolerates the imported parcels as legacy). Submodules
+(gitlinks) are skipped with a warning. For agents, this means a project can be moved onto
+forklift with one command.
+
+A large history lands hundreds of thousands of loose objects at once — the case the store
+is slowest and largest in — so import **packs the store on the way out** ([`compact`](#compact--pack-the-object-store),
+so you never have to remember to). Pass `--no-compact` to skip it and leave the objects
+loose (e.g. to inspect the raw store or benchmark the loose baseline).
+
+### `export-git` — migrate back to git (§7.8)
+
+```sh
+forklift export-git ../my-repo-in-git
+```
+
+The reverse of `import-git`, and the **escape hatch**: parcels become commits, trees become
+trees, blobs become blobs, and each **user pallet becomes a branch** (git's HEAD is set to
+the current pallet, and its working tree is checked out). The point is that trying forklift is
+reversible — your code history is never trapped. Requires `git` on your PATH; the target path
+must be empty or new. **Lossy in this direction:** git has no home for the signed office, the
+`@manifest` (approvals/provenance) or per-parcel signatures, so those are dropped. Author
+identity round-trips as the on-chain **identifier** — forklift never stores display names
+on-chain (zero-PII by design), so the git author name is that identifier. The meta pallets
+(`@office`, `@manifest`) are not exported.
+
+### `config` — who you are, and settings
+
+Identity is zero-configuration: if you never set anything, an opaque operator id
+(a UUID) is minted on first use and your history is pseudonymous. To be
+recognizable, set a name:
+
+```sh
+forklift config operator.name "Ada Lovelace"
+```
+
+`config` has four forms:
+
+```sh
+forklift config                       # list every known key and its value
+forklift config <key>                 # print one value
+forklift config <key> <value>         # set a value (warehouse scope)
+forklift config --unset <key>         # remove a value
+```
+
+- Add `--global` to target your per-user config (`~/.forkliftconfig`) instead of
+  the warehouse. Reads consult the warehouse first, then fall back to global.
+- Unknown keys are rejected (a typo can't silently do nothing).
+- The known keys are listed in [Configuration reference](#9-configuration-reference).
+
+### `.forkliftignore` — files forklift shouldn't track
+
+`prepare` writes a `.forkliftignore` at the warehouse root. Each line is a
+**regex** (not a glob) matched against warehouse-relative, `/`-separated paths.
+The defaults ignore `target/`, `.idea/` and `.git/`; `.forklift/` itself is
+always ignored. Example entries:
+
+```
+^target\/?.*$      # a folder called target
+\.log$             # any .log file
+```
+
+---
+
+## 2. Tracking changes
+
+The cycle is: change files → **load** them into the inventory → **stack** a
+parcel. `stocktake` shows you where you are; `diff` shows the actual lines;
+`restore` throws changes away.
+
+### `load` — stage changes (`l`)
+
+```sh
+forklift load .                # stage everything under the current directory
+forklift load src/main.rs      # stage one file
+forklift load src              # stage a directory
+```
+
+`load` reconciles each directory against its inventory shard: new files become
+tracked, modified files are re-hashed, deleted files are staged as removals. It
+is incremental — unchanged files are recognized by their stat data and never
+re-read. `load` (like every mutating command) holds the warehouse lock while it
+runs, so two forklift processes never interleave.
+
+### `unload` — stage a removal (`ul`)
+
+```sh
+forklift unload old.txt
+```
+
+Marks the path's inventory entries as deleted so the next parcel won't contain
+them. The working directory is **not** touched (the file stays on disk). To
+un-stage the removal, `load` the file again (if it's still there) or use
+`restore --staged`.
+
+### `stocktake` — status (`st`)
+
+```sh
+forklift stocktake            # full report
+forklift stocktake --summary  # just the counts (cheap; good for scripts/agents)
+```
+
+Reports the current pallet and its head, then two sets of changes:
+- **Staged** — inventory vs the pallet head (what the next `stack` will record).
+- **Not loaded** — working directory vs the inventory (what a `load` would stage).
+
+Moves are detected and shown as `moved: old -> new` when a file's content is
+unchanged but its path changed.
+
+### `diff` — line-by-line changes (`d`)
+
+```sh
+forklift diff                       # working directory vs inventory (what load would stage)
+forklift diff --staged              # inventory vs pallet head (what stack would record)
+forklift diff main feature          # two revisions, tree vs tree
+forklift diff main feature src/     # ...limited to a path
+forklift diff --verbose             # include unchanged context lines
+```
+
+Binary files are reported, not printed. Whitespace-only changes are shown faint
+(they're still real changes — the object store hashes them). With `--json`, diff
+reports the changed-file set (path + kind) rather than every line.
+
+### `restore` — discard changes (`r`)
+
+```sh
+forklift restore path            # rewrite path from the inventory (drop unstaged edits)
+forklift restore --staged path   # reset the inventory entry to the pallet head (unstage)
+```
+
+`restore path` overwrites the working file(s) from what's staged — it throws away
+unstaged edits, so use it deliberately. `restore --staged path` leaves the
+working directory alone and only un-stages (the inverse of `load`).
+
+### `stack` — commit (`s`)
+
+```sh
+forklift stack "a clear description"
+forklift stack                       # opens nothing; a description is optional but recommended
+```
+
+Builds tree objects from the inventory (bottom-up, staged removals excluded,
+empty directories pruned), creates a parcel (recording you as the author with a
+timestamp), advances the current pallet's head, and cleans up consumed staged
+state. If a consolidation is in progress, `stack` completes it. On a warehouse
+where trust is established, `stack` also signs the parcel (see
+[Identity, signing, and agents](#7-identity-signing-and-agents)).
+
+`stack` requires staged changes — it refuses to create an empty parcel.
+
+### `undo` — reverse the last operation (§7.8)
+
+```sh
+forklift undo
+```
+
+Reverses the **last state-changing operation**, using an undo journal — not just the
+last `stack`. Each `stack`, `consolidate` and `shift` snapshots its pre-operation state
+(the pallet refs, current pallet and any in-progress consolidation — all tiny, since the
+objects are content-addressed and already stored), so `undo` can walk them back one at a
+time:
+
+- Reversing a **`stack`** or **`consolidate`** is a *soft reset*: the head moves back while
+  the working directory and inventory are kept, so the undone changes are staged again
+  (like git's `reset --soft HEAD~1`). This is how a **merge is reversed** too — merge
+  parcels are no longer refused.
+- Reversing a **`shift`** moves back to the previous pallet and re-materializes its tree (it
+  refuses on a dirty working directory, just like a forward `shift`).
+
+Re-`stack` to redo (e.g. with a corrected message). When the journal is empty (a stack made
+before this feature), `undo` falls back to soft-resetting the current pallet's head to its
+first parent. Undoing a pallet's *very first* parcel, pure-staging (`load`/`unload`) and
+trust/remote commands are out of scope; `park` is reversed with `park pop`.
+
+### `peek` — inspect an object (`pk`)
+
+```sh
+forklift peek <object-hash>          # print a blob / tree / parcel
+forklift peek --inventory src        # print a folder's inventory entries
+forklift peek --inventory src -v     # ...with full stat detail
+```
+
+A debugging/inspection tool: it decodes any object by hash (a blob's text, a
+tree's entries, a parcel's tree/parents/actions/description) or dumps a folder's
+inventory shard.
+
+---
+
+## 3. Inspecting history
+
+### `history` — the log (`hi`)
+
+```sh
+forklift history                 # from the current pallet's head, newest first
+forklift history feature         # from another pallet
+forklift history 1a2b3c          # from a parcel (hash prefix, ≥ 4 chars)
+forklift history @office          # the office's audit trail (users & keys — a meta pallet)
+forklift history --class agent    # only parcels an agent authored (§7.1)
+forklift history -n 20            # only the 20 newest parcels (bounded walk)
+forklift history --oneline        # one terse line per parcel: abbreviated hash + subject
+forklift history -n 20 --json                  # a page + a `next` cursor (for agents)
+forklift history --after <cursor> -n 20 --json # the following page
+```
+
+Walks the parcel graph newest-first (ordered by the latest action timestamp, so
+merged lines interleave sensibly). `-n`/`--limit` bounds the walk to the newest N
+parcels — on a large history that loads only those N and their frontier, not the
+whole graph. Shows each parcel's hash, the parents it
+consolidates (for merge parcels), its actions (author/stack with operator and
+time), and the description. `--oneline` prints just the abbreviated hash and the
+description's first line (git's `log --oneline`) — and, since it shows no author or
+class, it skips the office read and the display-name resolution the full form does,
+so it is the fastest way to scan history. **Machine authorship is legible:** an author that is an
+agent, bot or service is shown as `[agent, supervised by <human>]`, read from the
+signed office record (§7.1) — so authorship stays forge-proof, and `--class
+<human|agent|bot|service>` filters the log to answer "which parcels did agents write,
+under whose supervision".
+
+### Paging
+
+Forklift pages output the way git does. When stdout is a **terminal**, long human
+output (`history`, a big `diff`, …) is piped through a pager so it is scrollable
+instead of scrolling off the top:
+
+- The pager is `$FORKLIFT_PAGER`, then `$PAGER`, then `less` (with git's `LESS=FRX`
+  when unset: quit if it fits one screen, keep color, don't clear on exit).
+- Short output that fits one screen prints inline; there is no pager to dismiss.
+- `--no-pager` disables it, and `--json` or any **non-terminal** target (a pipe, a
+  file) streams raw — never a pager. `history` streams as it walks, so
+  `forklift history | head` (or quitting the pager early) stops the walk instead of
+  reading the whole graph.
+
+**For agents**, page `--json` output with a cursor rather than a pager:
+`forklift history -n 20 --json` returns 20 parcels plus a `next` cursor; pass it as
+`forklift history --after <cursor> -n 20 --json` to read the following page, until
+`next` is absent (the history is exhausted). The cursor is opaque — treat it as a
+token to hand back, not something to construct.
+
+### `blame` — who wrote each line (`bl`, `annotate`)
+
+```sh
+forklift blame src/main.rs            # each line, attributed to the parcel that introduced it
+forklift blame src/main.rs --rev v1   # blame as of another revision (a pallet or parcel hash)
+forklift blame src/main.rs --json     # structured: line → parcel, parcel → signed author
+```
+
+Attributes every line of a file to the parcel that last changed it — and, because
+authorship is signed and classed (§7.1), to the author's **identity class and
+supervisor**. That is blame git structurally cannot express: *"was this line written by a
+human or an agent, under whose supervision"*, offline and forge-proof. An agent-authored
+line reads `[agent, supervised by <human>]` in the gutter, exactly like `history`. The walk
+follows the first-parent chain from the revision (git's `blame --first-parent`); a line a
+merge brought in from a side line is attributed to the merge parcel. On a long history the walk
+uses the commit-graph's **changed-path filters** (built by [`compact`](#compact--pack-the-object-store))
+to skip the parcels that never touched the file, so it stays fast as history grows.
+
+### `audit` — verify signed history offline (`a`)
+
+```sh
+forklift audit          # verify the office chain, then the current pallet
+forklift audit feature  # verify a specific pallet
+forklift audit @office  # verify just the office chain (the office is a meta pallet)
+```
+
+Requires established trust. Verifies the office chain from genesis (each office
+parcel signed by a key that was active in the previous state), then the pallet's
+parcels (each signed by a tracked key; parcels stacked before trust was
+established are tolerated as "legacy"). Any tampering — stripped or corrupted
+signatures, an unknown key, a chain that doesn't reach genesis — fails with a
+non-zero exit. See [`trust-and-identity.md`](trust-and-identity.md).
+
+### `manifest` — signed post-metadata on parcels (`mf`)
+
+```sh
+forklift manifest approve 1a2b3c -m "LGTM"   # a signed sign-off on a parcel
+forklift manifest note 1a2b3c -m "add a test" # a signed review note
+forklift manifest provenance 1a2b3c \         # how an AI produced the parcel (§7.2)
+    --model claude-opus-4-8 --tool claude-code --session sess-42
+forklift manifest show 1a2b3c                 # the entries attached to a parcel
+forklift manifest                             # the whole manifest
+```
+
+The manifest is Forklift's "GitHub layer" living inside the warehouse: approvals, review
+notes, and machine-authorship **provenance** (which model/tool/session produced a parcel,
+§7.2) — recorded as **signed tracked metadata** that *references* a parcel without ever
+changing it. Because provenance is signed, paired with an agent-class identity (`office
+admit --agent --supervisor …`) it answers *"which model produced this change, under whose
+supervision"* forge-proof and offline — the AI-traceability question git cannot. Entries live on the
+`@manifest` meta pallet, so they are forge-proof, portable, and offline-verifiable:
+`forklift audit @manifest` checks them like any signed history, `forklift history @manifest`
+is their audit trail. **Authorship is the signature, not a field you type** — you record
+as yourself, and no one can attribute an entry to another operator without their key.
+Recording needs an enrolled signing key, exactly like an office change — an approval is
+evidence, not an annotation. The subject is any revision (a pallet name or a parcel hash).
+
+The manifest **syncs with the office and the working pallets**: `lift` pushes it, `lower`
+and `franchise` pull it (never into the working directory — it is metadata). If two people
+record entries concurrently the manifest diverges, and `lower` **merges it automatically**
+— entries are independent, so the union is always conflict-free; you then `lift` the
+merge. (The office, whose records interdepend, stays linear and is reconciled by hand.)
+
+### `tag` — signed tags / releases (§9.4d)
+
+```sh
+forklift tag create v1.2.0 main -m "the second release"   # an admin-signed release tag
+forklift tag                                              # list every tag
+forklift tag show v1.2.0                                  # one tag in full
+```
+
+A tag is a named, signed pointer at a parcel — a release or a milestone. Like the manifest,
+who cut it is the parcel's **signature**, not a self-declared field, so it is verifiable
+offline against the office chain (`forklift audit @tags`). The release convention (§9.4d):
+a tag is signed by an **admin** key, so creating one requires an admin — an authoritative
+act. Tag names are **immutable** (a name already in use is refused). Tags live on the
+`@tags` meta pallet, reserving no user pallet name; without a revision, `tag create` tags
+the current pallet's head.
+
+### `haul` — pull requests (reviewable merge proposals)
+
+```sh
+forklift haul open --target main --source feature --title "Add X" -m "why"
+forklift haul list [--state open|merged|closed|all]
+forklift haul show <id>
+forklift haul comment <id> -m "…"
+forklift haul review <id> [--request-changes | --comment] -m "…"   # approves by default
+forklift shift main && forklift haul merge <id>                    # merge lands on the target
+forklift haul close <id> | reopen <id>
+```
+
+A **haul** proposes merging one pallet into another, with discussion and reviews — forklift's
+pull request. Like the manifest, it lives on a meta pallet (`@haul`) as an **append-only log
+of signed events** (Opened / Pushed / Comment / Review / Merged / Closed), folded into current
+state; it lifts/lowers/franchises with your warehouse and a diverged `@haul` **auto-merges**
+(the union of events). Because every event is signed, authorship — **including who approved** —
+is forge-proof and carries the reviewer's identity class, so a human's approval is
+distinguishable from an agent's (`haul show` tags automated reviewers). `merge` reuses
+`consolidate` (a clean disjoint merge auto-stacks; a conflict leaves the consolidation in
+progress — resolve, `stack`, then re-run `haul merge` to record it). A haul id is
+content-addressed; use any unique prefix.
+
+This release is **intra-warehouse** (pallet → pallet), and reviews are **recorded but not
+enforced** — anyone with write access to the target can merge (approval-gating is a later
+policy layer). Cross-warehouse forks come later. Requires an enrolled signing key.
+
+---
+
+## 4. Branching and merging
+
+### `palletize` — create a pallet / list pallets (`pz`)
+
+```sh
+forklift palletize                 # list pallets (the current one marked *)
+forklift palletize --all           # also list the meta pallets (@office, …) under a heading
+forklift palletize feature         # create "feature" at the current head and shift to it
+forklift palletize hotfix 1a2b3c   # create "hotfix" at a revision and shift to it
+```
+
+The list shows user pallets only by default; `--all` adds the meta pallets (the office
+and other tracked metadata), each in its `@`-qualified form — the address you reach it
+with. Pallet names may contain `/` (mapped to subfolders). Creating one at a revision
+materializes that state (and refuses on a dirty warehouse); creating one at the
+current head just moves refs.
+
+### `shift` — switch pallets (`sh`)
+
+```sh
+forklift shift main
+```
+
+Materializes the target pallet's head tree in the working directory, repopulates
+the inventory from it, and makes it the current pallet. Refuses to run when you
+have staged or unstaged changes (they'd be overwritten) — stack, restore, or park
+them first. Untracked files are left alone unless the target needs to write over
+one.
+
+### `consolidate` — merge (`con`)
+
+```sh
+forklift consolidate feature
+```
+
+Merges another pallet's head into the current pallet:
+- **Already up to date** when the current head already contains it — nothing happens.
+- **Fast-forward** when the current head is an ancestor of the target — the ref just moves.
+- Otherwise a **three-way merge** against the common ancestor. Clean merges stack
+  a two-parent merge parcel immediately. Conflicts are written into the working
+  files with diff3 markers, the entries enter a conflict state, and the
+  consolidation stays in progress until you resolve, `load`, and `stack`.
+
+Requires a clean warehouse before it starts.
+
+### `deliver` — squash a draft onto a target, keeping the trail (`dv`)
+
+```sh
+forklift deliver main -m "add the feature"   # run from the draft pallet
+```
+
+The squash agents need without losing the trail (§7.3). Agents checkpoint constantly;
+humans want one reviewed parcel. `deliver` takes the current (draft) pallet's net change
+and lands it on the target as a **single clean signed parcel** — the draft head's tree
+with the target as its *only* parent, so the checkpoints stay out of the target's history.
+The full trail is **kept** (the draft pallet is left intact, browsable with `history`) and
+recorded as a signed **delivery** entry on the new parcel's manifest, so "what the agent
+tried, in what order" stays discoverable (`manifest show <parcel>`). The delivered parcel
+preserves the trail's authors; the deliverer is the stacker.
+
+Needs an enrolled key (the trail is signed evidence). The current pallet becomes the
+target, and because the delivered tree equals the draft's, the working directory does not
+change. A second delivery of an already-delivered draft is refused.
+
+### `cherry-pick` — apply one parcel's change onto the current pallet (`cp`)
+
+```sh
+forklift cherry-pick 1a2b3c            # apply that parcel's diff here, as a new parcel
+forklift cherry-pick feature -m "..."  # pick a pallet's head, with a custom message
+```
+
+Applies a parcel's diff — its change against its first parent — onto the current pallet as
+a new parcel (§9.1 #8). Unlike rebase, cherry-pick only **adds**: no rewrite, no
+force-push, nothing an audit has to bless twice. The picked parcel's **authors are
+preserved** and you are recorded as the stacker (the same author/stacker split as
+`import-git`/`export-git` and `deliver`), and the new parcel is freshly signed. It is
+applied by three-way merge, so a **clean** pick is stacked immediately as a single-parent
+parcel; a **conflicting** one writes diff3 markers and leaves a cherry-pick in progress —
+resolve, `load`, and `stack` to complete it (still single-parent, still author-preserving),
+or remove `.forklift/cherry-pick` to abort. A pick whose changes are already present is
+refused. Requires a clean warehouse.
+
+### `conflicts` — list unresolved conflicts
+
+```sh
+forklift conflicts            # human list
+forklift conflicts --json     # structured: each file's base/ours/theirs as content addresses
+```
+
+Lists the files a consolidation or cherry-pick left in conflict. With `--json`, each file's
+three sides (base, ours, theirs) are reconstructed from the diff3 markers and
+given as content-addressed blob hashes you can `peek` — designed for agents,
+which resolve merges well given structure instead of marker soup. An empty list
+is a valid answer (nothing to resolve).
+
+**Resolving a conflict:** edit each conflicted file to remove the markers,
+`forklift load` it, then `forklift stack` to complete the consolidation or cherry-pick.
+
+### `bay` — parallel working directories (§7.5)
+
+```sh
+forklift bay add feature ../myrepo.feature   # a new working dir on a new pallet "feature"
+forklift bay                                 # list the bays
+forklift bay remove feature                  # de-register a bay (its pallet + files are kept)
+```
+
+A bay is an additional working directory bound to this warehouse — git's worktrees,
+designed in. It **shares** the object store, the refs (pallets/meta) and trust, but keeps
+its **own** working tree, inventory, current pallet and lock. So several agents (or you and
+an agent) work one machine without cloning the objects N times or serializing through one
+lock: N bays, N pallets, one warehouse. `bay add <name>` checks out a new pallet named
+after the bay (branched from the current head) into a fresh directory (default: a sibling
+of the warehouse); `cd` into it and it behaves like any warehouse — `load`, `stack`, `lift`
+all operate on the bay's pallet against the shared object store. The bay's directory holds
+a `.forklift` *file* (a redirect back to the warehouse), and its local state lives under
+`.forklift/bays/<name>/`.
+
+---
+
+## 5. Parking work in progress
+
+### `park` — stash (`pa`)
+
+```sh
+forklift park            # park tracked changes and reset to the pallet head
+forklift park list       # list parked parcels, newest first
+forklift park pop         # re-apply the most recent parked changes (staged) and drop it
+```
+
+`park` saves your staged and unstaged changes to **tracked** files as a parked
+parcel and resets the warehouse to the pallet head (untracked files are left
+alone). `park pop` re-applies the most recent parked changes as a clean re-apply
+— it must be popped onto the head it was parked on, or it reports a conflict.
+
+---
+
+## 6. Working with remotes
+
+Forklift's remote is untrusted storage plus thin verifiers: bytes move in
+parallel, and anything you download is verified locally by hash. Set a remote
+once, then push and pull.
+
+### `franchise` — clone (`fr`)
+
+```sh
+forklift franchise http://forklift.example.com:9418 my-project
+forklift franchise <url> <dir> --pallet main --token <secret>
+```
+
+Prepares a fresh warehouse in the target directory, remembers the remote, adopts
+its trust anchor, downloads the history (using the remote's bundle when it has
+one, then loose objects for the rest), and materializes the chosen pallet
+(default: the remote's default pallet). The directory must be new or empty.
+
+### Configuring a remote on an existing warehouse
+
+```sh
+forklift config remote.url http://forklift.example.com:9418
+forklift config remote.token <secret>      # only if the server requires one
+```
+
+### `lift` — push (`li`)
+
+```sh
+forklift lift
+```
+
+Uploads the current pallet's new parcels to the remote and moves the remote's ref
+with a compare-and-swap. When trust is established, the office pallet and trust
+anchor are lifted first (the server verifies every signature before accepting).
+The remote only accepts **fast-forward** updates — no force push.
+
+**Optimistic lift (§7.7):** if the remote moved and the two changes are cleanly
+mergeable (they touch different files), `lift` **auto-lowers, consolidates and
+retries** on its own — so a fleet of agents stacking to one pallet stops
+serializing through a human. It reports how many times it auto-merged. Only a
+clean warehouse qualifies (the merge materializes), and a **true overlap** (both
+sides edited the same file) still stops with the diverged error, leaving the
+warehouse untouched — resolve it with `lower` + `consolidate`.
+
+### `lower` — pull (`lo`)
+
+```sh
+forklift lower
+```
+
+Fetches the remote's new parcels for the current pallet and fast-forwards to them
+— working directory and inventory included. On first contact with a trusted
+remote, its trust anchor is adopted (a one-way door, like enrolling). A diverged
+pallet is never merged implicitly: `lower` fetches the parcels and reports the
+divergence, and you consolidate deliberately (`palletize` the remote head into
+its own pallet, `consolidate` it, then `lift` the merge). Requires a clean
+warehouse.
+
+---
+
+## 7. Identity, signing, and agents
+
+The `office` command manages who may contribute and how contributions are signed
+— users, keys, roles, agents, and trust resets. This is a big topic with its own
+guide: **[`trust-and-identity.md`](trust-and-identity.md)**. In brief:
+
+```sh
+forklift office enroll            # establish trust (one-way; every parcel is signed after this)
+forklift office keygen            # generate a key and print your enrollment line
+forklift office admit <id> <pub> <pop>   # an admin admits a newcomer (or an agent/bot)
+forklift office list              # who's enrolled, their roles, keys, and classes
+forklift office rotate            # replace your key
+forklift office retire <key>      # revoke a key
+```
+
+`profile` lets one machine act as different operators in different warehouses:
+
+```sh
+forklift profile list
+forklift profile create work --name "Work Me"
+forklift profile use work
+```
+
+---
+
+## 8. Machine & agent output
+
+Every command takes `--json` and emits one structured envelope instead of prose;
+errors carry a stable code and a deterministic exit code. Forklift also ships an
+MCP server (`forklift mcp`) that exposes the command surface as native tools for
+AI agents. Full details — the envelope schema, the error/exit-code taxonomy, the
+`conflicts` content addresses, and wiring `forklift mcp` into a client — are in
+**[`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md)**.
+
+```sh
+forklift stocktake --json
+forklift stack "x" --json
+forklift mcp --root /path/to/warehouse    # run the MCP server against a warehouse
+```
+
+### `self-update` — check for and apply a newer release
+
+```sh
+forklift self-update            # update in place if you installed via the script
+forklift self-update --check    # only report; change nothing
+```
+
+Compares this binary against the latest published release. If you installed via the
+install script (or a manual copy), it updates in place by re-running that verified script.
+If you installed via a **package manager**, it never overwrites the binary — it prints the
+right upgrade command instead (`cargo install … --force`, `brew upgrade forklift`), so it
+can't fight your package manager. `--check` (and `--json`) just reports `{current, latest,
+update_available, install_method, update_command}`. There is **no server self-update** by
+design: a server is redeployed (new container / Lambda version / package), never
+self-mutated.
+
+### `compact` — pack the object store
+
+```sh
+forklift compact
+```
+
+Forklift stores every object as its own compressed file. That is simple and safe, but at
+scale (say after importing a large git history) it becomes hundreds of thousands of tiny
+files: each pays filesystem slack, and a full-history walk pays an open per object. `compact`
+sweeps the loose objects into a few dense **pack** files — an append-only data file plus a
+sorted index — so the store is a handful of large files and a read is a binary search plus one
+seek. Each file's successive versions are stored as **deltas** — the change from the previous
+version of the *same file* rather than a whole new copy — which is git's biggest space win.
+`compact` finds that previous version the way git does, by walking history to associate each
+blob with its path, so the deltas are as tight as git's: **git.git packs to 261 MB, smaller
+than git's own 310 MB pack.** A loose object is removed only after the pack that holds it is
+durably written, and a delta is content-verified on read, so compacting can never lose or
+corrupt an object (interrupt it freely). Packs roll over at a size/count threshold, so no
+single pack grows unbounded. `--json` reports
+`{objects_packed, packs_written, loose_removed, deltas, bytes_packed}`.
+
+`compact` also **builds the commit-graph** (`.forklift/graph/`) while it is here: a sharded,
+self-healing cache that gives each parcel a generation number — so ancestry checks
+(`consolidate`, `haul`) find a merge base without walking history to the roots — and a
+changed-path filter — so `blame` skips parcels that did not touch the file. It is derived and
+repairs itself, so you never manage it; building it during `compact` just means it is warm the
+first time you need it.
+
+**You rarely need to run this by hand.** `import-git` compacts on the way out (unless you pass
+`--no-compact`), and afterwards forklift **compacts automatically** in the background of a
+mutating command once the store has accumulated enough loose objects or packs to warrant it
+(git's `gc --auto`). It runs synchronously, under that command's lock, so it is correct and
+never races — which means it can add a brief pause when it fires (rarely). Turn it off with
+`config maintenance.auto false`, or tune the thresholds (`maintenance.loose`, `maintenance.packs`).
+
+Compaction also takes a **shared object-store lock** (separate from the per-bay lock ordinary
+commands hold), so two bays or two processes never compact the same store at once. If another
+compaction is already running, an explicit `forklift compact` reports it and stops; the
+automatic background compaction simply skips (the other run is doing the same work). Ordinary
+mutating commands are never blocked by it.
+
+Plain `compact` is **incremental**: it packs the loose objects into a *new* pack and leaves
+existing packs alone (cheap, but packs accumulate over time). `compact --all` is a **full
+repack**: it rewrites every pack too, **dropping unreachable objects** that were stuck in
+packs (garbage from undone stacks, abandoned pushes) and **consolidating many packs into
+few**. It **reuses** each object's existing delta (a byte-copy, not a re-compress), so it is
+fast and never balloons the store — but heavier than incremental; run it occasionally (auto
+does when packs pile up, or a server off-peak).
+
+```sh
+forklift compact          # incremental: pack the loose objects
+forklift compact --all    # full repack: drop garbage, consolidate every pack
+```
+
+> Phase 1 of object-store scaling: it removes per-file slack and the open-per-object read
+> cost. Delta compression between similar versions (the rest of the size gap vs git) is a
+> later phase — see [`../OBJECT_STORE_SCALING.md`](../OBJECT_STORE_SCALING.md).
+
+### `store` — object-store health
+
+```sh
+forklift store
+```
+
+The read-only counterpart of `compact` (and the object-store analog of `stocktake`, which
+reports the working tree). It takes an **exact** census of `.forklift/objects`: how many
+objects are **loose** (unpacked) versus **packed**, how many pack files there are and how
+**delta-dense** they are, the on-disk sizes, and — against the `maintenance.loose` /
+`maintenance.packs` thresholds — whether an incremental compaction or a consolidating repack
+is currently **due**. It answers "how much of the store is packed, and does it need
+maintenance?" without doing any work.
+
+```
+Object store
+  loose:   12 objects   (48.0 KiB)
+  packed:  402118 objects in 1 pack   (236.0 MiB, 261000 deltas)   99% packed
+  total:   236.0 MiB on disk
+
+  maintenance: auto on
+    compaction  not due — 12 / 6700 loose objects
+    repack      not due — 1 / 20 packs
+```
+
+`--json` reports `{loose_objects, loose_bytes, packed_objects, pack_files, deltas, pack_bytes,
+total_bytes, packs:[{id, objects, deltas, bytes}], maintenance:{auto, loose_threshold,
+pack_threshold, compaction_due, repack_due}}` — every size an exact byte count. Nothing is
+written; run `compact` to act on what it reports.
+
+---
+
+## 9. Configuration reference
+
+Two scopes: **warehouse** (`.forklift/config/warehouse.toml`, default) and
+**global** (`~/.forkliftconfig`, with `--global`). Reads prefer the warehouse
+value. Known keys:
+
+| Key | Meaning |
+|-----|---------|
+| `operator.name` | Your display name (local only — never written on-chain). |
+| `operator.identifier` | Your on-chain operator id (opaque; a UUID is minted if unset). |
+| `operator.profile` | The named profile this warehouse acts under (see `profile`). |
+| `remote.url` | The remote warehouse URL (for `lift`/`lower`). |
+| `remote.token` | The bearer token, when the remote requires one. |
+| `maintenance.auto` | Auto-compact after mutating commands (`false`/`0`/`off`/`no` to disable; default on). |
+| `maintenance.loose` | Loose-object count that triggers an auto incremental compact (default 6700). |
+| `maintenance.packs` | Pack count that triggers an auto consolidating repack (default 20). |
+
+Set / read / remove:
+
+```sh
+forklift config operator.name "Ada"
+forklift config --global operator.identifier ada@example.com
+forklift config remote.token
+forklift config --unset remote.token
+```
+
+The `FORKLIFT_GLOBAL_CONFIG` and `FORKLIFT_KEYS_DIR` environment variables
+relocate the global config file and the private-key directory (used by tests and
+for isolating identities). `FORKLIFT_KEY_PASSPHRASE` supplies a protected key's
+passphrase non-interactively (an automation escape hatch — see
+[`trust-and-identity.md`](trust-and-identity.md#6-passphrase-protected-keys)).
+
+`FORKLIFT_FSYNC` controls write durability. By default every object, ref and pack
+write is fsynced (file **and** its directory) so an interruption — including power
+loss — can never lose or truncate committed data. Set it to `0`, `off`, `false`,
+or `no` to skip all fsyncing: markedly faster for **bulk, disposable** work (large
+imports, CI, throwaway fixtures) where a mid-run crash just means re-running the
+whole operation. Leave it on for any warehouse whose history you intend to keep.
+
+---
+
+## 10. Command & alias reference
+
+### Coming from git?
+
+Forklift accepts the familiar git command names as hidden aliases, so your muscle memory
+works on day one — while forklift's own vocabulary stays primary in `--help` (the aliases
+nudge you toward the real names as you go):
+
+| You type (git) | Runs (forklift) | | You type (git) | Runs (forklift) |
+|---|---|---|---|---|
+| `init` | `prepare` | | `checkout` / `switch` | `shift` |
+| `add` | `load` | | `merge` | `consolidate` |
+| `commit` | `stack` | | `clone` | `franchise` |
+| `status` | `stocktake` | | `push` | `lift` |
+| `log` | `history` | | `pull` | `lower` |
+| `branch` | `palletize` | | `stash` | `park` |
+| `annotate` | `blame` | | | |
+
+The mapping isn't always one-to-one in *behavior* (e.g. `commit` runs `stack`, which commits
+what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag` and `cherry-pick`
+keep their git names outright. For the review workflow, git's "pull request" is
+[`haul`](#haul--pull-requests-reviewable-merge-proposals).
+
+| Command | Alias | Does |
+|---------|-------|------|
+| `prepare` | `p` | Create a warehouse here |
+| `import-git` | | Migrate a git repo's history into the warehouse |
+| `export-git` | | Export the warehouse's history back into a git repo |
+| `config` | `cfg` | Read/set/unset configuration |
+| `profile` | | Manage named identity profiles |
+| `load` | `l` | Stage changes into the inventory |
+| `unload` | `ul` | Stage a removal |
+| `restore` | `r` | Restore from the inventory (discard changes) |
+| `stocktake` | `st` | Show staged and unstaged changes |
+| `diff` | `d` | Show line-by-line changes |
+| `stack` | `s` | Record the inventory as a new parcel |
+| `undo` | | Soft-reset the last stack |
+| `peek` | `pk` | Inspect an object or inventory |
+| `history` | `hi` | Walk the parcel graph |
+| `blame` | `bl` | Attribute each line to its author (with identity class) |
+| `audit` | `a` | Verify signed history offline |
+| `palletize` | `pz` | Create a pallet / list pallets |
+| `shift` | `sh` | Switch pallets |
+| `consolidate` | `con` | Merge another pallet in |
+| `cherry-pick` | `cp` | Apply a parcel's diff here, preserving authorship |
+| `deliver` | `dv` | Squash a draft onto a target, keeping the trail |
+| `bay` | | Parallel working directories (add / list / remove) |
+| `compact` | | Pack the loose object store into dense pack files |
+| `store` | | Report object-store health (loose vs packed, sizes, maintenance due) |
+| `conflicts` | | List unresolved conflicts |
+| `park` | `pa` | Stash / list / pop work in progress |
+| `franchise` | `fr` | Clone a remote warehouse |
+| `lift` | `li` | Push to a remote |
+| `lower` | `lo` | Pull from a remote |
+| `office` | `o` | Manage users, keys, roles, agents, trust |
+| `manifest` | `mf` | Record/read signed post-metadata on parcels |
+| `tag` | | Signed tags / releases (admin-signed, offline-verifiable) |
+| `mcp` | | Serve the command surface as MCP tools |
+| `help` | `h` | Show help |
+| `version` | `v` | Print the version |
+
+---
+
+## 11. Exit codes
+
+Errors set a deterministic exit code so scripts branch without parsing prose:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Generic error |
+| 2 | Usage / argument error |
+| 3 | Not a warehouse |
+| 4 | Conflict (working state blocks the operation) |
+| 5 | Diverged (a remote ref moved under a lift) |
+| 6 | Warehouse locked (another forklift process holds it) |
+
+With `--json`, the same classification appears as `error.code` in the output
+envelope. See [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md).

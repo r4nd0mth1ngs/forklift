@@ -1,0 +1,202 @@
+use chrono::Utc;
+use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+use crate::enums::parcel_action_type::ParcelActionType;
+use crate::model::operator::Operator;
+use crate::model::parcel::Parcel;
+use crate::model::parcel_action::ParcelAction;
+use crate::util::{
+    cherry_pick_utils, config_utils, inventory_utils, merge_utils, object_utils, office_utils,
+    pallet_utils, sign_utils, tree_utils,
+};
+
+/// Resolve the key a parcel must be signed with: `None` while trust is not established,
+/// the operator's local active key afterwards (an error when they have none — signing
+/// is mandatory once trust exists).
+///
+/// # Arguments
+/// * `operator` - The configured operator.
+///
+/// # Returns
+/// * `Ok(Some(String))` - The signing key id.
+/// * `Ok(None)`         - Trust is not established; parcels are not signed yet.
+/// * `Err(String)`      - Trust is established but the operator cannot sign.
+pub fn resolve_signing_key(operator: &Operator) -> Result<Option<String>, String> {
+    if office_utils::read_trust_anchor()?.is_none() {
+        return Ok(None);
+    }
+
+    let state = office_utils::read_office_state()?;
+
+    if state.find_user(&operator.identifier).is_none() {
+        return Err(format!(
+            "Trust is established for this warehouse, and \"{}\" is not enrolled: \
+            parcels cannot be stacked without a signature. Ask an enrolled operator to \
+            admit you (\"office keygen\", then \"office admit\").",
+            operator.identifier
+        ));
+    }
+
+    state.signing_key_of(&operator.identifier)
+        .map(|key| Some(key.key_id.clone()))
+        .ok_or(format!(
+            "No active key of \"{}\" is present on this machine; parcels cannot be \
+            stacked without a signature.",
+            operator.identifier
+        ))
+}
+
+/// Stack the inventory as a new parcel on the current pallet: build the tree objects,
+/// create the parcel (recording the configured operator), advance the pallet head, and
+/// clean up the consumed staged state.
+///
+/// When a consolidation is in progress, the consolidated head becomes the parcel's second
+/// parent and the consolidation state is cleared. Stacking refuses to run while any
+/// inventory entry is in a conflict state.
+///
+/// # Arguments
+/// * `description` - The parcel description.
+///
+/// # Returns
+/// * `Ok((String, String))` - The new parcel's hash and the pallet it was stacked on.
+/// * `Err(String)`          - If there is nothing to stack, the operator identity is not
+///                            configured, conflicts are unresolved, or an operation failed.
+pub async fn stack_parcel(description: Option<String>) -> Result<(String, String), String> {
+    // The operator identity is resolved before any work happens, so a missing
+    // configuration aborts the stack before objects are written.
+    let operator = config_utils::get_operator()?;
+
+    // Once trust is established, every parcel must be signed — there is no unsigned
+    // escape hatch. The signing key is resolved up front so a missing key aborts the
+    // stack before objects are written.
+    let signing_key_id = resolve_signing_key(&operator)?;
+
+    if inventory_utils::has_conflict_entries()? {
+        return Err(
+            "There are unresolved conflicts in the inventory. Resolve them, \"load\" the \
+            resolved files, and stack again (see \"stocktake\" for the list).".to_string()
+        );
+    }
+
+    let consolidation = merge_utils::read_consolidation_state()?;
+
+    // A cherry-pick in progress (§9.1 #8) completes here, single-parent: the picked
+    // parcel's authors are preserved and this operator is recorded as the stacker.
+    let cherry_pick = cherry_pick_utils::read_state()?;
+
+    let pallet = pallet_utils::get_current_pallet_name()?;
+    let head = pallet_utils::get_pallet_head(&pallet)?;
+
+    let root_tree = tree_utils::build_tree_from_inventory().await?
+        .ok_or("There is nothing to stack. Use the \"load\" command to stage changes first.".to_string())?;
+
+    let root_is_empty = root_tree.get_files().len() == 0 && root_tree.get_subtrees().len() == 0;
+
+    if head.is_none() && root_is_empty {
+        return Err("There is nothing to stack. Use the \"load\" command to stage changes first.".to_string());
+    }
+
+    if let Some(head_hash) = &head {
+        let head_parcel = object_utils::load_parcel(head_hash)?;
+
+        // A consolidation may legitimately produce the same tree (e.g. "theirs" only
+        // re-applied changes we already have) — the merge parcel still has to be
+        // recorded, so the no-op check only applies to plain stacks.
+        if consolidation.is_none() && head_parcel.tree_hash == root_tree.hash {
+            // For a cherry-pick, an unchanged tree means the pick is empty (the head
+            // already has the change): clear the pick and say so, rather than recording
+            // an empty parcel.
+            if cherry_pick.is_some() {
+                cherry_pick_utils::clear_state()?;
+
+                return Err(
+                    "The cherry-pick is empty: applying it changes nothing (the head already \
+                    has these changes). Nothing was stacked.".to_string()
+                );
+            }
+
+            return Err(format!(
+                "Nothing to stack: the inventory matches the head of pallet \"{}\".",
+                pallet
+            ));
+        }
+    }
+
+    let mut parents: Vec<String> = head.into_iter().collect();
+
+    // A consolidation adds the consolidated head as a second parent; a cherry-pick does
+    // not — it re-applies a diff as a single-parent parcel (no merge, no rewrite).
+    if let Some(state) = &consolidation {
+        parents.push(state.their_head.clone());
+    }
+
+    // A cherry-pick's completing `stack` defaults to the pick's stored description.
+    let description = description.or_else(|| cherry_pick.as_ref().and_then(|cp| cp.description.clone()));
+
+    // Authorship convention: every parcel records its author(s) as explicit Author
+    // actions, even when the author and the stacker are the same operator (like git,
+    // which records author == committer on plain commits). A cherry-pick preserves the
+    // source parcel's Author actions and adds this operator's Stack action.
+    let timestamp = Utc::now();
+
+    let actions = match &cherry_pick {
+        Some(state) => {
+            let authors = cherry_pick_utils::collect_source_authors(&state.source, &operator)?;
+
+            let mut actions: Vec<ParcelAction> = authors.into_iter()
+                .map(|author| ParcelAction {
+                    operator: author,
+                    action: ParcelActionType::Author,
+                    description: None,
+                    timestamp,
+                })
+                .collect();
+
+            actions.push(ParcelAction {
+                operator: operator.clone(),
+                action: ParcelActionType::Stack,
+                description: None,
+                timestamp,
+            });
+
+            actions
+        }
+        None => vec![
+            ParcelAction {
+                operator: operator.clone(),
+                action: ParcelActionType::Author,
+                description: None,
+                timestamp,
+            },
+            ParcelAction {
+                operator: operator.clone(),
+                action: ParcelActionType::Stack,
+                description: None,
+                timestamp,
+            },
+        ],
+    };
+
+    let parcel = Parcel {
+        tree_hash: root_tree.hash.clone(),
+        parents,
+        actions,
+        description,
+    };
+
+    let mut object = LooseObjectBuilder::build_parcel(&parcel);
+    object.store()?;
+
+    if let Some(key_id) = &signing_key_id {
+        let signature = sign_utils::sign_parcel_hash(key_id, &object.hash)?;
+        sign_utils::store_parcel_signature(&object.hash, &signature)?;
+    }
+
+    pallet_utils::set_pallet_head(&pallet, &object.hash)?;
+
+    // The parcel consumed the staged removals (and the consolidation or cherry-pick, if any).
+    inventory_utils::cleanup_after_stack()?;
+    merge_utils::clear_consolidation_state()?;
+    cherry_pick_utils::clear_state()?;
+
+    Ok((object.hash, pallet))
+}
