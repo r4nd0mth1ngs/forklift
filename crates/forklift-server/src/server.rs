@@ -34,6 +34,7 @@ use forklift_core::model::remote::{
     PROTOCOL_VERSION,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
+use forklift_core::util::lock_utils::ServeLock;
 use forklift_core::util::{
     audit_utils, bundle_utils, file_utils, hook_utils, merge_utils, object_utils,
     office_utils, pallet_utils, sign_utils, warehouse_utils,
@@ -56,16 +57,42 @@ struct WarehouseHandle {
 
     /// Whether a bundle rebuild is running right now (never two at once).
     bundling: std::sync::atomic::AtomicBool,
+
+    /// The serve lock for this root, held for as long as the handle is served (R7). `None` for
+    /// transient handles that are not a live served warehouse (e.g. the throwaway handle
+    /// `put_warehouse` uses only to run `prepare` in a storage scope). Held in the handle so the
+    /// lock releases exactly when the served warehouse stops being served (server shutdown).
+    _serve_lock: Option<ServeLock>,
 }
 
 impl WarehouseHandle {
+    /// A transient handle with no serve lock — for work that is not a live served warehouse
+    /// (warehouse creation). A served warehouse is built with [`WarehouseHandle::serving`].
     fn new(root: PathBuf) -> WarehouseHandle {
         WarehouseHandle {
             writes: Mutex::new(()),
             root,
             lifts_since_bundle: std::sync::atomic::AtomicU32::new(0),
             bundling: std::sync::atomic::AtomicBool::new(false),
+            _serve_lock: None,
         }
+    }
+
+    /// A handle for a warehouse this process is about to serve: acquires the serve lock at `root`
+    /// (R7) and holds it in the handle for the handle's lifetime. Errors if the root is already
+    /// served by another process, or a `gc`/`bundle` is running against it — in either case
+    /// serving it would be unsafe.
+    fn serving(root: PathBuf) -> Result<WarehouseHandle, String> {
+        // Acquire inside the root's storage scope so the lock lands at this warehouse's store
+        // root (the scope is synchronous and never held across an `.await`; the guard keeps an
+        // absolute path, so it stays valid once the scope drops).
+        let serve_lock = {
+            let _scope = StorageRootScope::enter(&root);
+            ServeLock::acquire()?
+        };
+        let mut handle = WarehouseHandle::new(root);
+        handle._serve_lock = Some(serve_lock);
+        Ok(handle)
     }
 }
 
@@ -221,7 +248,9 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
                 ));
             }
 
-            ServeMode::Single(Arc::new(WarehouseHandle::new(root)))
+            // Hold the serve lock for the served root for the process lifetime (R7): a second
+            // server on the same root is refused here rather than silently breaking the CAS.
+            ServeMode::Single(Arc::new(WarehouseHandle::serving(root)?))
         }
         (None, Some(base)) => {
             let base = std::fs::canonicalize(&base)
@@ -734,7 +763,15 @@ fn resolve_warehouse(state: &AppState,
         ));
     }
 
-    let handle = Arc::new(WarehouseHandle::new(root));
+    // Acquire this warehouse's serve lock as it is first served, and hold it in the cached handle
+    // for the server's lifetime (R7). Refuses (503) if a `gc`/`bundle` is running against this
+    // warehouse, or another server already serves it — serving it then would be unsafe.
+    let handle = Arc::new(
+        WarehouseHandle::serving(root).map_err(|e| (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("Warehouse \"{}\" is temporarily unavailable (under maintenance): {}", id, e),
+        ))?
+    );
     registry.insert(id, Arc::clone(&handle));
 
     Ok(handle)
