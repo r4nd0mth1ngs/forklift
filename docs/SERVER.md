@@ -131,9 +131,16 @@ refuse a request, it cannot make an invalid one verify.
   Successive versions of a file are **delta-compressed** (`docs/format/BUNDLE_FORMAT.md`,
   §9.1 #1), so the bundle moves each change rather than every whole file; the reconstructed
   objects are hash-verified on import, and older clients fall back to loose objects.
+  Unlike `gc`, `bundle` is **safe to run against a live server** — it never deletes an object
+  and writes atomically, so you can refresh a served root's bundle without downtime.
 - **GC:** `forklift-server gc --root … [--grace-hours 24]` deletes objects no pallet
-  head reaches. The grace period protects the objects of in-flight lifts; run it from
-  cron at whatever cadence fits.
+  head reaches. The grace period protects the objects of in-flight lifts. It is **refused
+  while a server is serving that root** — it would sweep the server's in-flight objects and
+  make a concurrent lift fail its ref update — so stop the server, gc, then restart (run it
+  in a maintenance window, not against a live server). A hard-killed server leaves a
+  `serve.lock` behind (a graceful SIGINT/SIGTERM removes it automatically); if `gc` reports
+  the root locked by a process that is no longer running, remove
+  `<root>/.forklift/serve.lock` and retry.
 - **Shutdown:** SIGINT/SIGTERM drain in-flight requests before exiting.
 
 ## Updating

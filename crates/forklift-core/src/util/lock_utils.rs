@@ -8,6 +8,9 @@ const FILE_NAME_LOCK: &str = "lock";
 /// The name of the shared object-store lock file (inside the forklift root folder).
 const FILE_NAME_STORE_LOCK: &str = "store.lock";
 
+/// The name of the serve lock file (inside the forklift root folder).
+const FILE_NAME_SERVE_LOCK: &str = "serve.lock";
+
 /// An exclusive lock on the warehouse, held for the duration of a mutating command.
 ///
 /// This is the staging-area atomicity story (see the design document): commands that
@@ -86,6 +89,49 @@ impl Drop for StoreLock {
     }
 }
 
+/// An exclusive lock marking a warehouse root as **served by a live server** (or held for the
+/// duration of a serve-exclusive maintenance command).
+///
+/// The server head acquires it once at startup — for the single served root, or per warehouse in
+/// multi-warehouse mode — and holds it for the whole process lifetime; `gc` acquires it for its
+/// duration. That makes the two mutually exclusive on a given root: `gc` can never sweep a live
+/// server's in-flight objects (a lift slower than the grace period would otherwise lose its
+/// staged objects and then fail its ref update), and a second server accidentally started on the
+/// same root is refused up front instead of silently breaking the first server's in-process
+/// ref-update CAS (R7). `bundle` deliberately does *not* take it — it never deletes an object,
+/// writes atomically, and a stale bundle is self-healing, so it is safe against a live server.
+///
+/// Distinct from [`StoreLock`], which serializes destructive store *maintenance* against itself
+/// (compaction vs compaction) — a server never compacts, so it never takes that lock; this one is
+/// the serve-vs-maintenance gate. Like the other locks it is a lock *file* created with
+/// `create_new` (atomic on every platform) and removed on drop; a hard-killed holder leaves it
+/// behind for the next command to report by PID (a crashed server thus blocks `gc`/`bundle` until
+/// the operator removes it, which is the safe default — better than sweeping a root that might
+/// still be served).
+pub struct ServeLock {
+    path: PathBuf,
+}
+
+impl ServeLock {
+    /// Acquire the serve lock at the current storage root. Errors immediately (does not block) if
+    /// another process already holds it — a live server on this root, or a `gc`/`bundle` already
+    /// running against it.
+    pub fn acquire() -> Result<ServeLock, String> {
+        // Lives at `forklift_root` (the shared store root), like the store lock: the server and
+        // `gc`/`bundle` all enter the same storage-root scope, so they agree on the path. Absolute
+        // for the same reason as the other locks — the working directory can change before drop.
+        let path = absolute(forklift_root().join(FILE_NAME_SERVE_LOCK));
+        acquire_lock_file(&path, "warehouse root")?;
+        Ok(ServeLock { path })
+    }
+}
+
+impl Drop for ServeLock {
+    fn drop(&mut self) {
+        release_lock_file(&self.path);
+    }
+}
+
 /// Create an exclusive lock file at `path`, atomically (`create_new`, atomic on every platform).
 /// `subject` names what is being locked, for the contention message. Shared by every lock scope.
 fn acquire_lock_file(path: &Path, subject: &str) -> Result<(), String> {
@@ -158,6 +204,31 @@ mod tests {
         );
         drop(first);
         StoreLock::acquire().expect("after the first is dropped the lock is free again");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn the_serve_lock_is_exclusive_releases_on_drop_and_is_distinct_from_the_store_lock() {
+        let temp = std::env::temp_dir().join(format!("forklift-servelock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(temp.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let first = ServeLock::acquire().expect("the first serve-lock acquire succeeds");
+        assert!(
+            ServeLock::acquire().is_err(),
+            "a second serve lock must be refused while the first is held (a live server, or a \
+             gc/bundle already running, blocks the other)",
+        );
+        // The serve lock and the store lock are different files: a compaction and a running server
+        // are independent concerns and must be able to coexist.
+        let store = StoreLock::acquire()
+            .expect("the store lock is a distinct file — holding the serve lock must not block it");
+        drop(store);
+
+        drop(first);
+        ServeLock::acquire().expect("after the first is dropped the serve lock is free again");
 
         std::fs::remove_dir_all(&temp).ok();
     }

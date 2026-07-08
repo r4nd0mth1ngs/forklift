@@ -1084,7 +1084,7 @@ fn healthz_is_open_and_the_config_file_configures_the_server() {
 }
 
 #[test]
-fn gc_sweeps_orphans_and_never_touches_live_history() {
+fn gc_is_refused_while_serving_then_sweeps_orphans_once_the_server_stops() {
     let area = TestArea::new("gc");
     let server = Server::start(&area, None);
 
@@ -1099,9 +1099,31 @@ fn gc_sweeps_orphans_and_never_touches_live_history() {
     std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
     std::fs::write(&orphan, b"junk").unwrap();
 
+    let root = area.path("server-root");
+    let root_str = root.to_str().unwrap().to_string();
+
+    // R7: gc against the *live* server is refused — it would sweep the server's in-flight objects
+    // and make a concurrent lift fail its ref update. It must wait until the server is stopped, and
+    // it sweeps nothing when refused.
+    let refused = Command::new(server_binary())
+        .args(["gc", "--root", &root_str])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success(),
+            "gc must be refused while a server serves this root");
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("locked by another forklift process"),
+            "the refusal should name the serve lock: {}", String::from_utf8_lossy(&refused.stderr));
+    assert!(orphan.exists(), "a refused gc must not have swept anything");
+
+    // Stop the server. A graceful shutdown (SIGTERM/SIGINT) drops the serve lock automatically; the
+    // test harness hard-kills the child (SIGKILL), which leaves the lock behind — exactly the
+    // stale-lock case an operator clears after a crash — so we clear it here before gc.
+    drop(server);
+    let _ = std::fs::remove_file(root.join(".forklift").join("serve.lock"));
+
     // Within the grace period the orphan is protected...
     let output = Command::new(server_binary())
-        .args(["gc", "--root", area.path("server-root").to_str().unwrap()])
+        .args(["gc", "--root", &root_str])
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -1111,7 +1133,7 @@ fn gc_sweeps_orphans_and_never_touches_live_history() {
 
     // ...with the grace period at zero it is swept, and live history survives.
     let output = Command::new(server_binary())
-        .args(["gc", "--root", area.path("server-root").to_str().unwrap(), "--grace-hours", "0"])
+        .args(["gc", "--root", &root_str, "--grace-hours", "0"])
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
@@ -1119,9 +1141,50 @@ fn gc_sweeps_orphans_and_never_touches_live_history() {
             "{}", String::from_utf8_lossy(&output.stdout));
     assert!(!orphan.exists());
 
+    // Live history survives the sweep: re-serve the same root (the lock is free again) and
+    // franchise a fresh copy.
+    let server = Server::start(&area, None);
     let franchised = area.forklift(".", &["franchise", &server.url, "b"]);
     assert_success(&franchised);
     assert_eq!(area.read_file("b/keep.txt"), "live content\n");
+}
+
+#[test]
+fn a_second_server_and_gc_are_refused_while_serving_but_bundle_is_allowed() {
+    let area = TestArea::new("serve-lock");
+    let server = Server::start(&area, None);
+    let root_str = area.path("server-root").to_str().unwrap().to_string();
+
+    // R7: a second server on the same root is refused up front (it would silently break the first
+    // server's in-process ref-update CAS). The acquire happens before the serve loop, so this
+    // fails fast rather than blocking.
+    let second = Command::new(server_binary())
+        .args(["serve", "--root", &root_str, "--addr", "127.0.0.1:0"])
+        .output()
+        .unwrap();
+    assert!(!second.status.success(),
+            "a second server on the same root must be refused");
+    assert!(String::from_utf8_lossy(&second.stderr).contains("locked by another forklift process"),
+            "second-server refusal should name the serve lock: {}",
+            String::from_utf8_lossy(&second.stderr));
+
+    // gc is likewise refused while serving.
+    let gc = Command::new(server_binary())
+        .args(["gc", "--root", &root_str])
+        .output()
+        .unwrap();
+    assert!(!gc.status.success(), "gc must be refused while serving");
+
+    // bundle, by contrast, is deliberately *allowed* against a live server: it never deletes an
+    // object, writes atomically, and a stale bundle is self-healing (R7).
+    let bundle = Command::new(server_binary())
+        .args(["bundle", "--root", &root_str])
+        .output()
+        .unwrap();
+    assert!(bundle.status.success(),
+            "bundle must be allowed while serving: {}", String::from_utf8_lossy(&bundle.stderr));
+
+    drop(server);
 }
 
 #[test]
