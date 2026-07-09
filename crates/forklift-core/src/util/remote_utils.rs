@@ -1206,3 +1206,114 @@ pub async fn resolve_office_display_names() -> BTreeMap<String, String> {
 
     client.resolve(identifiers).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+    use crate::globals::StorageRootScope;
+
+    /// A fresh warehouse root for one test, entered as the active storage-root scope for
+    /// its lifetime — `is_known_complete` reads the object store and the commit-graph
+    /// under it. Each test gets its own directory, so parallel tests never collide.
+    struct Scratch {
+        root: PathBuf,
+        _scope: StorageRootScope,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let root = std::env::temp_dir().join(format!(
+                "forklift-remote-test-{}-{}-{}", name, std::process::id(), id
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let scope = StorageRootScope::enter(&root);
+
+            Scratch { root, _scope: scope }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Store a minimal parcel (a dummy, shared tree hash — ancestry never reads the
+    /// tree) with the given parents, tagged so otherwise-identical parcels still hash
+    /// distinctly. Mirrors the idiom already used by `merge_utils`'s own ancestry tests.
+    fn stack(parents: Vec<String>, tag: &str) -> String {
+        let parcel = crate::model::parcel::Parcel {
+            tree_hash: "0".repeat(64),
+            parents,
+            actions: Vec::new(),
+            description: Some(tag.to_string()),
+        };
+        let mut object = LooseObjectBuilder::build_parcel(&parcel);
+        object.store().unwrap();
+        object.hash
+    }
+
+    #[test]
+    fn a_hash_never_fetched_is_never_complete() {
+        let _scratch = Scratch::new("known-complete-absent");
+
+        let phantom_hash = "f".repeat(64);
+        assert!(!is_known_complete(&phantom_hash, &[phantom_hash.clone()]).unwrap());
+    }
+
+    #[test]
+    fn a_hash_that_is_itself_a_complete_head_is_complete() {
+        let _scratch = Scratch::new("known-complete-self");
+
+        let head = stack(Vec::new(), "head");
+        assert!(is_known_complete(&head, &[head.clone()]).unwrap());
+    }
+
+    #[test]
+    fn an_ancestor_of_a_complete_head_is_complete() {
+        let _scratch = Scratch::new("known-complete-ancestor");
+
+        let root = stack(Vec::new(), "root");
+        let child = stack(vec![root.clone()], "child");
+
+        assert!(is_known_complete(&root, &[child]).unwrap());
+    }
+
+    #[test]
+    fn an_unrelated_parcel_is_not_complete() {
+        let _scratch = Scratch::new("known-complete-unrelated");
+
+        let trunk_root = stack(Vec::new(), "trunk-root");
+        let trunk_tip = stack(vec![trunk_root], "trunk-tip");
+        let other = stack(Vec::new(), "other-branch-root");
+
+        assert!(!is_known_complete(&other, &[trunk_tip]).unwrap());
+    }
+
+    #[test]
+    fn no_complete_heads_means_nothing_is_complete() {
+        let _scratch = Scratch::new("known-complete-no-heads");
+
+        let head = stack(Vec::new(), "lonely");
+        assert!(!is_known_complete(&head, &[]).unwrap());
+    }
+
+    #[test]
+    fn every_complete_head_is_checked_not_just_the_first() {
+        let _scratch = Scratch::new("known-complete-second-head");
+
+        let root = stack(Vec::new(), "root");
+        let child = stack(vec![root.clone()], "child");
+        let unrelated = stack(Vec::new(), "unrelated");
+
+        // `unrelated` (checked first) is not an ancestry match; `child` (checked second)
+        // is — the loop must not stop at the first miss.
+        assert!(is_known_complete(&root, &[unrelated, child]).unwrap());
+    }
+}

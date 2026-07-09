@@ -527,3 +527,272 @@ fn reconstruct_delta(target_hash: &str, payload: &[u8]) -> Result<Vec<u8>, Strin
 
     delta_utils::decompress_delta(&base_bytes, frame, decompressed_len)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::object::loose_object_builder::LooseObjectBuilder;
+    use crate::enums::dir_entry_type::DirEntryType;
+    use crate::globals::StorageRootScope;
+    use crate::model::blob::Blob;
+    use crate::model::parcel::Parcel;
+    use crate::model::tree_item::TreeItem;
+    use crate::util::byte_utils::number_to_vlq_bytes;
+
+    /// A fresh warehouse root for one test, entered as the active storage-root scope for
+    /// its lifetime. Each test gets its own directory (and its own thread, `cargo test`'s
+    /// default), so parallel tests never see each other's objects.
+    struct Scratch {
+        root: PathBuf,
+        _scope: StorageRootScope,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let root = std::env::temp_dir().join(format!(
+                "forklift-bundle-test-{}-{}-{}", name, std::process::id(), id
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let scope = StorageRootScope::enter(&root);
+
+            Scratch { root, _scope: scope }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Build a minimal (uncompressed-header + one zstd stream) bundle byte string from
+    /// raw records, exactly as `import_bundle_reader` expects to read one — the manual
+    /// low-level construction the fuzz suite also uses, but here to hit semantic
+    /// (not just never-panic) branches.
+    fn raw_bundle(header: &str, records: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(header.as_bytes());
+        bytes.push(b'\n');
+        bytes.extend(zstd::encode_all(records, 3).unwrap());
+        bytes
+    }
+
+    /// One record's on-wire bytes: kind byte, 64-hex hash, big-endian u64 length, payload.
+    fn record(kind: u8, hash: &str, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.push(kind);
+        bytes.extend(hash.as_bytes());
+        bytes.extend((payload.len() as u64).to_be_bytes());
+        bytes.extend(payload);
+        bytes
+    }
+
+    /// A well-formed (but not cryptographically meaningful) signature sidecar: version 1,
+    /// an arbitrary key id and signature bytes — `sign_utils` never verifies a signature
+    /// structurally beyond this shape (verification happens later, at ref-update time).
+    fn raw_signature_sidecar(key_id: &str, signature: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(number_to_vlq_bytes(1));
+        bytes.extend(number_to_vlq_bytes(key_id.len() as u64));
+        bytes.extend(key_id.as_bytes());
+        bytes.extend(number_to_vlq_bytes(signature.len() as u64));
+        bytes.extend(signature);
+        bytes
+    }
+
+    #[test]
+    fn import_stores_a_valid_object_record() {
+        let _scratch = Scratch::new("import-object-ok");
+
+        let content = b"hello, bundle";
+        let hash = object_utils::hash_object_bytes(content);
+        let bytes = raw_bundle(BUNDLE_HEADER, &record(b'O', &hash, content));
+
+        let stats = import_bundle_bytes(&bytes).unwrap();
+        assert_eq!(stats.stored_objects, 1);
+        assert_eq!(stats.skipped_records, 0);
+        assert!(file_utils::does_object_exist(&hash).unwrap());
+        assert_eq!(file_utils::retrieve_object_by_hash(&hash).unwrap(), content);
+    }
+
+    #[test]
+    fn import_rejects_a_hash_mismatched_object_record() {
+        let _scratch = Scratch::new("import-object-mismatch");
+
+        let content = b"hello, bundle";
+        let wrong_hash = object_utils::hash_object_bytes(b"not the same content");
+        let bytes = raw_bundle(BUNDLE_HEADER, &record(b'O', &wrong_hash, content));
+
+        let error = import_bundle_bytes(&bytes).err().unwrap();
+        assert!(error.contains("does not match its claimed hash"), "{}", error);
+        assert!(!file_utils::does_object_exist(&wrong_hash).unwrap(), "nothing unverified may land");
+    }
+
+    #[test]
+    fn import_skips_an_object_already_present() {
+        let _scratch = Scratch::new("import-object-skip");
+
+        let content = b"already here";
+        let hash = object_utils::hash_object_bytes(content);
+        object_utils::store_object_bytes(&hash, content).unwrap();
+
+        let bytes = raw_bundle(BUNDLE_HEADER, &record(b'O', &hash, content));
+        let stats = import_bundle_bytes(&bytes).unwrap();
+
+        assert_eq!(stats.stored_objects, 0);
+        assert_eq!(stats.skipped_records, 1);
+    }
+
+    #[test]
+    fn import_stores_a_signature_record_and_skips_a_duplicate() {
+        let _scratch = Scratch::new("import-signature");
+
+        // The signature path shares the object's hash-sharded folder, so (as in a real
+        // bundle, where the parcel record always precedes its signature) the parcel
+        // object must already be stored.
+        let parcel_content = b"a stand-in parcel object";
+        let parcel_hash = object_utils::hash_object_bytes(parcel_content);
+        object_utils::store_object_bytes(&parcel_hash, parcel_content).unwrap();
+
+        let sidecar = raw_signature_sidecar("key-1", &[7u8; 64]);
+        let bytes = raw_bundle(BUNDLE_HEADER, &record(b'S', &parcel_hash, &sidecar));
+
+        let stats = import_bundle_bytes(&bytes).unwrap();
+        assert_eq!(stats.stored_signatures, 1);
+        assert_eq!(sign_utils::load_raw_parcel_signature(&parcel_hash).unwrap(), Some(sidecar.clone()));
+
+        // The same sidecar again is a duplicate, not an error.
+        let stats = import_bundle_bytes(&bytes).unwrap();
+        assert_eq!(stats.stored_signatures, 0);
+        assert_eq!(stats.skipped_records, 1);
+    }
+
+    #[test]
+    fn import_reconstructs_a_valid_delta_record() {
+        let _scratch = Scratch::new("import-delta-ok");
+
+        let base = b"the quick brown fox\n".repeat(8);
+        let mut target = base.clone();
+        target.extend_from_slice(b"one more line\n");
+        let target_hash = object_utils::hash_object_bytes(&target);
+        let base_hash = object_utils::hash_object_bytes(&base);
+
+        object_utils::store_object_bytes(&base_hash, &base).unwrap();
+
+        let frame = delta_utils::compress_delta(&base, &target).unwrap();
+        let mut payload = Vec::new();
+        payload.extend(base_hash.as_bytes());
+        payload.extend((target.len() as u64).to_be_bytes());
+        payload.extend(&frame);
+
+        let bytes = raw_bundle(BUNDLE_HEADER, &record(b'D', &target_hash, &payload));
+        let stats = import_bundle_bytes(&bytes).unwrap();
+
+        assert_eq!(stats.stored_objects, 1);
+        assert_eq!(file_utils::retrieve_object_by_hash(&target_hash).unwrap(), target);
+    }
+
+    #[test]
+    fn import_rejects_a_delta_record_whose_base_is_missing() {
+        let _scratch = Scratch::new("import-delta-missing-base");
+
+        let base = b"the quick brown fox\n".repeat(8);
+        let mut target = base.clone();
+        target.extend_from_slice(b"one more line\n");
+        let target_hash = object_utils::hash_object_bytes(&target);
+        let base_hash = object_utils::hash_object_bytes(&base);
+        // Deliberately never stored: the base is absent from this warehouse.
+
+        let frame = delta_utils::compress_delta(&base, &target).unwrap();
+        let mut payload = Vec::new();
+        payload.extend(base_hash.as_bytes());
+        payload.extend((target.len() as u64).to_be_bytes());
+        payload.extend(&frame);
+
+        let bytes = raw_bundle(BUNDLE_HEADER, &record(b'D', &target_hash, &payload));
+        let error = import_bundle_bytes(&bytes).err().unwrap();
+        assert!(error.contains("is not present; the bundle is corrupt"), "{}", error);
+    }
+
+    #[test]
+    fn import_rejects_an_unknown_record_kind() {
+        let _scratch = Scratch::new("import-unknown-kind");
+
+        let bytes = raw_bundle(BUNDLE_HEADER, &record(b'Z', &"a".repeat(64), b"whatever"));
+        let error = import_bundle_bytes(&bytes).err().unwrap();
+        assert!(error.contains("Unknown bundle record kind"), "{}", error);
+    }
+
+    #[test]
+    fn import_rejects_an_unknown_header() {
+        let _scratch = Scratch::new("import-unknown-header");
+
+        let bytes = raw_bundle("forklift-bundle 1999-01-01", &[]);
+        let error = import_bundle_bytes(&bytes).err().unwrap();
+        assert!(error.contains("Unknown bundle header"), "{}", error);
+    }
+
+    #[test]
+    fn import_still_accepts_the_legacy_v1_header() {
+        let _scratch = Scratch::new("import-v1-header");
+
+        let content = b"legacy content";
+        let hash = object_utils::hash_object_bytes(content);
+        let bytes = raw_bundle(BUNDLE_HEADER_V1, &record(b'O', &hash, content));
+
+        let stats = import_bundle_bytes(&bytes).unwrap();
+        assert_eq!(stats.stored_objects, 1);
+    }
+
+    /// The header/record write-then-read semantics, end to end: a real (tiny) warehouse's
+    /// `build_bundle` output, imported into a second, empty warehouse — not just the
+    /// never-panic fuzz suite's malformed-input focus.
+    #[test]
+    fn build_bundle_then_import_bundle_round_trips_a_real_warehouse() {
+        let bundle_bytes = {
+            let _source = Scratch::new("bundle-roundtrip-src");
+
+            let blob = Blob { content: b"version 1".to_vec() };
+            let mut blob_object = LooseObjectBuilder::build_blob(&blob);
+            blob_object.store().unwrap();
+
+            let mut root_tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+            root_tree.add_child(TreeItem::new(
+                "a.txt".to_string(), blob_object.hash.clone(), DirEntryType::Normal
+            ));
+            let mut tree_object = LooseObjectBuilder::build_tree(&root_tree);
+            tree_object.store().unwrap();
+
+            let parcel = Parcel {
+                tree_hash: tree_object.hash.clone(),
+                parents: Vec::new(),
+                actions: Vec::new(),
+                description: Some("first parcel".to_string()),
+            };
+            let mut parcel_object = LooseObjectBuilder::build_parcel(&parcel);
+            parcel_object.store().unwrap();
+
+            pallet_utils::set_pallet_head("main", &parcel_object.hash).unwrap();
+
+            let stats = build_bundle().unwrap();
+            assert_eq!(stats.objects, 3, "the parcel, its tree and its one blob");
+            assert_eq!(stats.deltas, 0);
+
+            std::fs::read(&stats.path).unwrap()
+        };
+
+        let _destination = Scratch::new("bundle-roundtrip-dst");
+        let import_stats = import_bundle_bytes(&bundle_bytes).unwrap();
+        assert_eq!(import_stats.stored_objects, 3);
+        assert_eq!(import_stats.skipped_records, 0);
+
+        // Re-importing the same bundle is idempotent: everything is now already present.
+        let reimport_stats = import_bundle_bytes(&bundle_bytes).unwrap();
+        assert_eq!(reimport_stats.stored_objects, 0);
+        assert_eq!(reimport_stats.skipped_records, 3);
+    }
+}
