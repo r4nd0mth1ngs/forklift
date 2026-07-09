@@ -34,6 +34,9 @@ pub struct MemoryObjectStore {
     /// Uploads that bypassed the head, keyed by `(session, hash)` — the in-memory stand-in
     /// for an S3 staging prefix. Invisible to `exists`/`get` until promoted.
     staged: Mutex<HashMap<(String, String), Vec<u8>>>,
+    /// Offloaded response bodies (`batch` bundles), keyed by their content hash — the
+    /// stand-in for an ephemeral S3 prefix served by presigned `GET`. Never an object.
+    responses: Mutex<HashMap<String, Vec<u8>>>,
     /// When set, `access`/`put_target` answer with a presigned-style URL under this base
     /// instead of serving bytes directly — the AWS deployment's behaviour.
     redirect_base: Option<String>,
@@ -66,6 +69,13 @@ impl MemoryObjectStore {
     /// How many uploads are still sitting in staging (for test assertions).
     pub fn staged_count(&self) -> usize {
         self.staged.lock().unwrap().len()
+    }
+
+    /// The bytes behind an offloaded response URL, as a presigned `GET` would serve them.
+    pub fn offloaded_response(&self, url: &str) -> Option<Vec<u8>> {
+        let key = url.rsplit('/').next()?;
+
+        self.responses.lock().unwrap().get(key).cloned()
     }
 }
 
@@ -182,6 +192,19 @@ impl ObjectStore for MemoryObjectStore {
         self.staged.lock().unwrap().retain(|(staged_session, _), _| staged_session != session);
 
         Ok(())
+    }
+
+    fn offload_response(&self, bytes: &[u8]) -> Result<Option<String>, String> {
+        let Some(base) = &self.redirect_base else {
+            return Ok(None);
+        };
+
+        // A content-addressed *response* key, deliberately outside the `objects/` namespace.
+        let key = object_utils::hash_object_bytes(bytes);
+
+        self.responses.lock().unwrap().insert(key.clone(), bytes.to_vec());
+
+        Ok(Some(format!("{}/responses/{}", base, key)))
     }
 }
 

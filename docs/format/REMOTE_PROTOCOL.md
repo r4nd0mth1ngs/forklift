@@ -111,6 +111,37 @@ Body: `{"hashes": ["<hash>", …]}` (at most 10 000 per request — batch larger
 Response: `{"missing": ["<hash>", …]}` — the subset the remote does not have. Used by
 `lift` to negotiate what to upload.
 
+### `POST /v1/objects/upload-targets` (additive; storage-backed heads)
+
+The **body-less upload negotiation**. Request:
+
+```json
+{ "session": "<lift session>", "hashes": ["<hash>", …] }
+```
+
+Response — one verdict per hash, and not a single object body sent to learn it:
+
+```json
+{
+  "present": ["<hash>", …],
+  "targets": { "<hash>": "<presigned PUT url>", … },
+  "direct":  ["<hash>", …]
+}
+```
+
+`present` are objects the remote already has (do not upload them; it is exactly the
+complement of `missing`, so this call subsumes that one on the upload path). `targets` are
+presigned `PUT`s into the session's **staging prefix** — the bytes go straight to storage,
+bypassing the control plane, and are not fetchable until the session commit promotes them.
+`direct` are objects to `PUT` to `/v1/objects/{hash}` as usual, for the head to verify
+inline.
+
+A direct head (`forklift-server`) answers with every missing hash in `direct` and an empty
+`targets`, so one client code path serves both heads. Without this call, a client uploading
+to a storage-backed head must send each body to the control plane only to be answered `307`
+— paying for the bytes twice, through a request-size limit the byte plane exists to avoid.
+Servers that predate it answer `404`; the client falls back to `missing` + per-object `PUT`.
+
 ### `POST /v1/objects/batch`
 
 Many objects in one round trip. Request: `{"hashes": […]}` (max 10 000). Response: a
@@ -120,6 +151,15 @@ lacks are simply absent — the client notices what did not land and falls back 
 `GET`s. The endpoint is additive: servers that predate it answer `404` and clients
 fall back entirely. Every imported record is hash-verified before it lands, exactly
 like a bundle import.
+
+The bundle is the one response with no small upper bound — it is as large as the objects
+asked for. A storage-backed head may therefore answer `307` with a `Location` of a
+presigned `GET` for the bundle rather than streaming megabytes back through the control
+plane (the same medicine as the upload path, in the other direction; a Lambda control plane
+cannot return more than a few megabytes at all). The bytes live under an **ephemeral,
+content-addressed response prefix**, never the `objects/` namespace, so nothing there is
+reachable as an object at a hash key and invariant 1 is not in play — and the client
+hash-verifies every record on import regardless.
 
 ### `GET /v1/objects/{hash}`
 
@@ -276,10 +316,15 @@ fall back to loose-object `GET`s for anything the bundle lacks.
 working pallet:
 1. `GET /v1/warehouse`; refuse when the remote head is unknown locally (lower first).
 2. Collect the closure of the parcels between the local head and the remote head;
-   `POST /v1/objects/missing` in batches.
-3. `PUT` the missing objects in parallel; `PUT` the signature sidecars of the new
-   parcels; `PUT /v1/trust` when the remote has no anchor and the client does.
-4. `POST /v1/pallets/{name}` with `{old_head: remote head, new_head: local head}`.
+   `POST /v1/objects/missing` in batches — or, against a storage-backed head,
+   `POST /v1/objects/upload-targets`, which answers the same question *and* hands back the
+   presigned `PUT`s in the same round trip.
+3. `PUT` the missing objects in parallel — to the control plane, or straight to the
+   presigned staging URLs; `PUT` the signature sidecars of the new parcels;
+   `PUT /v1/trust` when the remote has no anchor and the client does.
+4. Against a staging head only: `POST /lift/{session}/commit`, which verifies and promotes
+   the staged control-plane objects before anything becomes fetchable.
+5. `POST /v1/pallets/{name}` with `{old_head: remote head, new_head: local head}`.
 
 **lower (pull)** — the mirror: `GET /v1/warehouse`, breadth-first fetch of the unknown
 closure from the remote head (parallel `GET`s, skipping objects already present

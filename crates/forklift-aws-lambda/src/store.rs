@@ -183,6 +183,18 @@ pub trait ObjectStore {
     fn discard_session(&self, _session: &str) -> Result<(), String> {
         Ok(())
     }
+
+    /// Park a large *response* body (a `batch` bundle) in storage and return a presigned
+    /// `GET` for it, so the bytes never travel through the control plane — which on Lambda
+    /// cannot return more than a few megabytes anyway. `None` means "serve it inline"
+    /// (the self-host / fake behaviour).
+    ///
+    /// The bytes land under an ephemeral, content-addressed prefix that is *not* the
+    /// canonical object namespace, so nothing here is reachable as an object at a hash key
+    /// and invariant 1 is not in play. Clients verify bundle records on import regardless.
+    fn offload_response(&self, _bytes: &[u8]) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
 /// The consistency point: pallet heads and the trust anchor.

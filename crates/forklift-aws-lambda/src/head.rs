@@ -18,7 +18,8 @@
 use std::collections::{BTreeMap, HashSet};
 
 use forklift_core::model::remote::{
-    RefUpdateRequest, TrustAnchorDto, WarehouseInfo, MAX_MISSING_BATCH, PROTOCOL_VERSION,
+    RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_MISSING_BATCH,
+    PROTOCOL_VERSION,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
@@ -46,6 +47,16 @@ pub enum ObjectWriteResult {
     /// The head stored the bytes directly; `true` if newly created.
     Stored { created: bool },
     /// Upload the bytes to this presigned URL (`307`).
+    Redirect(String),
+}
+
+/// How the head answers a `batch` request: the bundle bytes, or a redirect to a presigned
+/// `GET` for them.
+#[derive(Debug)]
+pub enum BatchResult {
+    /// The bundle-format stream (the head serves it itself).
+    Bundle(Vec<u8>),
+    /// Follow this presigned URL for the bundle (`307`).
     Redirect(String),
 }
 
@@ -103,6 +114,61 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
 
         Ok(missing)
+    }
+
+    /// `POST /v1/objects/upload-targets` — the body-less upload negotiation (additive).
+    ///
+    /// One round trip, no object bodies: for every hash the client learns whether the
+    /// remote already has it (`present`), where to `PUT` it straight into storage
+    /// (`targets`, a presigned staging URL), or that it must go through the control plane
+    /// (`direct`). Without it a client uploading to a staging head has to send each body to
+    /// the control plane only to be told `307` — paying for the bytes twice, and on Lambda
+    /// paying for them through a request-size limit the byte plane exists to avoid.
+    ///
+    /// A direct head answers with every missing hash in `direct`, so one client code path
+    /// serves both heads.
+    pub fn upload_targets(
+        &self,
+        session: &str,
+        hashes: &[String],
+    ) -> HeadResult<UploadTargetsResponse> {
+        self.reject_oversized_batch(hashes.len())?;
+
+        let mut response = UploadTargetsResponse {
+            present: Vec::new(),
+            targets: BTreeMap::new(),
+            direct: Vec::new(),
+        };
+
+        let mut seen: HashSet<&str> = HashSet::new();
+
+        for hash in hashes {
+            if !seen.insert(hash.as_str()) {
+                continue;
+            }
+
+            if self.objects.exists(hash).map_err(HeadError::internal)? {
+                response.present.push(hash.clone());
+                continue;
+            }
+
+            match self.objects.put_target(Some(session), hash).map_err(HeadError::internal)? {
+                PutTarget::Staged(url) => {
+                    response.targets.insert(hash.clone(), url);
+                }
+                PutTarget::Direct => response.direct.push(hash.clone()),
+                // The session was named, so a store that still demands one is broken.
+                PutTarget::SessionRequired => {
+                    return Err(HeadError::internal(format!(
+                        "The object store refused a staging target for {} despite a named lift \
+                        session.",
+                        hash
+                    )))
+                }
+            }
+        }
+
+        Ok(response)
     }
 
     /// `GET /v1/objects/{hash}` — the raw object bytes, or a redirect to storage.
@@ -367,12 +433,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// packfile moment). Objects the store lacks are simply absent; the client falls back
     /// to loose fetches. Built by mirroring the requested objects into a scratch and
     /// reusing `bundle_utils::build_partial_bundle`.
-    pub fn batch(&self, hashes: &[String]) -> HeadResult<Vec<u8>> {
+    ///
+    /// The bundle is the one *response* that has no small bound — it is as large as the
+    /// objects asked for — so a store that can offload it hands back a presigned `GET`
+    /// (`307`) rather than squeezing megabytes back through the control plane. Same
+    /// medicine as the upload path, in the other direction.
+    pub fn batch(&self, hashes: &[String]) -> HeadResult<BatchResult> {
         self.reject_oversized_batch(hashes.len())?;
 
         let scratch = Scratch::new().map_err(HeadError::internal)?;
 
-        scratch.scoped(|| -> HeadResult<Vec<u8>> {
+        let bundle = scratch.scoped(|| -> HeadResult<Vec<u8>> {
             let mut mirrored: HashSet<String> = HashSet::new();
 
             for hash in hashes {
@@ -392,7 +463,12 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             }
 
             bundle_utils::build_partial_bundle(hashes).map_err(HeadError::internal)
-        })
+        })?;
+
+        match self.objects.offload_response(&bundle).map_err(HeadError::internal)? {
+            Some(url) => Ok(BatchResult::Redirect(url)),
+            None => Ok(BatchResult::Bundle(bundle)),
+        }
     }
 
     /// `GET /v1/bundles/latest` — the whole-warehouse bundle. Building it is periodic ECS

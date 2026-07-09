@@ -38,7 +38,7 @@ pub mod scratch;
 pub mod head;
 
 pub use error::{HeadError, HeadResult, Status};
-pub use head::Head;
+pub use head::{BatchResult, Head};
 pub use store::{
     CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
     SignatureOutcome, TrustOutcome,

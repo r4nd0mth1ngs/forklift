@@ -17,7 +17,7 @@ use forklift_aws_lambda::error::Status;
 use forklift_aws_lambda::head::{ObjectReadResult, ObjectWriteResult, TrustResult};
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
 use forklift_aws_lambda::store::{ObjectStore, PromoteOutcome, SignatureOutcome};
-use forklift_aws_lambda::Head;
+use forklift_aws_lambda::{BatchResult, Head};
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{RefUpdateRequest, TrustAnchorDto};
@@ -581,9 +581,100 @@ fn batch_returns_a_bundle_stream() {
     upload_all(&head, &harvest);
 
     let hashes: Vec<String> = harvest.objects.keys().cloned().collect();
-    let bundle = head.batch(&hashes).expect("batch");
-    assert!(!bundle.is_empty(), "the batch produced a non-empty bundle stream");
+
+    match head.batch(&hashes).expect("batch") {
+        BatchResult::Bundle(bundle) => {
+            assert!(!bundle.is_empty(), "the batch produced a non-empty bundle stream")
+        }
+        BatchResult::Redirect(_) => panic!("a direct store serves the bundle inline"),
+    }
 
     // Nothing is missing after the upload.
     assert!(head.missing(&hashes).expect("missing").is_empty());
+}
+
+/// A store that can offload keeps the bundle out of the control plane: `batch` answers with
+/// a presigned `GET` whose bytes are exactly the bundle the direct head would have streamed.
+#[test]
+fn batch_offloads_the_bundle_to_a_presigned_url() {
+    let area = Area::new("batch-offload");
+    prepare(&area, "wh");
+    area.write_file("wh/a.txt", "alpha\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "one"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let hashes: Vec<String> = harvest.objects.keys().cloned().collect();
+
+    // The same warehouse behind a direct head and a staging head.
+    let direct = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&direct, &harvest);
+
+    let staging = Head::new(
+        MemoryObjectStore::with_redirect("https://s3.example/bucket"),
+        MemoryRefStore::new(),
+    );
+    for (hash, bytes) in &harvest.objects {
+        staging.objects.put_verified(hash, bytes).expect("seed the staging store");
+    }
+
+    let inline = match direct.batch(&hashes).expect("direct batch") {
+        BatchResult::Bundle(bundle) => bundle,
+        BatchResult::Redirect(_) => panic!("a direct store serves the bundle inline"),
+    };
+
+    match staging.batch(&hashes).expect("offloaded batch") {
+        BatchResult::Redirect(url) => {
+            assert!(url.starts_with("https://s3.example/bucket/responses/"));
+            assert!(!url.contains("/objects/"), "a response body is never an object");
+
+            let served = staging.objects.offloaded_response(&url).expect("the presigned bytes");
+            assert_eq!(served, inline, "the offloaded bundle is the bundle");
+        }
+        BatchResult::Bundle(_) => panic!("an offloading store hands out a presigned GET"),
+    }
+}
+
+/// The body-less upload negotiation: one round trip sorts the hashes into already-present,
+/// upload-straight-to-storage, and send-through-the-control-plane — without a single body.
+#[test]
+fn upload_targets_negotiates_without_sending_bodies() {
+    let present = b"an object the remote already has".to_vec();
+    let present_hash = object_utils::hash_object_bytes(&present);
+    let wanted_hash = object_utils::hash_object_bytes(b"an object it does not");
+
+    // A staging head: the missing object gets a presigned staging URL.
+    let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
+    store.put_verified(&present_hash, &present).expect("seed");
+    let staging = Head::new(store, MemoryRefStore::new());
+
+    let answer = staging
+        .upload_targets("lift-1", &[present_hash.clone(), wanted_hash.clone(), present_hash.clone()])
+        .expect("negotiate");
+
+    assert_eq!(answer.present, vec![present_hash.clone()], "duplicates collapse");
+    assert!(answer.direct.is_empty());
+    assert_eq!(
+        answer.targets.get(&wanted_hash).map(String::as_str),
+        Some(format!("https://s3.example/bucket/staging/lift-1/{}", wanted_hash).as_str())
+    );
+
+    // `present` is exactly the complement of `missing`, so this subsumes that call.
+    assert_eq!(staging.missing(&[present_hash.clone(), wanted_hash.clone()]).unwrap(), vec![
+        wanted_hash.clone()
+    ]);
+
+    // A direct head: the same request routes the missing object through the control plane,
+    // so one client code path serves both heads.
+    let store = MemoryObjectStore::new();
+    store.put_verified(&present_hash, &present).expect("seed");
+    let direct = Head::new(store, MemoryRefStore::new());
+
+    let answer = direct
+        .upload_targets("lift-1", &[present_hash.clone(), wanted_hash.clone()])
+        .expect("negotiate");
+
+    assert_eq!(answer.present, vec![present_hash]);
+    assert_eq!(answer.direct, vec![wanted_hash]);
+    assert!(answer.targets.is_empty());
 }

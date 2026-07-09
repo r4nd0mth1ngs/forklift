@@ -83,6 +83,36 @@ pub struct MissingObjectsResponse {
     pub missing: Vec<String>,
 }
 
+/// The body of `POST /v1/objects/upload-targets` (additive; a head whose byte plane is
+/// object storage). Asks, without sending a single object body, where each of these
+/// objects should be uploaded for lift `session`.
+#[derive(Serialize, Deserialize)]
+pub struct UploadTargetsRequest {
+    /// The lift session the uploads belong to; it scopes the staging keys.
+    pub session: String,
+
+    pub hashes: Vec<String>,
+}
+
+/// The response of `POST /v1/objects/upload-targets`: one verdict per requested hash, so a
+/// client learns in a single body-less round trip what to skip, what to send straight to
+/// storage, and what to hand the control plane. It subsumes `POST /v1/objects/missing` for
+/// the upload path (`present` is the complement of `missing`).
+#[derive(Serialize, Deserialize)]
+pub struct UploadTargetsResponse {
+    /// Objects the remote already has at their canonical key. Do not upload them.
+    pub present: Vec<String>,
+
+    /// Presigned `PUT` URLs by hash — upload the bytes straight to storage, bypassing the
+    /// control plane. Each URL addresses a *staging* key: the object is not fetchable until
+    /// `POST /lift/{session}/commit` (or the staging verifier) promotes it.
+    pub targets: BTreeMap<String, String>,
+
+    /// Objects with no presigned target: `PUT` their bytes to `/v1/objects/{hash}` as usual
+    /// and the head verifies them inline. A direct head answers with every missing hash here.
+    pub direct: Vec<String>,
+}
+
 /// The body of `POST /v1/pallets/{name}` — the CAS ref update.
 #[derive(Serialize, Deserialize)]
 pub struct RefUpdateRequest {
