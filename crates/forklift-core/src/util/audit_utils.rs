@@ -5,6 +5,7 @@
 //! state a local audit would reject.
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::sync::{Mutex, OnceLock};
 use crate::util::office_utils::{OfficeState, TrustAnchor};
 use crate::util::{file_utils, graph_utils, object_utils, sign_utils};
 
@@ -512,6 +513,73 @@ fn classify_signature(hash: &str, office_state: &OfficeState) -> Result<Verdict,
     object_utils::load_parcel(hash)?;
 
     Ok(verdict)
+}
+
+/// Verified office chains, remembered per `(warehouse, anchor, office head)`.
+static VERIFIED_OFFICE_CHAINS: OnceLock<Mutex<HashMap<String, OfficeState>>> = OnceLock::new();
+
+/// How many verified chains to remember before starting over. A server serves few
+/// warehouses and the office head moves rarely, so this never needs to be an LRU.
+const MAX_MEMOIZED_OFFICE_CHAINS: usize = 16;
+
+/// [`verify_office_chain`], remembered for the life of the process.
+///
+/// A server head runs the chain verification on *every* trusted ref update — including lifts
+/// of ordinary pallets, which only consume the resulting key registry and do not move the
+/// office head. That work is pure: the office objects are content-addressed and immutable, so
+/// the same head under the same anchor always verifies to the same state. Memoizing it turns
+/// an O(office history) signature walk per lift into one per office head.
+///
+/// **The warehouse root is part of the key on purpose.** Without it a multi-warehouse server
+/// could hand a verified state to a warehouse whose object store does not hold that chain at
+/// all — the same tenant-boundary mistake a scratch shared across warehouses would make. The
+/// whole anchor is folded in too, not just its genesis: a re-genesis changes the boundary.
+///
+/// Use this from a long-lived head. The `audit` command verifies once and exits, so it calls
+/// [`verify_office_chain`] directly and never consults a memo.
+pub fn verify_office_chain_memoized(
+    anchor: &TrustAnchor,
+    office_head: &str,
+) -> Result<OfficeState, String> {
+    let key = office_chain_key(anchor, office_head);
+    let memo = VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Some(state) = lock_memo(memo)?.get(&key) {
+        return Ok(state.clone());
+    }
+
+    // Verified outside the lock: a slow chain must not block the other warehouses.
+    let state = verify_office_chain(anchor, office_head)?;
+
+    let mut chains = lock_memo(memo)?;
+
+    if chains.len() >= MAX_MEMOIZED_OFFICE_CHAINS {
+        chains.clear();
+    }
+
+    chains.insert(key, state.clone());
+
+    Ok(state)
+}
+
+/// The memo key: which warehouse, under which anchor, at which office head.
+fn office_chain_key(anchor: &TrustAnchor, office_head: &str) -> String {
+    format!(
+        "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+        crate::globals::forklift_root().to_string_lossy(),
+        anchor.genesis,
+        anchor.enabled_at,
+        anchor.boundary.join(","),
+        anchor.prior_genesis.as_deref().unwrap_or(""),
+        anchor.adopts.as_deref().unwrap_or(""),
+        office_head
+    )
+}
+
+fn lock_memo(
+    memo: &Mutex<HashMap<String, OfficeState>>,
+) -> Result<std::sync::MutexGuard<'_, HashMap<String, OfficeState>>, String> {
+    memo.lock().map_err(|e| format!("The office-chain memo is poisoned: {}", e))
 }
 
 /// Reachable from `head`.

@@ -215,6 +215,56 @@ fn a_merge_lift_reads_nothing_below_the_fork_point() {
     });
 }
 
+/// The office chain is verified once per `(warehouse, anchor, office head)`, not once per
+/// ref update — and the memo is keyed by warehouse, so it can never answer for a store that
+/// does not hold the chain.
+#[test]
+fn a_verified_office_chain_is_memoized_per_warehouse() {
+    let warehouse = Warehouse::new("office-memo");
+    warehouse.stack("app.txt", "v1\n", "first");
+
+    let office_head = warehouse.scoped(|| {
+        pallet_utils::all_pallet_refs()
+            .unwrap()
+            .into_iter()
+            .find(|(pallet_ref, _)| pallet_ref.to_wire() == "@office")
+            .map(|(_, head)| head)
+            .expect("an office head")
+    });
+
+    let anchor =
+        warehouse.scoped(|| office_utils::read_trust_anchor().unwrap().expect("trust"));
+
+    // First call verifies for real.
+    let first = warehouse
+        .scoped(|| audit_utils::verify_office_chain_memoized(&anchor, &office_head))
+        .expect("the office chain verifies");
+
+    // Make re-verification impossible: the chain's parcels are gone.
+    warehouse.delete_parcel(&office_head);
+
+    let memoized = warehouse
+        .scoped(|| audit_utils::verify_office_chain_memoized(&anchor, &office_head))
+        .expect("the memo answers without touching the chain");
+    assert_eq!(memoized.keys.len(), first.keys.len());
+    assert_eq!(memoized.users.len(), first.users.len());
+
+    // The uncached path still reads, and still fails.
+    assert!(
+        warehouse.scoped(|| audit_utils::verify_office_chain(&anchor, &office_head)).is_err(),
+        "the deletion was real"
+    );
+
+    // The tenant boundary: another warehouse, same anchor and head, must not inherit the
+    // verified state — its object store holds no such chain.
+    let other = Warehouse::new("office-memo-other");
+
+    assert!(
+        other.scoped(|| audit_utils::verify_office_chain_memoized(&anchor, &office_head)).is_err(),
+        "a memo must never answer across warehouses"
+    );
+}
+
 /// The frontier's edge cases, stated directly.
 #[test]
 fn the_new_segment_is_the_gap_between_two_heads() {
