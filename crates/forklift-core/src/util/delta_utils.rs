@@ -50,11 +50,31 @@ pub fn compress_delta(base: &[u8], target: &[u8]) -> Result<Vec<u8>, String> {
 /// * `Ok(Vec<u8>)` - The reconstructed target bytes (still to be hash-verified by the caller).
 /// * `Err(String)` - If the base is wrong, the payload is corrupt, or it exceeds `capacity`.
 pub fn decompress_delta(base: &[u8], payload: &[u8], capacity: usize) -> Result<Vec<u8>, String> {
-    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(base)
+    use std::io::Read;
+
+    // `capacity` is the *declared* length carried in a delta record — attacker-controlled in an
+    // imported bundle and untrusted in an on-disk pack. It must never be pre-allocated: a lie
+    // (e.g. `u64::MAX`) would otherwise be a one-record denial of service (a capacity-overflow
+    // panic, or an allocator abort for a large-but-representable value). Instead, decode as a
+    // stream so the buffer grows with the bytes actually produced, and stop one byte past the
+    // declared length so a decompression bomb is still rejected. Correctness never rests on this
+    // bound — every caller hash-verifies the result — so it is purely a resource guard.
+    let mut decoder = zstd::stream::read::Decoder::with_dictionary(payload, base)
         .map_err(|e| format!("Error while preparing the delta decompressor: {}", e))?;
 
-    decompressor.decompress(payload, capacity)
-        .map_err(|e| format!("Error while decompressing a delta: {}", e))
+    let mut output = Vec::new();
+    let limit = capacity as u64;
+    // `saturating_add` because `capacity` can be `u64::MAX` (a hostile declared length): reading
+    // one byte past it is what detects a bomb, and saturating there is harmless — no stream can
+    // actually produce `u64::MAX` bytes.
+    decoder.by_ref().take(limit.saturating_add(1)).read_to_end(&mut output)
+        .map_err(|e| format!("Error while decompressing a delta: {}", e))?;
+
+    if output.len() as u64 > limit {
+        return Err("A delta expanded past its declared length.".to_string());
+    }
+
+    Ok(output)
 }
 
 #[cfg(test)]

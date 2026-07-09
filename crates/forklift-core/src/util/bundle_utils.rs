@@ -433,10 +433,22 @@ fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStat
 
         let length = u64::from_be_bytes(length_bytes) as usize;
 
-        let mut payload = vec![0u8; length];
-
-        decoder.read_exact(&mut payload)
+        // `length` is attacker-controlled (a bundle can arrive from an untrusted remote over
+        // `franchise`), so never pre-allocate it: a lie like `u64::MAX` would be a one-record
+        // denial of service (a capacity-overflow panic, or an allocator abort for a large-but-
+        // representable value). Read as a bounded stream instead — the buffer grows with the
+        // bytes actually present, and a short stream is reported as truncation, exactly as the
+        // former `read_exact` did.
+        let mut payload = Vec::new();
+        let read = decoder.by_ref().take(length as u64).read_to_end(&mut payload)
             .map_err(|e| format!("The bundle is truncated: {}", e))?;
+
+        if read != length {
+            return Err(format!(
+                "The bundle is truncated: a record declared {} bytes but only {} remained.",
+                length, read
+            ));
+        }
 
         match kind[0] {
             KIND_OBJECT => {

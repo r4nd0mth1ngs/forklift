@@ -58,11 +58,12 @@ fn parse_entry(offset: usize, content: &[u8]) -> Result<(TreeItem, usize), Strin
         })? as usize;
 
     let name_start = offset + cursor;
-    let name_end = name_start + name_length;
-
-    if name_end > content.len() {
-        return Err("Tree entry name is truncated.".to_string());
-    }
+    // `name_length` is an attacker-controlled length prefix, so fold the overflow guard into the
+    // bounds check: a huge value is reported as truncated rather than panicking on the addition
+    // (an `attempt to add with overflow` in debug, a wrapped out-of-range slice in release).
+    let name_end = name_start.checked_add(name_length)
+        .filter(|end| *end <= content.len())
+        .ok_or_else(|| "Tree entry name is truncated.".to_string())?;
 
     let name = String::from_utf8(content[name_start..name_end].to_vec())
         .map_err(|_| "Failed to parse the name of the tree item.".to_string())?;

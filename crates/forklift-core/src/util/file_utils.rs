@@ -1080,6 +1080,38 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_write_never_becomes_a_readable_object() {
+        // The durability contract's other half (T1): objects are addressed by their hash and the
+        // atomic write stages through a `hash.tmp…` sibling, so a crash *between* the temp write
+        // and the rename leaves only that temp file — never a truncated file at the object's real
+        // path. A reader keys on the hash, so that debris must be invisible: the object does not
+        // exist, and a genuine object at the same address still reads back cleanly alongside it.
+        let temp = std::env::temp_dir().join(format!("forklift-interrupted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let _scope = StorageRootScope::enter(&temp);
+
+        let content = vec![7u8; 4000];
+        let hash = blake3::hash(&content).to_hex().to_string();
+        let (folder, file_name) = get_path_for_object(&hash).unwrap();
+        create_folder_if_not_exists(Path::new(&folder)).unwrap();
+
+        // Simulate a crashed write: only the temporary file exists, the real object never landed.
+        let debris = Path::new(&folder).join(format!("{}.tmp99999-0", file_name));
+        std::fs::write(&debris, b"half-written, never renamed").unwrap();
+
+        assert!(!does_object_exist(&hash).unwrap(), "temp debris must not read as an object");
+        assert!(retrieve_object_by_hash(&hash).is_err(), "a never-renamed object must not be readable");
+
+        // Now the real object lands; the leftover temp must not have disturbed it.
+        let compressed = zstd::encode_all(content.as_slice(), 0).unwrap();
+        write_object_to_file(Path::new(&folder), &file_name, compressed).unwrap();
+        assert_eq!(retrieve_object_by_hash(&hash).unwrap(), content);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
     fn atomic_write_lands_the_content_and_leaves_no_temp_file() {
         // The rewritten (now fsyncing) atomic write must still publish exactly the target file with
         // the intended bytes and consume its temporary — a crash-window regression guard.

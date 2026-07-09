@@ -189,11 +189,12 @@ fn read_length_prefixed_string(offset: usize,
         }).map_err(|e| format!("Failed to parse the length of the {}: {}", field_name, e))? as usize;
 
     let start = offset + cursor;
-    let end = start + length;
-
-    if end > content.len() {
-        return Err(format!("The {} is truncated.", field_name));
-    }
+    // `length` is an untrusted length prefix, so fold the overflow guard into the bounds check: a
+    // huge value is reported as truncated rather than panicking on the addition (an `attempt to
+    // add with overflow` in debug, a wrapped out-of-range slice in release).
+    let end = start.checked_add(length)
+        .filter(|end| *end <= content.len())
+        .ok_or_else(|| format!("The {} is truncated.", field_name))?;
 
     let value = String::from_utf8(content[start..end].to_vec())
         .map_err(|_| format!("Failed to parse the {}.", field_name))?;
