@@ -33,3 +33,4 @@ pub mod inventory_utils;
 pub mod path_utils;
 pub mod remote_utils;
 pub mod hook_utils;
+pub mod fanout_utils;

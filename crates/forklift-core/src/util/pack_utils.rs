@@ -35,8 +35,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::util::{
-    audit_utils, bundle_utils, byte_utils, delta_utils, file_utils, graph_utils, lock_utils,
-    object_utils, pallet_utils, sign_utils,
+    audit_utils, bundle_utils, byte_utils, delta_utils, fanout_utils, file_utils, graph_utils,
+    lock_utils, object_utils, pallet_utils, sign_utils,
 };
 
 /// The folder under the object store that holds packs.
@@ -1063,33 +1063,13 @@ fn prepare_batch(batch: &[PackTarget],
         return batch.iter().map(|target| prepare_target(target, path_bases)).collect();
     }
 
-    let workers = num_cpus::get().max(1).min(batch.len());
-    let chunk = batch.len().div_ceil(workers);
-
-    // Storage-root scopes are thread-local and not inherited by spawned threads; capture the
-    // caller's so each worker resolves its object reads (of the delta bases) under the same
-    // warehouse root.
-    let scope_root = crate::globals::current_scope_root();
-
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = batch
-            .chunks(chunk)
-            .map(|slice| {
-                let scope_root = scope_root.as_deref();
-                scope.spawn(move || {
-                    let _scope = scope_root.map(crate::globals::StorageRootScope::enter);
-
-                    slice.iter()
-                        .map(|target| prepare_target(target, path_bases))
-                        .collect::<Vec<Result<Option<Prepared>, String>>>()
-                })
-            })
-            .collect();
-
-        handles.into_iter()
-            .flat_map(|handle| handle.join().expect("a compaction worker panicked"))
-            .collect()
-    })
+    // See `fanout_utils::fanout_map` for the fan-out idiom (chunking, worker count, and the
+    // storage-scope re-entry every worker needs). It never short-circuits, so the
+    // first-index error a serial `.collect()` would report is recovered by collecting the
+    // (order-preserved) results the same way here.
+    fanout_utils::fanout_map(batch, |target| prepare_target(target, path_bases))
+        .into_iter()
+        .collect()
 }
 
 /// Read one target and compute its path delta if one wins — the body of the parallel prep.

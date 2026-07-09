@@ -6,7 +6,9 @@ use forklift_core::model::diff::Diff;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::stocktake_utils::ChangeKind;
-use forklift_core::util::{diff, file_utils, merge_utils, object_utils, pallet_utils, stocktake_utils};
+use forklift_core::util::{
+    diff, fanout_utils, file_utils, merge_utils, object_utils, pallet_utils, stocktake_utils,
+};
 use crate::output::{self, CommandOutput};
 
 /// Handle the diff command: show the changed files line by line.
@@ -292,28 +294,13 @@ fn format_changed_files(changes: &[&TreeChange], verbose: bool) -> Result<Vec<St
         return changes.iter().map(|change| diff_block(change, verbose)).collect();
     }
 
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(changes.len());
-    let chunk = changes.len().div_ceil(workers);
-
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = changes
-            .chunks(chunk)
-            .map(|slice| {
-                scope.spawn(move || {
-                    slice.iter()
-                        .map(|change| diff_block(change, verbose))
-                        .collect::<Vec<Result<String, String>>>()
-                })
-            })
-            .collect();
-
-        handles.into_iter()
-            .flat_map(|handle| handle.join().expect("a diff worker panicked"))
-            .collect()
-    })
+    // See `forklift_core::util::fanout_utils::fanout_map` for the fan-out idiom (chunking,
+    // worker count, and the storage-scope re-entry every worker needs). It never
+    // short-circuits, so the first-path error a serial `.collect()` would report is
+    // recovered by collecting the (order-preserved) results the same way here.
+    fanout_utils::fanout_map(changes, |change| diff_block(change, verbose))
+        .into_iter()
+        .collect()
 }
 
 /// Load one changed file's two sides and format its diff block (the body of the parallel

@@ -1,7 +1,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use crate::globals::bay_root;
-use crate::util::{file_utils, graph_utils, lcs, object_utils};
+use crate::util::{fanout_utils, file_utils, graph_utils, lcs, object_utils};
 
 /// The name of the consolidation-state file (inside the forklift root folder). While a
 /// consolidation is in progress, it holds the head parcel hash of the pallet being
@@ -570,32 +570,10 @@ fn resolve_pending(pending: Vec<PendingAction>,
 fn resolve_merge_jobs_parallel(jobs: &[(usize, MergeJob)],
                                ours_label: &str,
                                theirs_label: &str) -> Vec<(usize, Result<MergeAction, String>)> {
-    let workers = num_cpus::get().max(1).min(jobs.len());
-    let chunk = jobs.len().div_ceil(workers);
-
-    // Storage-root scopes are thread-local and not inherited by spawned threads; capture the
-    // caller's so each worker resolves its blob reads under the same warehouse root. `None`
-    // is cwd/bay resolution, which spawned threads already share.
-    let scope_root = crate::globals::current_scope_root();
-
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = jobs
-            .chunks(chunk)
-            .map(|slice| {
-                let scope_root = scope_root.as_deref();
-                scope.spawn(move || {
-                    let _scope = scope_root.map(crate::globals::StorageRootScope::enter);
-
-                    slice.iter()
-                        .map(|(index, job)| (*index, resolve_merge_job(job, ours_label, theirs_label)))
-                        .collect::<Vec<(usize, Result<MergeAction, String>)>>()
-                })
-            })
-            .collect();
-
-        handles.into_iter()
-            .flat_map(|handle| handle.join().expect("a merge worker panicked"))
-            .collect()
+    // See `fanout_utils::fanout_map` for the fan-out idiom (chunking, worker count, and the
+    // storage-scope re-entry every worker needs).
+    fanout_utils::fanout_map(jobs, |(index, job)| {
+        (*index, resolve_merge_job(job, ours_label, theirs_label))
     })
 }
 

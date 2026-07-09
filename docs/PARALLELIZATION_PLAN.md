@@ -48,9 +48,11 @@ contention.** Two things decide almost every row:
    **read-only** `office_state` (no shared write). The implementation is a three-phase split:
    phase 1 discovers the parcel set by a breadth-first walk over commit-graph parent edges
    (content-addressed, so complete; near-free on a graph-warm warehouse, which avoids a
-   sequential `load_parcel` floor at git.git scale); phase 2 fans the per-parcel verify across
-   `num_cpus` scoped threads (which re-enter the caller's thread-local storage scope — the server
-   serves several warehouses); phase 3 resolves the trust/distrust **boundary** decisions serially,
+   sequential `load_parcel` floor at git.git scale); phase 2 fans the per-parcel verify out
+   through the canonical fan-out helper (`fanout_utils::fanout_map` — see below), which spawns
+   `num_cpus` scoped threads that each re-enter the caller's thread-local storage scope (the
+   server serves several warehouses); phase 3 resolves the trust/distrust **boundary** decisions
+   serially,
    preserving the lazy closures, exact error messages and first-failure order of the serial walk.
    This is a real "beat git" shape (git has no signed-history verification at all).
 
@@ -81,9 +83,11 @@ contention.** Two things decide almost every row:
 
 3. **`diff` — done, 1.4–5.7× on 18 cores (`diff_pallets`).** A cross-revision diff is one
    independent unit per changed file: load the two blobs, run the histogram diff, format the block.
-   `diff_pallets` now fans those across the cores (`std::thread::available_parallelism`), each
-   worker formatting into a string, and prints the blocks in path order afterwards — the collect-
-   then-print that ordered output requires. Serial and parallel output are byte-identical. The win
+   `diff_pallets` now fans those out through the canonical fan-out helper (`fanout_utils::fanout_map`,
+   see below) — the one production caller of it that lives outside `forklift-core`, since `diff`'s
+   command handler is in the `forklift` CLI crate — each worker formatting into a string, and prints
+   the blocks in path order afterwards — the collect-then-print that ordered output requires. Serial
+   and parallel output are byte-identical. The win
    **scales with how much real diffing there is**: measured **5.7× on 3000 files of ~400 lines with
    a quarter changed** (the histogram diff dominates → compute-bound, dodges both the FS wall and
    largely the read ceiling), but only **1.4× on 8000 files with a two-line diff each** (little CPU
@@ -95,9 +99,9 @@ contention.** Two things decide almost every row:
 4. **`consolidate` — done, 6.4× on the merge / 2.5× end-to-end (`compute_merge_actions`).** Same
    shape as `diff`: a file both sides changed since the base is one independent 3-way line merge.
    The tree walk now stays cheap — for such a file it records a deferred `MergeJob` (hashes only,
-   no blob load) instead of merging inline — and a second phase runs the jobs across the cores
-   (`num_cpus` scoped threads, re-entering the storage scope), reassembling the actions in walk
-   order so the result is identical to the serial merge (verified: same merged tree hash). Measured
+   no blob load) instead of merging inline — and a second phase runs the jobs through the canonical
+   fan-out helper (`fanout_utils::fanout_map`, see below), reassembling the actions in walk order so
+   the result is identical to the serial merge (verified: same merged tree hash). Measured
    on a 2000-file clean merge (400-line files, a half changed on each side): the merge computation
    itself went **989 ms → 153 ms (6.4×)** — the cleanest compute-bound win here, since a 3-way LCS
    is heavier per file than a 2-way diff. End-to-end `consolidate` went **1495 ms → 590 ms (2.5×)**:
@@ -114,8 +118,9 @@ contention.** Two things decide almost every row:
    it *without* changing the pack: the size-window fallback deltas each object against the ones just
    packed (a sequential chain), and reordering would change the content-derived pack filename (and
    break idempotent repack). So it is a **byte-bounded batch pipeline** — `prepare_batch` compresses
-   each batch's path deltas in parallel, then the writer walks the batch *in order* doing only the
-   sequential work (window fallback + append). Verified serial and parallel produce **byte-identical
+   each batch's path deltas in parallel through the canonical fan-out helper (`fanout_utils::fanout_map`,
+   see below), then the writer walks the batch *in order* doing only the sequential work (window
+   fallback + append). Verified serial and parallel produce **byte-identical
    `.pack` and `.idx` files** on a 6480-object store; measured **1290 ms → 610 ms (~2.1×)**. The
    window and the append stay serial by nature, and the delta bases are object reads through the
    shared caches, so it lands at the read-cache ceiling rather than near-linear — the expected place.
@@ -146,6 +151,36 @@ contention.** Two things decide almost every row:
   not parallelism.)
 
 - **`export-git` — bound by an external boundary** (a `git` subprocess per object), not CPU.
+
+## The canonical fan-out idiom (shipped, milestone D/P4)
+
+Four of the "done" rows above — `audit`, `consolidate`, `compact`, `diff` — hand-rolled the exact
+same shape independently: split a pre-collected `&[T]` into `min(num_cpus, items.len())` contiguous
+chunks, spawn one `std::thread::scope` worker per chunk that first re-enters the caller's
+thread-local storage-root scope (§ above, not inherited by spawned threads), map each item, and
+reassemble the results positionally so the caller's own walk/path order stays deterministic. That
+duplication is now one helper, `fanout_utils::fanout_map` (`crates/forklift-core/src/util/fanout_utils.rs`),
+and every one of the four sites routes through it — this *is* the parallelism idiom the project
+means when it says "use all cores": a flat, independent item list, fanned out, reassembled in order.
+
+`fanout_map` never short-circuits on error — it always returns exactly `items.len()` results,
+positionally aligned, whether or not the item's own result type is a `Result`. A caller that wants
+first-error/original-order short-circuiting gets it by collecting the returned `Vec` into a
+`Result` (`compact` and `diff` do this); a caller that must inspect every result before deciding
+what is fatal keeps the raw `Vec` (`audit`'s trust/distrust boundary resolution, `consolidate`'s
+walk-order reassembly). Each site keeps its own size threshold below which it never calls the
+helper at all (audit: 256 parcels; consolidate: 8 jobs; compact: 8 objects to prepare; diff: 8
+changed files) — that cutoff is a property of how expensive one item's work is, not of the fan-out
+mechanism, so it stays at the call site rather than living in the helper.
+
+This is deliberately a *different* idiom from [`TaskExecutor`](../crates/forklift-core/src/model/task.rs)
+(`stocktake`/`inventory build`/`stack`'s tree build): `TaskExecutor` is async (`tokio::task::JoinSet`)
+and recurses a *tree*, where a parent directory's result waits on its children enqueueing and
+finishing first. `fanout_map` is sync (`std::thread::scope`) and flat — the whole item list is known
+up front and every item is independent of every other. Neither replaces the other; see the doc
+comment on `fanout_map` for the full "when not to use it" list (filesystem-metadata-bound writes —
+the reverted `materialize` lesson above — and sequential-chain operations like compact's delta
+window or blame's first-parent walk).
 
 ## The cross-cutting lever — the object caches now hold their locks pointer-only (shipped)
 

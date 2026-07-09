@@ -7,7 +7,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 use crate::util::office_utils::{OfficeState, TrustAnchor};
-use crate::util::{file_utils, graph_utils, object_utils, sign_utils};
+use crate::util::{fanout_utils, file_utils, graph_utils, object_utils, sign_utils};
 
 /// Verify the office chain from the genesis forward and return the final office state.
 ///
@@ -450,34 +450,10 @@ fn verify_signatures(parcels: &[String],
         return parcels.iter().map(|hash| classify_signature(hash, office_state)).collect();
     }
 
-    let workers = num_cpus::get().max(1).min(parcels.len());
-    let chunk = parcels.len().div_ceil(workers);
-
-    // Storage-root scopes are thread-local and not inherited by spawned threads; capture
-    // the caller's so each worker resolves its object reads under the same warehouse root
-    // (the server head serves more than one). `None` is cwd/bay resolution, which spawned
-    // threads already share.
-    let scope_root = crate::globals::current_scope_root();
-
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = parcels
-            .chunks(chunk)
-            .map(|slice| {
-                let scope_root = scope_root.as_deref();
-                scope.spawn(move || {
-                    let _scope = scope_root.map(crate::globals::StorageRootScope::enter);
-
-                    slice.iter()
-                        .map(|hash| classify_signature(hash, office_state))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-
-        handles.into_iter()
-            .flat_map(|handle| handle.join().expect("a signature-verification worker panicked"))
-            .collect()
-    })
+    // See `fanout_utils::fanout_map` for the fan-out idiom (chunking, worker count, and the
+    // storage-scope re-entry every worker needs — the server head serves more than one
+    // warehouse).
+    fanout_utils::fanout_map(parcels, |hash| classify_signature(hash, office_state))
 }
 
 /// Classify one parcel's signature against the office key registry — the body of the
