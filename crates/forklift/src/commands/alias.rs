@@ -273,9 +273,31 @@ fn platform_alias_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{}.cmd", name))
 }
 
+/// Strip a `\\?\` verbatim prefix from `path`, so it can be handed to `cmd.exe`.
+///
+/// `target` comes from `this_binary()`, which canonicalizes via `std::fs::canonicalize` —
+/// on Windows that returns a *verbatim* path (`\\?\C:\…`, or `\\?\UNC\server\share`).
+/// `cmd.exe` cannot execute a `\\?\`-prefixed path at all ("The system cannot find the path
+/// specified"), so the shim must embed the ordinary form. Same reasoning (and the same
+/// stripping rule) as `forklift_core::globals::normalize_root` — this is a separate, private
+/// copy because that helper isn't exported across the crate boundary, but the two should be
+/// kept in sync if the rule ever changes. A no-op for a path that isn't verbatim.
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{}", rest))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 #[cfg(windows)]
 fn shim_content(target: &Path) -> String {
-    format!("@echo off\r\n{}\r\n\"{}\" %*\r\n", SHIM_MARKER, target.display())
+    format!("@echo off\r\n{}\r\n\"{}\" %*\r\n", SHIM_MARKER, strip_verbatim_prefix(target).display())
 }
 
 /// Pull the quoted target path back out of a shim this command wrote.
@@ -301,11 +323,20 @@ fn inspect(alias_path: &Path, target: &Path) -> Existing {
 
     match shim_target(&content) {
         Some(existing) => {
-            // Canonicalize before comparing: the shim was written with `target.display()`,
-            // but `target` here is already canonical, so a raw comparison misclassifies
-            // PointsHere as PointsElsewhere on case-insensitive filesystems or when short
-            // (8.3) vs. long paths differ. Fall back to the raw path if it no longer
-            // resolves (e.g. a dangling target after the binary moved).
+            // Canonicalize before comparing: the shim stores the *simplified* (non-verbatim)
+            // form of the target (see `strip_verbatim_prefix`), while `target` here is
+            // already canonical (verbatim). Re-canonicalizing a live `existing` restores the
+            // verbatim form, so a shim written by this same binary still compares equal —
+            // idempotence holds, and this also absorbs case/short-vs-long path differences.
+            //
+            // If canonicalize fails (the shim's target no longer exists — e.g. the binary it
+            // pointed at was moved or deleted), we fall back to the raw, simplified `existing`
+            // path. That can never equal `target` (a verbatim path never string-equals a
+            // simplified one, even when they'd resolve to the same file), so a dangling shim
+            // always reads as PointsElsewhere rather than PointsHere. That's the right call
+            // regardless — a dangling target isn't "pointing here" by definition — and as a
+            // side effect, status output shows the human-readable simplified path instead of
+            // an unreadable `\\?\...` one for this case.
             let resolved = existing.canonicalize().unwrap_or_else(|_| existing.clone());
 
             if resolved == *target {
