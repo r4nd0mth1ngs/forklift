@@ -56,7 +56,13 @@ follow redirects for object bodies. The server head serves bytes directly.
 
 1. **Nothing unverified is ever fetchable.** A remote must verify
    `Blake3(body) == {hash}` before an uploaded object becomes visible at its hash key
-   (DESIGN.html §4.2 step 4 / §6.2).
+   (DESIGN.html §4.2 step 4 / §6.2). A head that lets clients upload *around* it (presigned
+   PUTs straight to storage) must therefore take those bytes at a **staging key**, never at
+   the hash key: a client with a presigned PUT to `objects/{hash}` could otherwise park
+   arbitrary bytes at a valid hash and have them served before anything verified them. The
+   staged bytes become fetchable only when the head copies them to the hash key, and it
+   copies them only after the check — a **verify-and-promote**, the single write path into
+   the canonical namespace.
 2. **Clients verify every downloaded object** the same way before storing it.
 3. **Objects travel uncompressed.** The hash covers the full uncompressed object
    (§4.4), so the wire format is the verifiable form. Transport-level compression
@@ -105,6 +111,37 @@ Body: `{"hashes": ["<hash>", …]}` (at most 10 000 per request — batch larger
 Response: `{"missing": ["<hash>", …]}` — the subset the remote does not have. Used by
 `lift` to negotiate what to upload.
 
+### `POST /v1/objects/upload-targets` (additive; storage-backed heads)
+
+The **body-less upload negotiation**. Request:
+
+```json
+{ "session": "<lift session>", "hashes": ["<hash>", …] }
+```
+
+Response — one verdict per hash, and not a single object body sent to learn it:
+
+```json
+{
+  "present": ["<hash>", …],
+  "targets": { "<hash>": "<presigned PUT url>", … },
+  "direct":  ["<hash>", …]
+}
+```
+
+`present` are objects the remote already has (do not upload them; it is exactly the
+complement of `missing`, so this call subsumes that one on the upload path). `targets` are
+presigned `PUT`s into the session's **staging prefix** — the bytes go straight to storage,
+bypassing the control plane, and are not fetchable until the session commit promotes them.
+`direct` are objects to `PUT` to `/v1/objects/{hash}` as usual, for the head to verify
+inline.
+
+A direct head (`forklift-server`) answers with every missing hash in `direct` and an empty
+`targets`, so one client code path serves both heads. Without this call, a client uploading
+to a storage-backed head must send each body to the control plane only to be answered `307`
+— paying for the bytes twice, through a request-size limit the byte plane exists to avoid.
+Servers that predate it answer `404`; the client falls back to `missing` + per-object `PUT`.
+
 ### `POST /v1/objects/batch`
 
 Many objects in one round trip. Request: `{"hashes": […]}` (max 10 000). Response: a
@@ -115,17 +152,35 @@ lacks are simply absent — the client notices what did not land and falls back 
 fall back entirely. Every imported record is hash-verified before it lands, exactly
 like a bundle import.
 
+The bundle is the one response with no small upper bound — it is as large as the objects
+asked for. A storage-backed head may therefore answer `307` with a `Location` of a
+presigned `GET` for the bundle rather than streaming megabytes back through the control
+plane (the same medicine as the upload path, in the other direction; a Lambda control plane
+cannot return more than a few megabytes at all). The bytes live under an **ephemeral,
+content-addressed response prefix**, never the `objects/` namespace, so nothing there is
+reachable as an object at a hash key and invariant 1 is not in play — and the client
+hash-verifies every record on import regardless.
+
 ### `GET /v1/objects/{hash}`
 
 The raw (uncompressed) object bytes, or `404`. The client verifies the hash before
 storing.
 
-### `PUT /v1/objects/{hash}`
+### `PUT /v1/objects/{hash}[?session={id}]`
 
 Body: the raw object bytes. The remote verifies `Blake3(body) == hash` **before** the
 object becomes fetchable; a mismatch is `422` and nothing is stored. Uploading an
 already-present hash is a no-op `200` (objects are immutable, so equal hash means equal
 content). Success is `201`.
+
+A head whose byte plane is object storage answers `307` instead, with a `Location` of a
+presigned PUT under the **staging prefix of the lift session** — `staging/{session}/{hash}`,
+never `objects/{hash}`. Nothing is fetchable at the hash key until
+`POST /lift/{session}/commit` (small control-plane objects) or the staging verifier (large
+blobs) has verified and promoted it. Such a head therefore needs the session: `?session=`
+is **additive and head-specific** (the `forklift-server` head ignores it and verifies the
+body inline), but a staging head answers `422` without one, because bytes staged under no
+session could never be promoted.
 
 ### `GET /v1/signatures/{hash}` · `PUT /v1/signatures/{hash}`
 
@@ -192,6 +247,14 @@ enforces meta-pallet rules by namespace, so the office lifts to `POST /v1/pallet
 verified when `old_head` was committed, so the signature walk stops there — a linear
 lift audits O(new parcels). A creation (`old_head` absent) audits the full history.
 
+Two honest caveats, recorded 2026-07-09 (DESIGN.html §5.0 B/R5, "no unnecessary walk"):
+the signature walk stops at the single hash `old_head`, which is the exact frontier of a
+*linear* lift but not of a **merge**, whose frontier is the merge-base set — so a merge
+lift re-verifies signatures below the fork point. And the closure check builds its prune
+set by walking `old_head`'s whole ancestry, so *every* ref update is O(history) parcel
+reads regardless. Both err by doing more work than needed, never less; both are fixed by
+the same generation-number-bounded frontier.
+
 ### `POST /lift/{session}/commit` (additive; serverless head)
 
 The **session-commit** step, for a head where object bytes bypass the control plane —
@@ -203,13 +266,19 @@ the client asks the head to confirm the session's uploads are ready:
 { "control_plane": ["<parcel/tree/signature hash>", …], "blobs": ["<blob hash>", …] }
 ```
 
-The head **verifies the small control-plane objects synchronously** — it reads each back
-and checks `Blake3(body) == hash`, so a corrupt object staged straight to storage is
-caught here (`422`) rather than becoming fetchable — and **checks large blobs for
-presence only** (they are hash-verified asynchronously by the staging verifier, which
-promotes an object to its canonical hash key only after `Blake3(body) == hash`, upholding
-invariant 1 for them too). `200` when the session is ready to commit; `422` with the
-offending hash when an object is missing or corrupt.
+The head **verifies and promotes the small control-plane objects synchronously** — for each
+it reads the staged bytes, checks `Blake3(bytes) == hash`, and only then copies them to the
+canonical hash key. A corrupt object staged straight to storage is *discarded* here and the
+lift is refused (`422`); it never becomes fetchable, because it was never at the hash key to
+begin with. Large blobs are **checked for presence at the canonical key only** — which is
+itself the proof they were verified, since the staging verifier (an out-of-band worker
+running the same verify-and-promote) is the only thing that could have put them there. A
+blob still sitting in staging simply reads as absent, and the client retries once the
+verifier has caught up.
+
+`200` when the session is ready to commit; `422` with the offending hash when an object is
+missing, still unverified, or corrupt. Promotion is idempotent, so a retried commit is safe.
+On success the session's staging prefix is swept.
 
 The endpoint is **additive and head-specific**: the `forklift-server` head verifies every
 `PUT` inline (a returned `PUT` means the object is present and verified), so it does not
@@ -255,10 +324,15 @@ fall back to loose-object `GET`s for anything the bundle lacks.
 working pallet:
 1. `GET /v1/warehouse`; refuse when the remote head is unknown locally (lower first).
 2. Collect the closure of the parcels between the local head and the remote head;
-   `POST /v1/objects/missing` in batches.
-3. `PUT` the missing objects in parallel; `PUT` the signature sidecars of the new
-   parcels; `PUT /v1/trust` when the remote has no anchor and the client does.
-4. `POST /v1/pallets/{name}` with `{old_head: remote head, new_head: local head}`.
+   `POST /v1/objects/missing` in batches — or, against a storage-backed head,
+   `POST /v1/objects/upload-targets`, which answers the same question *and* hands back the
+   presigned `PUT`s in the same round trip.
+3. `PUT` the missing objects in parallel — to the control plane, or straight to the
+   presigned staging URLs; `PUT` the signature sidecars of the new parcels;
+   `PUT /v1/trust` when the remote has no anchor and the client does.
+4. Against a staging head only: `POST /lift/{session}/commit`, which verifies and promotes
+   the staged control-plane objects before anything becomes fetchable.
+5. `POST /v1/pallets/{name}` with `{old_head: remote head, new_head: local head}`.
 
 **lower (pull)** — the mirror: `GET /v1/warehouse`, breadth-first fetch of the unknown
 closure from the remote head (parallel `GET`s, skipping objects already present

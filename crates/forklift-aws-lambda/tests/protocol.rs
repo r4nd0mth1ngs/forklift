@@ -16,8 +16,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use forklift_aws_lambda::error::Status;
 use forklift_aws_lambda::head::{ObjectReadResult, ObjectWriteResult, TrustResult};
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
-use forklift_aws_lambda::store::SignatureOutcome;
-use forklift_aws_lambda::Head;
+use forklift_aws_lambda::scratch::Scratch;
+use forklift_aws_lambda::store::{
+    CasOutcome, ObjectStore, PromoteOutcome, PutOutcome, RefStore, SignatureOutcome, TrustOutcome,
+};
+use forklift_aws_lambda::{AsyncBridge, BatchResult, Head};
 
 use forklift_core::globals::StorageRootScope;
 use forklift_core::model::remote::{RefUpdateRequest, TrustAnchorDto};
@@ -196,7 +199,7 @@ fn upload_all<O: forklift_aws_lambda::store::ObjectStore, R: forklift_aws_lambda
     harvest: &Harvest,
 ) {
     for (hash, bytes) in &harvest.objects {
-        head.object_put(hash, bytes).expect("upload object");
+        head.object_put(None, hash, bytes).expect("upload object");
     }
     for (hash, sidecar) in &harvest.signatures {
         head.signature_put(hash, sidecar).expect("upload signature");
@@ -290,7 +293,7 @@ fn a_ref_update_with_a_missing_blob_is_refused() {
             skipped = Some(hash.clone());
             continue;
         }
-        head.object_put(hash, bytes).expect("upload object");
+        head.object_put(None, hash, bytes).expect("upload object");
     }
     assert!(skipped.is_some(), "a blob was found to withhold");
 
@@ -312,7 +315,7 @@ fn a_tampered_object_upload_is_rejected() {
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
 
     let err = head
-        .object_put(&"a".repeat(64), b"not the content of that hash")
+        .object_put(None, &"a".repeat(64), b"not the content of that hash")
         .expect_err("hash mismatch");
     assert_eq!(err.status, Status::Unprocessable);
 }
@@ -416,15 +419,17 @@ fn a_conflicting_signature_is_refused() {
     }
 }
 
-/// The presigned byte plane: with a redirecting store, object reads and writes answer with
-/// a `307`-style redirect instead of moving bytes through the control plane.
+/// The presigned byte plane: with a staging store, object reads answer with a `307` to the
+/// canonical key, while uploads are redirected to a **staging** key — never to the hash key
+/// the reads serve. A session-less upload has nowhere to stage and is refused.
 #[test]
-fn a_redirecting_store_answers_with_presigned_urls() {
+fn a_staging_store_redirects_uploads_to_a_session_staging_key() {
     let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
-    // Seed one object as if it were already in S3.
+
+    // Seed one object as if it were already promoted into S3.
     let bytes = b"an object".to_vec();
     let hash = object_utils::hash_object_bytes(&bytes);
-    store.insert_unverified(&hash, bytes);
+    store.put_verified(&hash, &bytes).expect("seed a canonical object");
 
     let head = Head::new(store, MemoryRefStore::new());
 
@@ -435,43 +440,359 @@ fn a_redirecting_store_answers_with_presigned_urls() {
         ObjectReadResult::Bytes(_) => panic!("expected a redirect"),
     }
 
-    match head.object_put(&hash, b"ignored").expect("put") {
+    // The upload target is under the session's staging prefix, not `objects/{hash}`.
+    match head.object_put(Some("lift-1"), &hash, b"ignored").expect("put") {
         ObjectWriteResult::Redirect(url) => {
-            assert_eq!(url, format!("https://s3.example/bucket/objects/{}", hash))
+            assert_eq!(url, format!("https://s3.example/bucket/staging/lift-1/{}", hash));
+            assert!(!url.contains("/objects/"), "an upload must never target the hash key");
         }
         ObjectWriteResult::Stored { .. } => panic!("expected a redirect"),
     }
+
+    // Without a session there is nowhere to stage, so the head refuses rather than
+    // handing out a presigned PUT to the canonical key.
+    let err = head.object_put(None, &hash, b"ignored").expect_err("session-less upload");
+    assert_eq!(err.status, Status::Unprocessable);
 }
 
-/// The additive session-commit step: control-plane objects are hash-verified
-/// synchronously, so a corrupt one staged straight to S3 stops the lift.
+/// Invariant 1 on the presigned path: bytes a client `PUT`s straight to the staging prefix
+/// are **not fetchable at their hash key** until `commit_lift` verifies and promotes them,
+/// and a corrupt staged object is discarded rather than promoted.
 #[test]
-fn session_commit_catches_a_corrupt_control_plane_object() {
-    let store = MemoryObjectStore::new();
+fn a_staged_object_is_not_fetchable_until_it_is_verified_and_promoted() {
+    let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
 
     let good = b"a good control-plane object".to_vec();
     let good_hash = object_utils::hash_object_bytes(&good);
-    store.insert_unverified(&good_hash, good);
 
-    // A blob whose bytes do NOT match its claimed hash — the case an async verifier would
-    // reject, and that the synchronous control-plane check catches at commit.
+    // Bytes that do NOT match the hash they are staged under — a client uploading garbage
+    // to a presigned URL, the case the promote step must catch.
     let corrupt_hash = object_utils::hash_object_bytes(b"the declared content");
-    store.insert_unverified(&corrupt_hash, b"tampered content".to_vec());
+
+    store.stage("lift-1", &good_hash, good);
+    store.stage("lift-1", &corrupt_hash, b"tampered content".to_vec());
 
     let head = Head::new(store, MemoryRefStore::new());
 
-    // A commit that names the corrupt object as control-plane is refused.
+    // Neither is fetchable while it is merely staged: this is the invariant the old
+    // canonical-key upload broke.
+    for hash in [&good_hash, &corrupt_hash] {
+        let err = head.object_get(hash).expect_err("a staged object is not fetchable");
+        assert_eq!(err.status, Status::NotFound);
+    }
+
+    // A commit naming the corrupt object is refused...
     let err = head
-        .commit_lift(&[good_hash.clone(), corrupt_hash.clone()], &[])
+        .commit_lift("lift-1", &[good_hash.clone(), corrupt_hash.clone()], &[])
         .expect_err("corrupt control-plane object");
     assert_eq!(err.status, Status::Unprocessable);
 
-    // A commit over only the good object succeeds.
-    head.commit_lift(std::slice::from_ref(&good_hash), &[]).expect("clean commit");
+    // ...and the corrupt bytes are gone, never having reached the hash key.
+    let err = head.object_get(&corrupt_hash).expect_err("corrupt bytes were discarded");
+    assert_eq!(err.status, Status::NotFound);
+
+    // A commit over only the good object promotes it: now — and only now — it is fetchable.
+    head.commit_lift("lift-1", std::slice::from_ref(&good_hash), &[]).expect("clean commit");
+
+    match head.object_get(&good_hash).expect("the promoted object") {
+        ObjectReadResult::Redirect(url) => {
+            assert_eq!(url, format!("https://s3.example/bucket/objects/{}", good_hash))
+        }
+        ObjectReadResult::Bytes(_) => panic!("expected a redirect"),
+    }
+
+    // The commit swept the session's staging prefix, and promotion is idempotent.
+    assert_eq!(head.objects.staged_count(), 0, "staging is swept after a commit");
+    head.commit_lift("lift-1", std::slice::from_ref(&good_hash), &[]).expect("retried commit");
 
     // A commit naming an object that was never staged is "not ready".
-    let err = head.commit_lift(&["f".repeat(64)], &[]).expect_err("missing object");
+    let err = head.commit_lift("lift-1", &["f".repeat(64)], &[]).expect_err("missing object");
     assert_eq!(err.status, Status::Unprocessable);
+}
+
+/// A blob is presence-checked at its *canonical* key, which is the proof the staging
+/// verifier already hash-checked it: a blob still in staging reads as not-yet-ready.
+#[test]
+fn a_blob_still_in_staging_is_not_ready_to_commit() {
+    let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
+
+    let blob = b"a large working blob".to_vec();
+    let blob_hash = object_utils::hash_object_bytes(&blob);
+    store.stage("lift-1", &blob_hash, blob);
+
+    let head = Head::new(store, MemoryRefStore::new());
+
+    let err = head
+        .commit_lift("lift-1", &[], std::slice::from_ref(&blob_hash))
+        .expect_err("unpromoted blob");
+    assert_eq!(err.status, Status::Unprocessable);
+
+    // The staging verifier promotes it out of band — the same trait operation the control
+    // plane uses for small objects — and the commit then succeeds.
+    let outcome = head.objects.verify_and_promote("lift-1", &blob_hash).expect("promote");
+    assert_eq!(outcome, PromoteOutcome::Promoted);
+
+    head.commit_lift("lift-1", &[], &[blob_hash]).expect("the blob is verified and present");
+}
+
+/// The control plane and the staging verifier can promote the same hash at the same time.
+/// Exactly one wins; the loser sees the canonical object rather than a spurious "missing",
+/// so a lift never fails because the other promoter got there first.
+#[test]
+fn racing_promoters_serialize_and_never_report_missing() {
+    let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
+
+    let bytes = b"an object two promoters both want".to_vec();
+    let hash = object_utils::hash_object_bytes(&bytes);
+    store.stage("lift-1", &hash, bytes);
+
+    let barrier = std::sync::Barrier::new(2);
+    let (store, barrier, hash) = (&store, &barrier, &hash);
+
+    let outcomes: Vec<PromoteOutcome> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(move || {
+                    barrier.wait();
+                    store.verify_and_promote("lift-1", hash).expect("promote")
+                })
+            })
+            .collect();
+
+        handles.into_iter().map(|handle| handle.join().expect("promoter thread")).collect()
+    });
+
+    assert_eq!(outcomes.iter().filter(|o| **o == PromoteOutcome::Promoted).count(), 1);
+    assert_eq!(outcomes.iter().filter(|o| **o == PromoteOutcome::AlreadyPresent).count(), 1);
+    assert!(!outcomes.contains(&PromoteOutcome::Missing), "the loser must not see 'missing'");
+    assert_eq!(store.object_count(), 1);
+    assert_eq!(store.staged_count(), 0);
+}
+
+/// Build a warehouse of `dirs` directories, then `touches` parcels each rewriting the same
+/// file. Every touch supersedes two trees (the root and `d0`), so the history accumulates
+/// tree versions that only an unbounded mirror would ever fetch. The head's own tree closure
+/// stays the same size no matter how many touches came before.
+fn layered_warehouse(area: &Area, dirs: usize, touches: usize) {
+    prepare(area, "wh");
+
+    for dir in 0..dirs {
+        area.write_file(&format!("wh/d{}/f.txt", dir), "v0\n");
+    }
+
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "create"]);
+
+    for touch in 0..touches {
+        area.write_file("wh/d0/f.txt", &format!("v{}\n", touch + 1));
+        area.forklift("wh", &["load", "."]);
+        area.forklift("wh", &["stack", &format!("touch {}", touch)]);
+    }
+}
+
+/// Audit one more parcel on top of a `touches`-long history, both ways, and report how many
+/// object bodies each mirror pulled from the store: `(bounded, unbounded)`. The two differ
+/// only in `old_head` — same graph, same objects.
+fn mirror_reads(touches: usize) -> (usize, usize) {
+    let area = Area::new("bounded-mirror");
+    layered_warehouse(&area, 4, touches);
+
+    let old_head = harvest(&area.path("wh")).head_of("main").expect("main head");
+
+    // The segment the incremental update actually audits.
+    area.write_file("wh/d0/f.txt", "the new segment\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "the new segment"]);
+
+    let latest = harvest(&area.path("wh"));
+    let new_head = latest.head_of("main").expect("main head");
+    assert_ne!(old_head, new_head);
+
+    // Bounded: the pallet already sits at `old_head`, so the audit stops expanding there.
+    let bounded = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&bounded, &latest);
+    bounded
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head: old_head.clone() })
+        .expect("establish the old head");
+    bounded.objects.reset_reads();
+    bounded
+        .ref_update(
+            "main",
+            &RefUpdateRequest { old_head: Some(old_head), new_head: new_head.clone() },
+        )
+        .expect("the bounded ref update still audits clean");
+
+    // Unbounded: the same head parcel audited as a creation — the whole history expands.
+    let unbounded = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&unbounded, &latest);
+    unbounded.objects.reset_reads();
+    unbounded
+        .ref_update("main", &RefUpdateRequest { old_head: None, new_head })
+        .expect("the unbounded ref update audits clean");
+
+    (bounded.objects.reads(), unbounded.objects.reads())
+}
+
+/// R3: the ref-update mirror is bounded at `old_head` — in the dimension that costs.
+///
+/// Below the bound it still reads one parcel *body* apiece (`collect_reachable` walks
+/// `old_head`'s ancestry to build the closure check's prune set), but **no trees**. So
+/// lengthening the history by `k` parcels costs a bounded mirror exactly `k` more reads,
+/// while an unbounded one also re-fetches every superseded tree version.
+#[test]
+fn the_ref_update_mirror_is_bounded_at_old_head() {
+    let extra = 4;
+    let (bounded_short, unbounded_short) = mirror_reads(2);
+    let (bounded_long, unbounded_long) = mirror_reads(2 + extra);
+
+    assert!(bounded_short < unbounded_short, "the bound saves reads even on a short history");
+
+    assert_eq!(
+        bounded_long - bounded_short,
+        extra,
+        "a bounded mirror pays exactly one parcel body per extra parcel of history and no \
+         trees ({} vs {} reads)",
+        bounded_long,
+        bounded_short
+    );
+
+    assert!(
+        unbounded_long - unbounded_short > extra,
+        "an unbounded mirror also re-reads every superseded tree ({} vs {} reads)",
+        unbounded_long,
+        unbounded_short
+    );
+}
+
+/// The sidecar bound is the subtle half of R3: `verify_pallet_history` never traverses
+/// *through* `old_head`, so a merge lift whose new segment forks below it must re-expand
+/// that older branch — signatures and all — or a trusted audit would see unsigned parcels.
+#[test]
+fn a_trusted_merge_lift_below_the_bound_still_audits() {
+    let area = Area::new("merge-bound");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+
+    area.write_file("wh/app.txt", "base\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "base"]);
+
+    // A branch forking at `base` — below the bound the lift will later carry.
+    area.forklift("wh", &["palletize", "feature"]);
+    area.write_file("wh/feature.txt", "from the branch\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "on the branch"]);
+
+    // main moves on, and that head becomes the remote's `old_head`.
+    area.forklift("wh", &["shift", "main"]);
+    area.write_file("wh/app.txt", "moved on\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "on main"]);
+
+    let before = harvest(&area.path("wh"));
+    let old_head = before.head_of("main").expect("main head");
+    let office_head = before.head_of("@office").expect("office head");
+
+    let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&head, &before);
+    head.put_trust(before.trust.as_ref().expect("trust")).expect("plant trust");
+    head.ref_update("@office", &RefUpdateRequest { old_head: None, new_head: office_head })
+        .expect("lift the office");
+    head.ref_update("main", &RefUpdateRequest { old_head: None, new_head: old_head.clone() })
+        .expect("establish the old head");
+
+    // The merge parcel: its second parent is the branch tip, whose ancestry forks below
+    // `old_head`. The audit walks into it; the mirror must follow.
+    area.forklift("wh", &["consolidate", "feature"]);
+
+    let after = harvest(&area.path("wh"));
+    let new_head = after.head_of("main").expect("merged main head");
+    assert_ne!(old_head, new_head);
+
+    // Guard the point of the test: a fast-forward would never walk below the bound.
+    let parents = {
+        let _scope = StorageRootScope::enter(&area.path("wh"));
+        object_utils::load_parcel(&new_head).expect("the merge parcel").parents
+    };
+    assert_eq!(parents.len(), 2, "consolidate stacked a real merge parcel");
+
+    upload_all(&head, &after);
+    head.ref_update("main", &RefUpdateRequest { old_head: Some(old_head), new_head })
+        .expect("a merge lift across the bound audits clean");
+}
+
+/// The warm-container scratch: a second ref update against the same warehouse finds the
+/// history already mirrored and re-reads almost nothing from the object store. The pool is
+/// keyed by warehouse, because scratch presence is read as store presence.
+#[test]
+fn a_pooled_scratch_amortizes_the_mirror_and_is_keyed_by_warehouse() {
+    // Unique per run: a shared scratch is keyed by warehouse alone, so a directory left in
+    // /tmp by an earlier run would silently pre-warm the "cold" measurement below.
+    let warehouse = format!("pooled-{}-{}", std::process::id(), unique_suffix());
+
+    let alpha = Scratch::shared(&warehouse).expect("shared scratch");
+    let again = Scratch::shared(&warehouse).expect("shared scratch");
+    let beta = Scratch::shared(&format!("{}-other", warehouse)).expect("shared scratch");
+
+    assert_eq!(alpha.root(), again.root(), "one scratch per warehouse, reused");
+    assert_ne!(alpha.root(), beta.root(), "never shared across warehouses");
+
+    let area = Area::new("pooled-scratch");
+    layered_warehouse(&area, 4, 3);
+
+    let old_head =
+        harvest(&area.path("wh")).head_of("main").expect("main head");
+
+    area.write_file("wh/d0/f.txt", "v2\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "the new segment"]);
+
+    let latest = harvest(&area.path("wh"));
+    let new_head = latest.head_of("main").expect("main head");
+
+    // A warehouse id unique to this test, so the process-global pool stays isolated.
+    let head = Head::pooled(MemoryObjectStore::new(), MemoryRefStore::new(), &warehouse);
+    upload_all(&head, &latest);
+
+    head.objects.reset_reads();
+    head.ref_update("main", &RefUpdateRequest { old_head: None, new_head: old_head.clone() })
+        .expect("cold ref update");
+    let cold = head.objects.reads();
+
+    head.objects.reset_reads();
+    head.ref_update(
+        "main",
+        &RefUpdateRequest { old_head: Some(old_head), new_head: new_head.clone() },
+    )
+    .expect("warm ref update");
+    let warm = head.objects.reads();
+
+    assert!(cold > 0, "the cold mirror reads the history");
+    assert!(
+        warm * 3 < cold,
+        "a warm scratch re-reads almost nothing: {} warm vs {} cold",
+        warm,
+        cold
+    );
+
+    // And it is still correct: the head moved.
+    assert_eq!(
+        head.refs.get_head(pallet_utils::PalletNamespace::User, "main").unwrap().as_deref(),
+        Some(new_head.as_str())
+    );
+
+    // A pooled scratch outlives the request by design; this test owns these two, so it
+    // leaves no directories behind.
+    let _ = std::fs::remove_dir_all(alpha.root());
+    let _ = std::fs::remove_dir_all(beta.root());
+}
+
+/// A monotonically increasing suffix, so a scratch key is unique to this run.
+fn unique_suffix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_nanos() as u64
 }
 
 /// `batch` returns a bundle-format stream the negotiation can consume, and the round trip
@@ -489,9 +810,230 @@ fn batch_returns_a_bundle_stream() {
     upload_all(&head, &harvest);
 
     let hashes: Vec<String> = harvest.objects.keys().cloned().collect();
-    let bundle = head.batch(&hashes).expect("batch");
-    assert!(!bundle.is_empty(), "the batch produced a non-empty bundle stream");
+
+    match head.batch(&hashes).expect("batch") {
+        BatchResult::Bundle(bundle) => {
+            assert!(!bundle.is_empty(), "the batch produced a non-empty bundle stream")
+        }
+        BatchResult::Redirect(_) => panic!("a direct store serves the bundle inline"),
+    }
 
     // Nothing is missing after the upload.
     assert!(head.missing(&hashes).expect("missing").is_empty());
+}
+
+/// A store that can offload keeps the bundle out of the control plane: `batch` answers with
+/// a presigned `GET` whose bytes are exactly the bundle the direct head would have streamed.
+#[test]
+fn batch_offloads_the_bundle_to_a_presigned_url() {
+    let area = Area::new("batch-offload");
+    prepare(&area, "wh");
+    area.write_file("wh/a.txt", "alpha\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "one"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let hashes: Vec<String> = harvest.objects.keys().cloned().collect();
+
+    // The same warehouse behind a direct head and a staging head.
+    let direct = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
+    upload_all(&direct, &harvest);
+
+    let staging = Head::new(
+        MemoryObjectStore::with_redirect("https://s3.example/bucket"),
+        MemoryRefStore::new(),
+    );
+    for (hash, bytes) in &harvest.objects {
+        staging.objects.put_verified(hash, bytes).expect("seed the staging store");
+    }
+
+    let inline = match direct.batch(&hashes).expect("direct batch") {
+        BatchResult::Bundle(bundle) => bundle,
+        BatchResult::Redirect(_) => panic!("a direct store serves the bundle inline"),
+    };
+
+    match staging.batch(&hashes).expect("offloaded batch") {
+        BatchResult::Redirect(url) => {
+            assert!(url.starts_with("https://s3.example/bucket/responses/"));
+            assert!(!url.contains("/objects/"), "a response body is never an object");
+
+            let served = staging.objects.offloaded_response(&url).expect("the presigned bytes");
+            assert_eq!(served, inline, "the offloaded bundle is the bundle");
+        }
+        BatchResult::Bundle(_) => panic!("an offloading store hands out a presigned GET"),
+    }
+}
+
+/// The body-less upload negotiation: one round trip sorts the hashes into already-present,
+/// upload-straight-to-storage, and send-through-the-control-plane — without a single body.
+#[test]
+fn upload_targets_negotiates_without_sending_bodies() {
+    let present = b"an object the remote already has".to_vec();
+    let present_hash = object_utils::hash_object_bytes(&present);
+    let wanted_hash = object_utils::hash_object_bytes(b"an object it does not");
+
+    // A staging head: the missing object gets a presigned staging URL.
+    let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
+    store.put_verified(&present_hash, &present).expect("seed");
+    let staging = Head::new(store, MemoryRefStore::new());
+
+    let answer = staging
+        .upload_targets("lift-1", &[present_hash.clone(), wanted_hash.clone(), present_hash.clone()])
+        .expect("negotiate");
+
+    assert_eq!(answer.present, vec![present_hash.clone()], "duplicates collapse");
+    assert!(answer.direct.is_empty());
+    assert_eq!(
+        answer.targets.get(&wanted_hash).map(String::as_str),
+        Some(format!("https://s3.example/bucket/staging/lift-1/{}", wanted_hash).as_str())
+    );
+
+    // `present` is exactly the complement of `missing`, so this subsumes that call.
+    assert_eq!(staging.missing(&[present_hash.clone(), wanted_hash.clone()]).unwrap(), vec![
+        wanted_hash.clone()
+    ]);
+
+    // A direct head: the same request routes the missing object through the control plane,
+    // so one client code path serves both heads.
+    let store = MemoryObjectStore::new();
+    store.put_verified(&present_hash, &present).expect("seed");
+    let direct = Head::new(store, MemoryRefStore::new());
+
+    let answer = direct
+        .upload_targets("lift-1", &[present_hash.clone(), wanted_hash.clone()])
+        .expect("negotiate");
+
+    assert_eq!(answer.present, vec![present_hash]);
+    assert_eq!(answer.direct, vec![wanted_hash]);
+    assert!(answer.targets.is_empty());
+}
+
+// ---------------------------------------------------------------------------------------
+// R4: the sync/async seam. Stores whose every operation is a future — the AWS SDK's shape —
+// implementing the synchronous traits through `AsyncBridge`.
+// ---------------------------------------------------------------------------------------
+
+/// An [`ObjectStore`] whose every call suspends, as an `aws-sdk-s3` call does. It exists to
+/// prove the seam: `forklift_core`'s synchronous audit, its thread-local storage scope and
+/// the whole `Head` run on one blocking thread, over a backend that is async underneath.
+struct AsyncObjectStore {
+    inner: MemoryObjectStore,
+    bridge: AsyncBridge,
+}
+
+/// Suspend first, *then* do the work — the shape of a real SDK call, whose response is
+/// handled after the await. A future that cannot resolve on its first poll, so the driver
+/// underneath must genuinely be running for the bridged call to return at all.
+async fn suspending<T>(work: impl FnOnce() -> T) -> T {
+    tokio::task::yield_now().await;
+
+    work()
+}
+
+impl ObjectStore for AsyncObjectStore {
+    fn exists(&self, hash: &str) -> Result<bool, String> {
+        self.bridge.block_on(suspending(|| self.inner.exists(hash)))
+    }
+
+    fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
+        self.bridge.block_on(suspending(|| self.inner.get(hash)))
+    }
+
+    fn put_verified(&self, hash: &str, bytes: &[u8]) -> Result<PutOutcome, String> {
+        self.bridge.block_on(suspending(|| self.inner.put_verified(hash, bytes)))
+    }
+
+    fn get_signature(&self, parcel_hash: &str) -> Result<Option<Vec<u8>>, String> {
+        self.bridge.block_on(suspending(|| self.inner.get_signature(parcel_hash)))
+    }
+
+    fn put_signature(&self, parcel_hash: &str, bytes: &[u8]) -> Result<SignatureOutcome, String> {
+        self.bridge.block_on(suspending(|| self.inner.put_signature(parcel_hash, bytes)))
+    }
+}
+
+/// The same for the consistency point: DynamoDB is async too.
+struct AsyncRefStore {
+    inner: MemoryRefStore,
+    bridge: AsyncBridge,
+}
+
+impl RefStore for AsyncRefStore {
+    fn get_head(&self, namespace: pallet_utils::PalletNamespace, name: &str) -> Result<Option<String>, String> {
+        self.bridge.block_on(suspending(|| self.inner.get_head(namespace, name)))
+    }
+
+    fn compare_and_set_head(
+        &self,
+        namespace: pallet_utils::PalletNamespace,
+        name: &str,
+        expected: Option<&str>,
+        new: &str,
+    ) -> Result<CasOutcome, String> {
+        self.bridge
+            .block_on(suspending(|| self.inner.compare_and_set_head(namespace, name, expected, new)))
+    }
+
+    fn list_refs(&self) -> Result<Vec<(pallet_utils::PalletRef, String)>, String> {
+        self.bridge.block_on(suspending(|| self.inner.list_refs()))
+    }
+
+    fn default_pallet(&self) -> Result<String, String> {
+        self.bridge.block_on(suspending(|| self.inner.default_pallet()))
+    }
+
+    fn get_trust(&self) -> Result<Option<office_utils::TrustAnchor>, String> {
+        self.bridge.block_on(suspending(|| self.inner.get_trust()))
+    }
+
+    fn put_trust_if_absent(&self, anchor: &office_utils::TrustAnchor) -> Result<TrustOutcome, String> {
+        self.bridge.block_on(suspending(|| self.inner.put_trust_if_absent(anchor)))
+    }
+
+    fn replace_trust(&self, anchor: &office_utils::TrustAnchor) -> Result<(), String> {
+        self.bridge.block_on(suspending(|| self.inner.replace_trust(anchor)))
+    }
+}
+
+/// R4: the whole trusted lift — mirror, thread-local storage scope, signature audit, CAS —
+/// runs synchronously on a blocking thread over stores that are async underneath. This is
+/// the shape milestone C's S3 + DynamoDB implementations take, minus AWS.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trusted_lift_runs_over_async_backed_stores_from_a_blocking_thread() {
+    let area = Area::new("async-seam");
+    prepare(&area, "wh");
+    area.forklift("wh", &["office", "enroll"]);
+    area.write_file("wh/app.txt", "v1\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "signed one"]);
+
+    let harvested = harvest(&area.path("wh"));
+    let office_head = harvested.head_of("@office").expect("office head");
+    let main_head = harvested.head_of("main").expect("main head");
+
+    let bridge = AsyncBridge::current().expect("the test runs on a multi-thread runtime");
+
+    let head = Head::new(
+        AsyncObjectStore { inner: MemoryObjectStore::new(), bridge: bridge.clone() },
+        AsyncRefStore { inner: MemoryRefStore::new(), bridge },
+    );
+
+    let expected = main_head.clone();
+
+    tokio::task::spawn_blocking(move || {
+        upload_all(&head, &harvested);
+        head.put_trust(harvested.trust.as_ref().expect("trust")).expect("plant trust");
+
+        head.ref_update("@office", &RefUpdateRequest { old_head: None, new_head: office_head })
+            .expect("lift the office over an async store");
+        head.ref_update("main", &RefUpdateRequest { old_head: None, new_head: main_head })
+            .expect("lift the pallet over an async store");
+
+        assert_eq!(
+            head.refs.get_head(pallet_utils::PalletNamespace::User, "main").unwrap().as_deref(),
+            Some(expected.as_str())
+        );
+    })
+    .await
+    .expect("the head runs to completion on a blocking thread");
 }

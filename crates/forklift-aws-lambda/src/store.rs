@@ -8,6 +8,14 @@
 //! bytes itself (the fake, the self-host equivalent) or hands out a `307` to a storage
 //! URL (the S3-backed deployment).
 //!
+//! When bytes bypass the head they land in a **staging prefix** keyed by the lift session,
+//! not at the object's hash key. Only [`ObjectStore::verify_and_promote`] — which checks
+//! `Blake3(bytes) == hash` — moves them to the canonical key, and that is the moment they
+//! become fetchable. So invariant 1 ("nothing unverified is ever fetchable") holds for the
+//! presigned path structurally, not by a later audit: there is no window in which a client
+//! can write arbitrary bytes to a hash key. The staging round trip is the whole reason
+//! `put_target` needs a session.
+//!
 //! [`RefStore`] is the single consistency point — pallet heads and the trust anchor. On
 //! AWS it is DynamoDB, and its one non-idempotent operation, [`RefStore::compare_and_set_head`],
 //! is a conditional write: exactly the CAS that lets the serverless head scale
@@ -18,6 +26,13 @@
 //! Every method returns `Result<_, String>`: storage failures are opaque strings that the
 //! [`Head`](crate::Head) turns into a `500`. The verification and CAS *semantics* live in
 //! the head, not the stores — a store only persists and reports.
+//!
+//! Both traits are **synchronous, deliberately** (R4, decided 2026-07-09), even though S3
+//! and DynamoDB are async: the audit these stores feed *is* `forklift_core`, which is
+//! synchronous to its roots and scoped by a thread-local that must never cross an `.await`.
+//! The async boundary therefore lives in the runtime adapter, which runs the whole `Head`
+//! call on a blocking thread; an SDK-backed store bridges each future with
+//! [`AsyncBridge`](crate::blocking::AsyncBridge). See `blocking.rs` for the full argument.
 
 use forklift_core::util::office_utils::TrustAnchor;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
@@ -55,12 +70,35 @@ pub enum ObjectAccess {
 pub enum PutTarget {
     /// The head accepts and verifies the bytes itself (self-host / fake).
     Direct,
-    /// Upload the bytes to this URL (a presigned S3 PUT); the head answers `307`. The
-    /// object becomes fetchable only after it is verified — inline at a completion
-    /// callback for small control-plane objects, asynchronously for large blobs
-    /// (DESIGN.html §4.2 / §4.6). The verifier reuses the same `Blake3(body) == hash`
-    /// check `put_verified` runs.
-    Redirect(String),
+    /// Upload the bytes to this URL (a presigned S3 PUT); the head answers `307`. The URL
+    /// addresses a **staging key**, never the object's hash key: bytes written there are
+    /// invisible to [`ObjectStore::exists`]/[`get`](ObjectStore::get) and become fetchable
+    /// only once [`ObjectStore::verify_and_promote`] has checked `Blake3(bytes) == hash`
+    /// and copied them to the canonical key. That ordering is what upholds invariant 1
+    /// against a client that uploads straight to storage (DESIGN.html §4.2 / §4.6).
+    Staged(String),
+    /// The store stages uploads, but the request named no lift session to stage under —
+    /// the head answers `422`. A session-less upload has nowhere to be promoted from.
+    SessionRequired,
+}
+
+/// The outcome of verifying a staged object and promoting it to its canonical hash key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromoteOutcome {
+    /// The staged bytes hashed to `hash` and now live at the canonical key: fetchable.
+    Promoted,
+    /// The canonical object was already present, so the staged copy (if any) was dropped.
+    /// Promotion is idempotent — a retried commit lands here.
+    AlreadyPresent,
+    /// Nothing is staged under `(session, hash)` and no canonical object exists: the
+    /// client never uploaded it.
+    Missing,
+    /// The staged bytes do **not** hash to `hash`. They are discarded, never promoted;
+    /// nothing unverified becomes fetchable. Carries the hash the bytes actually have.
+    Corrupt {
+        /// What the staged bytes actually hash to.
+        actual: String,
+    },
 }
 
 /// The outcome of a compare-and-set on a pallet head.
@@ -119,10 +157,50 @@ pub trait ObjectStore {
         Ok(self.get(hash)?.map(ObjectAccess::Direct))
     }
 
-    /// Where an upload of `hash` should go. The default accepts the bytes directly; an
-    /// S3-backed store overrides this to hand out a presigned-PUT [`PutTarget::Redirect`].
-    fn put_target(&self, _hash: &str) -> Result<PutTarget, String> {
+    /// Where an upload of `hash` belonging to lift `session` should go. The default
+    /// accepts the bytes directly and ignores the session (the head verifies them inline,
+    /// so it needs no staging area); an S3-backed store overrides this to hand out a
+    /// presigned PUT to a [`PutTarget::Staged`] key under the session.
+    fn put_target(&self, _session: Option<&str>, _hash: &str) -> Result<PutTarget, String> {
         Ok(PutTarget::Direct)
+    }
+
+    /// Verify a staged upload and, only if `Blake3(bytes) == hash`, promote it to its
+    /// canonical hash key — the single moment an uploaded object becomes fetchable
+    /// (invariant 1). Corrupt staged bytes are discarded, never promoted.
+    ///
+    /// Both callers of the AWS deployment funnel through here: the control plane runs it
+    /// synchronously for the small objects at `POST /lift/{session}/commit`, and the
+    /// staging verifier (an S3-event Lambda) runs it asynchronously for large blobs. It is
+    /// idempotent, so the two racing on one hash is safe.
+    ///
+    /// The default is the direct store's: nothing is ever staged, and whatever is present
+    /// was already hash-verified by [`put_verified`](ObjectStore::put_verified).
+    fn verify_and_promote(&self, _session: &str, hash: &str) -> Result<PromoteOutcome, String> {
+        if self.exists(hash)? {
+            Ok(PromoteOutcome::AlreadyPresent)
+        } else {
+            Ok(PromoteOutcome::Missing)
+        }
+    }
+
+    /// Drop everything still staged under `session` — the sweep after a committed lift
+    /// (whose objects have been promoted) or an abandoned one. Never touches canonical
+    /// objects. The default store stages nothing, so this is a no-op.
+    fn discard_session(&self, _session: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Park a large *response* body (a `batch` bundle) in storage and return a presigned
+    /// `GET` for it, so the bytes never travel through the control plane — which on Lambda
+    /// cannot return more than a few megabytes anyway. `None` means "serve it inline"
+    /// (the self-host / fake behaviour).
+    ///
+    /// The bytes land under an ephemeral, content-addressed prefix that is *not* the
+    /// canonical object namespace, so nothing here is reachable as an object at a hash key
+    /// and invariant 1 is not in play. Clients verify bundle records on import regardless.
+    fn offload_response(&self, _bytes: &[u8]) -> Result<Option<String>, String> {
+        Ok(None)
     }
 }
 

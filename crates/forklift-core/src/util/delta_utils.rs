@@ -35,11 +35,22 @@ pub fn compress_delta(base: &[u8], target: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("Error while compressing a delta: {}", e))
 }
 
+/// The largest target a delta may reconstruct — and, symmetrically, the largest object a
+/// delta is ever *created* for. Deltating huge blobs costs more RAM/CPU than it saves and it
+/// bounds window memory, so both writers (`pack_utils`, `bundle_utils`) store anything larger
+/// in full.
+///
+/// Because no writer emits a delta above this size, the reader may enforce it — which is what
+/// turns [`decompress_delta`]'s declared length into a real decompression-bomb bound rather
+/// than a number the attacker chooses. Without it, a hostile record could declare `u64::MAX`
+/// and a small zstd frame could expand without limit.
+pub const MAX_DELTA_TARGET_BYTES: usize = 16 * 1024 * 1024;
+
 /// Reconstruct a target from its delta against `base`.
 ///
-/// `capacity` is the target's exact decompressed length (carried in the delta record). It
-/// bounds the output allocation and doubles as a decompression-bomb guard — a frame that
-/// tries to expand past it is rejected rather than trusted.
+/// `capacity` is the target's exact decompressed length (carried in the delta record). The
+/// result must match it exactly, and it must not exceed [`MAX_DELTA_TARGET_BYTES`] — together
+/// those make this a real decompression-bomb guard.
 ///
 /// # Arguments
 /// * `base`     - The base object's raw bytes (the dictionary the delta was made against).
@@ -48,13 +59,49 @@ pub fn compress_delta(base: &[u8], target: &[u8]) -> Result<Vec<u8>, String> {
 ///
 /// # Returns
 /// * `Ok(Vec<u8>)` - The reconstructed target bytes (still to be hash-verified by the caller).
-/// * `Err(String)` - If the base is wrong, the payload is corrupt, or it exceeds `capacity`.
+/// * `Err(String)` - If the declared length is above the ceiling, the base is wrong, the
+///   payload is corrupt, or the frame does not reconstruct to exactly `capacity` bytes.
 pub fn decompress_delta(base: &[u8], payload: &[u8], capacity: usize) -> Result<Vec<u8>, String> {
-    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(base)
+    use std::io::Read;
+
+    // `capacity` is the *declared* length carried in a delta record — attacker-controlled in an
+    // imported bundle and untrusted in an on-disk pack. Two things follow.
+    //
+    // It must never be pre-allocated: a lie (e.g. `u64::MAX`) would be a one-record denial of
+    // service (a capacity-overflow panic, or an allocator abort for a large-but-representable
+    // value). So the buffer below grows with the bytes actually produced.
+    //
+    // And it must never be trusted as the *bound*, or it is no bound at all: a declared
+    // `u64::MAX` would let a small zstd frame expand until memory ran out. The ceiling is what
+    // makes the guard real — and it is sound because no writer emits a delta above it.
+    if capacity > MAX_DELTA_TARGET_BYTES {
+        return Err(format!(
+            "A delta record declares a {} byte target, above the {} byte ceiling deltas are \
+            created under; refusing to reconstruct it.",
+            capacity, MAX_DELTA_TARGET_BYTES
+        ));
+    }
+
+    let mut decoder = zstd::stream::read::Decoder::with_dictionary(payload, base)
         .map_err(|e| format!("Error while preparing the delta decompressor: {}", e))?;
 
-    decompressor.decompress(payload, capacity)
-        .map_err(|e| format!("Error while decompressing a delta: {}", e))
+    // Read one byte past the declared length: producing it is what proves the frame lied.
+    let mut output = Vec::new();
+    decoder.by_ref().take(capacity as u64 + 1).read_to_end(&mut output)
+        .map_err(|e| format!("Error while decompressing a delta: {}", e))?;
+
+    // Exactly, not at most: the length is the record's own claim about the object, so a frame
+    // that under-runs it is as corrupt as one that overruns it. Correctness never rests on this
+    // — every caller hash-verifies the result — but the resource bound does.
+    if output.len() != capacity {
+        return Err(format!(
+            "A delta reconstructed {} bytes but its record declared {}.",
+            output.len(),
+            capacity
+        ));
+    }
+
+    Ok(output)
 }
 
 #[cfg(test)]

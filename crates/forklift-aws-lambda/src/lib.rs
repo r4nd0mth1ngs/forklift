@@ -31,15 +31,17 @@
 //! serverless head varies, the working-blob existence check, routed to `ObjectStore`
 //! (an S3 `HEAD`) via `audit_utils::verify_parcel_closure_with`.
 
+pub mod blocking;
 pub mod error;
 pub mod store;
 pub mod memory;
 pub mod scratch;
 pub mod head;
 
+pub use blocking::AsyncBridge;
 pub use error::{HeadError, HeadResult, Status};
-pub use head::Head;
+pub use head::{BatchResult, Head};
 pub use store::{
-    CasOutcome, ObjectAccess, ObjectStore, PutOutcome, PutTarget, RefStore, SignatureOutcome,
-    TrustOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
+    SignatureOutcome, TrustOutcome,
 };

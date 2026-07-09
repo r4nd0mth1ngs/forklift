@@ -243,7 +243,12 @@ fn emit_blob<W: Write>(encoder: &mut zstd::stream::Encoder<'_, W>,
     if let Some(base_hash) = latest_blob_at_path.get(path).cloned() {
         let base_depth = *emitted_depth.get(&base_hash).unwrap_or(&0);
 
-        if base_depth < MAX_DELTA_CHAIN && base_hash != blob_hash {
+        // An over-large object is stored full, never delta'd — the same rule `pack_utils`
+        // applies, and the one that lets `decompress_delta` enforce a real bomb ceiling on
+        // the read side (`delta_utils::MAX_DELTA_TARGET_BYTES`).
+        let deltable = target_bytes.len() <= delta_utils::MAX_DELTA_TARGET_BYTES;
+
+        if deltable && base_depth < MAX_DELTA_CHAIN && base_hash != blob_hash {
             let base_bytes = file_utils::retrieve_object_by_hash(&base_hash)?;
             let delta = delta_utils::compress_delta(&base_bytes, &target_bytes)?;
 
@@ -433,10 +438,22 @@ fn import_bundle_reader<R: std::io::BufRead>(mut reader: R) -> Result<ImportStat
 
         let length = u64::from_be_bytes(length_bytes) as usize;
 
-        let mut payload = vec![0u8; length];
-
-        decoder.read_exact(&mut payload)
+        // `length` is attacker-controlled (a bundle can arrive from an untrusted remote over
+        // `franchise`), so never pre-allocate it: a lie like `u64::MAX` would be a one-record
+        // denial of service (a capacity-overflow panic, or an allocator abort for a large-but-
+        // representable value). Read as a bounded stream instead — the buffer grows with the
+        // bytes actually present, and a short stream is reported as truncation, exactly as the
+        // former `read_exact` did.
+        let mut payload = Vec::new();
+        let read = decoder.by_ref().take(length as u64).read_to_end(&mut payload)
             .map_err(|e| format!("The bundle is truncated: {}", e))?;
+
+        if read != length {
+            return Err(format!(
+                "The bundle is truncated: a record declared {} bytes but only {} remained.",
+                length, read
+            ));
+        }
 
         match kind[0] {
             KIND_OBJECT => {

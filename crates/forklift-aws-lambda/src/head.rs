@@ -14,20 +14,32 @@
 //! roles the server head consults gate *what* they may move). This type enforces the
 //! provider-independent content invariants: hash-verified objects, a fast-forward-only CAS,
 //! and — on a trusted warehouse — the full offline audit before a ref moves.
+//!
+//! **Every method here is synchronous and must be called from a blocking thread**
+//! (`tokio::task::spawn_blocking`), exactly as `forklift-server` runs its handlers' storage
+//! work. It mirrors objects into a thread-local-scoped scratch and runs `forklift_core`'s
+//! audit inside that scope, so the call must never migrate between threads mid-flight; and
+//! tokio refuses to let a runtime worker block on the futures an SDK-backed store bridges.
+//! See `blocking.rs` (R4).
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use forklift_core::model::remote::{
-    RefUpdateRequest, TrustAnchorDto, WarehouseInfo, MAX_MISSING_BATCH, PROTOCOL_VERSION,
+    RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_MISSING_BATCH,
+    PROTOCOL_VERSION,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
-use forklift_core::util::{audit_utils, bundle_utils, merge_utils, object_utils, sign_utils};
+use forklift_core::util::{
+    audit_utils, bundle_utils, file_utils, merge_utils, object_utils, sign_utils,
+};
 
 use crate::error::{HeadError, HeadResult};
-use crate::scratch::{materialize, Scratch};
+use crate::scratch::{materialize, Mirror, Scratch};
 use crate::store::{
-    CasOutcome, ObjectAccess, ObjectStore, PutTarget, RefStore, SignatureOutcome, TrustOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutTarget, RefStore, SignatureOutcome,
+    TrustOutcome,
 };
 
 /// How the head answers a byte read: the bytes, or a redirect to a storage URL.
@@ -48,6 +60,16 @@ pub enum ObjectWriteResult {
     Redirect(String),
 }
 
+/// How the head answers a `batch` request: the bundle bytes, or a redirect to a presigned
+/// `GET` for them.
+#[derive(Debug)]
+pub enum BatchResult {
+    /// The bundle-format stream (the head serves it itself).
+    Bundle(Vec<u8>),
+    /// Follow this presigned URL for the bundle (`307`).
+    Redirect(String),
+}
+
 /// The outcome of establishing (or resetting) trust.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustResult {
@@ -57,16 +79,43 @@ pub enum TrustResult {
     Unchanged,
 }
 
+/// Where a request's scratch warehouse comes from.
+enum ScratchSource {
+    /// A fresh directory per request, removed when the request ends.
+    Ephemeral,
+    /// The process-global scratch for this warehouse, reused across warm invocations.
+    Pooled(String),
+}
+
 /// The serverless protocol handler over an [`ObjectStore`] and a [`RefStore`].
 pub struct Head<O: ObjectStore, R: RefStore> {
     pub objects: O,
     pub refs: R,
+    scratch: ScratchSource,
 }
 
 impl<O: ObjectStore, R: RefStore> Head<O, R> {
-    /// Assemble a head over the two stores.
+    /// Assemble a head over the two stores, mirroring into a fresh scratch per request.
     pub fn new(objects: O, refs: R) -> Head<O, R> {
-        Head { objects, refs }
+        Head { objects, refs, scratch: ScratchSource::Ephemeral }
+    }
+
+    /// Assemble a head that reuses one scratch warehouse across warm invocations, so the
+    /// audit mirror is paid once per container rather than once per request.
+    ///
+    /// `warehouse_id` must identify the warehouse these stores serve, and nothing else: an
+    /// object found in the scratch is treated as present in the object store, and that
+    /// inference is only sound within one warehouse (see [`Scratch::shared`]).
+    pub fn pooled(objects: O, refs: R, warehouse_id: impl Into<String>) -> Head<O, R> {
+        Head { objects, refs, scratch: ScratchSource::Pooled(warehouse_id.into()) }
+    }
+
+    /// The scratch warehouse this request mirrors into.
+    fn scratch(&self) -> Result<Arc<Scratch>, String> {
+        match &self.scratch {
+            ScratchSource::Ephemeral => Scratch::new().map(Arc::new),
+            ScratchSource::Pooled(warehouse_id) => Scratch::shared(warehouse_id),
+        }
     }
 
     /// `GET /v1/warehouse` — the handshake: protocol version, refs and trust.
@@ -104,6 +153,61 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         Ok(missing)
     }
 
+    /// `POST /v1/objects/upload-targets` — the body-less upload negotiation (additive).
+    ///
+    /// One round trip, no object bodies: for every hash the client learns whether the
+    /// remote already has it (`present`), where to `PUT` it straight into storage
+    /// (`targets`, a presigned staging URL), or that it must go through the control plane
+    /// (`direct`). Without it a client uploading to a staging head has to send each body to
+    /// the control plane only to be told `307` — paying for the bytes twice, and on Lambda
+    /// paying for them through a request-size limit the byte plane exists to avoid.
+    ///
+    /// A direct head answers with every missing hash in `direct`, so one client code path
+    /// serves both heads.
+    pub fn upload_targets(
+        &self,
+        session: &str,
+        hashes: &[String],
+    ) -> HeadResult<UploadTargetsResponse> {
+        self.reject_oversized_batch(hashes.len())?;
+
+        let mut response = UploadTargetsResponse {
+            present: Vec::new(),
+            targets: BTreeMap::new(),
+            direct: Vec::new(),
+        };
+
+        let mut seen: HashSet<&str> = HashSet::new();
+
+        for hash in hashes {
+            if !seen.insert(hash.as_str()) {
+                continue;
+            }
+
+            if self.objects.exists(hash).map_err(HeadError::internal)? {
+                response.present.push(hash.clone());
+                continue;
+            }
+
+            match self.objects.put_target(Some(session), hash).map_err(HeadError::internal)? {
+                PutTarget::Staged(url) => {
+                    response.targets.insert(hash.clone(), url);
+                }
+                PutTarget::Direct => response.direct.push(hash.clone()),
+                // The session was named, so a store that still demands one is broken.
+                PutTarget::SessionRequired => {
+                    return Err(HeadError::internal(format!(
+                        "The object store refused a staging target for {} despite a named lift \
+                        session.",
+                        hash
+                    )))
+                }
+            }
+        }
+
+        Ok(response)
+    }
+
     /// `GET /v1/objects/{hash}` — the raw object bytes, or a redirect to storage.
     pub fn object_get(&self, hash: &str) -> HeadResult<ObjectReadResult> {
         match self.objects.access(hash).map_err(HeadError::internal)? {
@@ -113,11 +217,27 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
     }
 
-    /// `PUT /v1/objects/{hash}` — store the object (hash-verified before it is fetchable),
-    /// or redirect the upload to a presigned storage URL.
-    pub fn object_put(&self, hash: &str, bytes: &[u8]) -> HeadResult<ObjectWriteResult> {
-        match self.objects.put_target(hash).map_err(HeadError::internal)? {
-            PutTarget::Redirect(url) => Ok(ObjectWriteResult::Redirect(url)),
+    /// `PUT /v1/objects/{hash}?session={id}` — store the object (hash-verified before it is
+    /// fetchable), or redirect the upload to a presigned staging URL.
+    ///
+    /// On a direct head the bytes are verified inline and `session` is irrelevant. On a
+    /// staging head the bytes never pass through here: the `307` sends them to a staging
+    /// key under `session`, from which `commit_lift` promotes them. Such a head refuses a
+    /// session-less upload (`422`) — bytes staged under no session could never be promoted,
+    /// and the alternative (staging at the hash key) is exactly the invariant-1 hole.
+    pub fn object_put(
+        &self,
+        session: Option<&str>,
+        hash: &str,
+        bytes: &[u8],
+    ) -> HeadResult<ObjectWriteResult> {
+        match self.objects.put_target(session, hash).map_err(HeadError::internal)? {
+            PutTarget::Staged(url) => Ok(ObjectWriteResult::Redirect(url)),
+            PutTarget::SessionRequired => Err(HeadError::unprocessable(
+                "This warehouse stages uploads in object storage; name the lift session \
+                (`?session=…`) so the upload can be verified and promoted to its hash key."
+                    .to_string(),
+            )),
             PutTarget::Direct => {
                 // A hash mismatch is a client error (`422`): nothing unverified is stored.
                 let outcome =
@@ -248,24 +368,30 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         // Mirror the objects the audit reads into a scratch `.forklift`, then run the exact
         // `forklift_core` audit inside its scope. Working blobs are never mirrored — their
         // presence is answered by the object store (an S3 HEAD).
-        let scratch = Scratch::new().map_err(HeadError::internal)?;
+        let scratch = self.scratch().map_err(HeadError::internal)?;
 
         scratch.scoped(|| -> HeadResult<()> {
-            let mut mirrored: HashSet<String> = HashSet::new();
+            let mut mirror = Mirror::default();
 
             // On a trusted warehouse the office chain must be readable (it carries the keys
             // that verify every other pallet). Its "blobs" are tracked-metadata records the
-            // audit reads, so they are mirrored too.
+            // audit reads, so they are mirrored too — and never bounded, because
+            // `verify_office_chain` walks from the head to the genesis every time.
             if anchor.is_some() {
                 if let Some(office_head) = &office_head {
-                    materialize(&self.objects, office_head, true, &mut mirrored)
+                    materialize(&self.objects, office_head, true, None, &mut mirror)
                         .map_err(HeadError::internal)?;
                 }
             }
 
+            // Everything reachable from the pallet's current head was audited when that head
+            // was committed, so the target mirror stops expanding trees there. The office is
+            // the exception (see above); a creation has no bound at all.
+            let known_complete = if is_office { None } else { request.old_head.as_deref() };
+
             // The target closure: a meta pallet's blobs are records (mirror them); a
             // working pallet's blobs are file content (leave them in the object store).
-            materialize(&self.objects, &request.new_head, is_meta, &mut mirrored)
+            materialize(&self.objects, &request.new_head, is_meta, known_complete, &mut mirror)
                 .map_err(HeadError::internal)?;
 
             // 1. Closure presence. Working blobs are checked via the object store.
@@ -350,12 +476,17 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     /// packfile moment). Objects the store lacks are simply absent; the client falls back
     /// to loose fetches. Built by mirroring the requested objects into a scratch and
     /// reusing `bundle_utils::build_partial_bundle`.
-    pub fn batch(&self, hashes: &[String]) -> HeadResult<Vec<u8>> {
+    ///
+    /// The bundle is the one *response* that has no small bound — it is as large as the
+    /// objects asked for — so a store that can offload it hands back a presigned `GET`
+    /// (`307`) rather than squeezing megabytes back through the control plane. Same
+    /// medicine as the upload path, in the other direction.
+    pub fn batch(&self, hashes: &[String]) -> HeadResult<BatchResult> {
         self.reject_oversized_batch(hashes.len())?;
 
-        let scratch = Scratch::new().map_err(HeadError::internal)?;
+        let scratch = self.scratch().map_err(HeadError::internal)?;
 
-        scratch.scoped(|| -> HeadResult<Vec<u8>> {
+        let bundle = scratch.scoped(|| -> HeadResult<Vec<u8>> {
             let mut mirrored: HashSet<String> = HashSet::new();
 
             for hash in hashes {
@@ -363,19 +494,34 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                     continue;
                 }
 
-                if let Some(bytes) = self.objects.get(hash).map_err(HeadError::internal)? {
-                    object_utils::store_object_bytes(hash, &bytes).map_err(HeadError::internal)?;
+                // A warm scratch may already hold it, mirrored from this same warehouse.
+                if !file_utils::does_object_exist(hash).map_err(HeadError::internal)? {
+                    if let Some(bytes) = self.objects.get(hash).map_err(HeadError::internal)? {
+                        object_utils::store_object_bytes(hash, &bytes)
+                            .map_err(HeadError::internal)?;
+                    }
                 }
 
-                if let Some(sidecar) = self.objects.get_signature(hash).map_err(HeadError::internal)?
+                if sign_utils::load_raw_parcel_signature(hash).map_err(HeadError::internal)?.is_none()
                 {
-                    sign_utils::store_raw_parcel_signature(hash, &sidecar)
-                        .map_err(HeadError::internal)?;
+                    if let Some(sidecar) =
+                        self.objects.get_signature(hash).map_err(HeadError::internal)?
+                    {
+                        sign_utils::store_raw_parcel_signature(hash, &sidecar)
+                            .map_err(HeadError::internal)?;
+                    }
                 }
             }
 
+            // `build_partial_bundle` skips whatever is absent from the scratch, so a hash the
+            // store lacks is simply not in the bundle — the documented contract.
             bundle_utils::build_partial_bundle(hashes).map_err(HeadError::internal)
-        })
+        })?;
+
+        match self.objects.offload_response(&bundle).map_err(HeadError::internal)? {
+            Some(url) => Ok(BatchResult::Redirect(url)),
+            None => Ok(BatchResult::Bundle(bundle)),
+        }
     }
 
     /// `GET /v1/bundles/latest` — the whole-warehouse bundle. Building it is periodic ECS
@@ -386,30 +532,44 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// `POST /lift/{session}/commit` — the additive session-commit step (the split-verify
-    /// decision, 2026-07-06). In the AWS deployment the client uploads straight to S3, so
-    /// the control plane never saw the bytes; before the ref update, this verifies that the
-    /// small control-plane objects it staged are present *and* hash-correct (synchronously),
-    /// while large blobs — verified asynchronously by the staging verifier — are only
-    /// checked for presence. A corrupt control-plane object stops the lift here.
-    pub fn commit_lift(&self, control_plane: &[String], blobs: &[String]) -> HeadResult<()> {
+    /// decision, 2026-07-06). In the AWS deployment the client uploads straight to a staging
+    /// prefix, so the control plane never saw the bytes. This is where the small
+    /// control-plane objects of `session` are **verified and promoted** to their hash keys
+    /// (synchronously, via [`ObjectStore::verify_and_promote`]) — until it runs they are not
+    /// fetchable, and a corrupt one is discarded and stops the lift rather than ever
+    /// becoming visible.
+    ///
+    /// Large blobs are only checked for *presence at their canonical key*, which is itself
+    /// the proof they were verified: the staging verifier promotes a blob only after the
+    /// same `Blake3(bytes) == hash` check. A blob still sitting in staging simply reads as
+    /// absent, and the client retries once the verifier has caught up.
+    ///
+    /// Promotion is idempotent, so a retried commit is safe. Once everything is promoted the
+    /// session's staging prefix is swept.
+    pub fn commit_lift(
+        &self,
+        session: &str,
+        control_plane: &[String],
+        blobs: &[String],
+    ) -> HeadResult<()> {
         for hash in control_plane {
-            match self.objects.get(hash).map_err(HeadError::internal)? {
-                None => {
+            let outcome =
+                self.objects.verify_and_promote(session, hash).map_err(HeadError::internal)?;
+
+            match outcome {
+                PromoteOutcome::Promoted | PromoteOutcome::AlreadyPresent => {}
+                PromoteOutcome::Missing => {
                     return Err(HeadError::unprocessable(format!(
                         "Object {} was not uploaded; the lift session is not ready to commit.",
                         hash
                     )))
                 }
-                Some(bytes) => {
-                    let actual = object_utils::hash_object_bytes(&bytes);
-
-                    if actual != *hash {
-                        return Err(HeadError::unprocessable(format!(
-                            "Staged object {} is corrupt (it hashes to {}); it will not be \
-                            committed.",
-                            hash, actual
-                        )));
-                    }
+                PromoteOutcome::Corrupt { actual } => {
+                    return Err(HeadError::unprocessable(format!(
+                        "Staged object {} is corrupt (it hashes to {}); it was discarded, not \
+                        promoted, and the lift will not commit.",
+                        hash, actual
+                    )))
                 }
             }
         }
@@ -417,11 +577,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         for hash in blobs {
             if !self.objects.exists(hash).map_err(HeadError::internal)? {
                 return Err(HeadError::unprocessable(format!(
-                    "Blob {} was not uploaded; the lift session is not ready to commit.",
+                    "Blob {} is not yet verified and promoted; the lift session is not ready to \
+                    commit.",
                     hash
                 )));
             }
         }
+
+        self.objects.discard_session(session).map_err(HeadError::internal)?;
 
         Ok(())
     }

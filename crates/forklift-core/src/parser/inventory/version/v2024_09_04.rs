@@ -113,11 +113,12 @@ fn parse_item(offset: usize, content: &[u8]) -> Result<(InventoryItem, usize), S
     // new line byte: file names may legally contain new line bytes, and the length field
     // recovers them exactly.
     let name_start = offset + cursor;
-    let name_end = name_start + file_name_length as usize;
-
-    if name_end > content.len() {
-        return Err("Inventory item name is truncated.".to_string());
-    }
+    // `file_name_length` is an untrusted length prefix, so fold the overflow guard into the bounds
+    // check: a huge value is reported as truncated rather than panicking on the addition (an
+    // `attempt to add with overflow` in debug, a wrapped out-of-range slice in release).
+    let name_end = name_start.checked_add(file_name_length as usize)
+        .filter(|end| *end <= content.len())
+        .ok_or_else(|| "Inventory item name is truncated.".to_string())?;
 
     let name = String::from_utf8(content[name_start..name_end].to_vec())
         .map_err(|_| "Failed to parse name.".to_string())?;

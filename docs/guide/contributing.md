@@ -63,11 +63,21 @@ cargo clippy --workspace --all-targets
 Notes:
 - The remote integration tests (`crates/forklift/tests/remote.rs`) spawn a real
   `forklift-server` process next to the `forklift` binary, so run tests via a
-  **workspace build** (plain `cargo test`), not a single-crate build.
+  **workspace build** (plain `cargo test`), not a single-crate build. The crash
+  (`crates/forklift/tests/crash_consistency.rs`) and determinism
+  (`crates/forklift/tests/determinism.rs`) suites likewise drive the real binary.
 - Integration tests isolate state with `FORKLIFT_GLOBAL_CONFIG` and
   `FORKLIFT_KEYS_DIR` env vars pointed at a scratch directory, so they never
   touch a developer's real config or keys. Use the same pattern for new tests
   (`TestWarehouse` / `TestArea` helpers already do this).
+- The "test spine" (milestone A) is worth knowing when touching the object store,
+  the parsers, or the parallel walks: `crates/forklift-core/tests/fuzz_formats.rs`
+  fuzzes every parse entry point (must never panic) and checks round-trip
+  fidelity; `crash_consistency.rs` SIGKILLs `stack` mid-write to prove the store
+  stays consistent (D2); `determinism.rs` pins deterministic tree hashes,
+  byte-reproducible repacks (D5), and the warehouse-lock refusal. A parser or
+  format change should keep the fuzzer green; if you add a length-prefixed field,
+  bound it with a `checked_add` (never `start + length` before the bounds check).
 - To install a working binary (e.g. to dogfood): `cargo install --path
   crates/forklift --force` (lands in `~/.cargo/bin`).
 
