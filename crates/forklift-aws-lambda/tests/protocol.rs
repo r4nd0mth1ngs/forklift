@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use forklift_aws_lambda::error::Status;
 use forklift_aws_lambda::head::{ObjectReadResult, ObjectWriteResult, TrustResult};
 use forklift_aws_lambda::memory::{MemoryObjectStore, MemoryRefStore};
-use forklift_aws_lambda::store::SignatureOutcome;
+use forklift_aws_lambda::store::{ObjectStore, PromoteOutcome, SignatureOutcome};
 use forklift_aws_lambda::Head;
 
 use forklift_core::globals::StorageRootScope;
@@ -196,7 +196,7 @@ fn upload_all<O: forklift_aws_lambda::store::ObjectStore, R: forklift_aws_lambda
     harvest: &Harvest,
 ) {
     for (hash, bytes) in &harvest.objects {
-        head.object_put(hash, bytes).expect("upload object");
+        head.object_put(None, hash, bytes).expect("upload object");
     }
     for (hash, sidecar) in &harvest.signatures {
         head.signature_put(hash, sidecar).expect("upload signature");
@@ -290,7 +290,7 @@ fn a_ref_update_with_a_missing_blob_is_refused() {
             skipped = Some(hash.clone());
             continue;
         }
-        head.object_put(hash, bytes).expect("upload object");
+        head.object_put(None, hash, bytes).expect("upload object");
     }
     assert!(skipped.is_some(), "a blob was found to withhold");
 
@@ -312,7 +312,7 @@ fn a_tampered_object_upload_is_rejected() {
     let head = Head::new(MemoryObjectStore::new(), MemoryRefStore::new());
 
     let err = head
-        .object_put(&"a".repeat(64), b"not the content of that hash")
+        .object_put(None, &"a".repeat(64), b"not the content of that hash")
         .expect_err("hash mismatch");
     assert_eq!(err.status, Status::Unprocessable);
 }
@@ -416,15 +416,17 @@ fn a_conflicting_signature_is_refused() {
     }
 }
 
-/// The presigned byte plane: with a redirecting store, object reads and writes answer with
-/// a `307`-style redirect instead of moving bytes through the control plane.
+/// The presigned byte plane: with a staging store, object reads answer with a `307` to the
+/// canonical key, while uploads are redirected to a **staging** key — never to the hash key
+/// the reads serve. A session-less upload has nowhere to stage and is refused.
 #[test]
-fn a_redirecting_store_answers_with_presigned_urls() {
+fn a_staging_store_redirects_uploads_to_a_session_staging_key() {
     let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
-    // Seed one object as if it were already in S3.
+
+    // Seed one object as if it were already promoted into S3.
     let bytes = b"an object".to_vec();
     let hash = object_utils::hash_object_bytes(&bytes);
-    store.insert_unverified(&hash, bytes);
+    store.put_verified(&hash, &bytes).expect("seed a canonical object");
 
     let head = Head::new(store, MemoryRefStore::new());
 
@@ -435,43 +437,133 @@ fn a_redirecting_store_answers_with_presigned_urls() {
         ObjectReadResult::Bytes(_) => panic!("expected a redirect"),
     }
 
-    match head.object_put(&hash, b"ignored").expect("put") {
+    // The upload target is under the session's staging prefix, not `objects/{hash}`.
+    match head.object_put(Some("lift-1"), &hash, b"ignored").expect("put") {
         ObjectWriteResult::Redirect(url) => {
-            assert_eq!(url, format!("https://s3.example/bucket/objects/{}", hash))
+            assert_eq!(url, format!("https://s3.example/bucket/staging/lift-1/{}", hash));
+            assert!(!url.contains("/objects/"), "an upload must never target the hash key");
         }
         ObjectWriteResult::Stored { .. } => panic!("expected a redirect"),
     }
+
+    // Without a session there is nowhere to stage, so the head refuses rather than
+    // handing out a presigned PUT to the canonical key.
+    let err = head.object_put(None, &hash, b"ignored").expect_err("session-less upload");
+    assert_eq!(err.status, Status::Unprocessable);
 }
 
-/// The additive session-commit step: control-plane objects are hash-verified
-/// synchronously, so a corrupt one staged straight to S3 stops the lift.
+/// Invariant 1 on the presigned path: bytes a client `PUT`s straight to the staging prefix
+/// are **not fetchable at their hash key** until `commit_lift` verifies and promotes them,
+/// and a corrupt staged object is discarded rather than promoted.
 #[test]
-fn session_commit_catches_a_corrupt_control_plane_object() {
-    let store = MemoryObjectStore::new();
+fn a_staged_object_is_not_fetchable_until_it_is_verified_and_promoted() {
+    let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
 
     let good = b"a good control-plane object".to_vec();
     let good_hash = object_utils::hash_object_bytes(&good);
-    store.insert_unverified(&good_hash, good);
 
-    // A blob whose bytes do NOT match its claimed hash — the case an async verifier would
-    // reject, and that the synchronous control-plane check catches at commit.
+    // Bytes that do NOT match the hash they are staged under — a client uploading garbage
+    // to a presigned URL, the case the promote step must catch.
     let corrupt_hash = object_utils::hash_object_bytes(b"the declared content");
-    store.insert_unverified(&corrupt_hash, b"tampered content".to_vec());
+
+    store.stage("lift-1", &good_hash, good);
+    store.stage("lift-1", &corrupt_hash, b"tampered content".to_vec());
 
     let head = Head::new(store, MemoryRefStore::new());
 
-    // A commit that names the corrupt object as control-plane is refused.
+    // Neither is fetchable while it is merely staged: this is the invariant the old
+    // canonical-key upload broke.
+    for hash in [&good_hash, &corrupt_hash] {
+        let err = head.object_get(hash).expect_err("a staged object is not fetchable");
+        assert_eq!(err.status, Status::NotFound);
+    }
+
+    // A commit naming the corrupt object is refused...
     let err = head
-        .commit_lift(&[good_hash.clone(), corrupt_hash.clone()], &[])
+        .commit_lift("lift-1", &[good_hash.clone(), corrupt_hash.clone()], &[])
         .expect_err("corrupt control-plane object");
     assert_eq!(err.status, Status::Unprocessable);
 
-    // A commit over only the good object succeeds.
-    head.commit_lift(std::slice::from_ref(&good_hash), &[]).expect("clean commit");
+    // ...and the corrupt bytes are gone, never having reached the hash key.
+    let err = head.object_get(&corrupt_hash).expect_err("corrupt bytes were discarded");
+    assert_eq!(err.status, Status::NotFound);
+
+    // A commit over only the good object promotes it: now — and only now — it is fetchable.
+    head.commit_lift("lift-1", std::slice::from_ref(&good_hash), &[]).expect("clean commit");
+
+    match head.object_get(&good_hash).expect("the promoted object") {
+        ObjectReadResult::Redirect(url) => {
+            assert_eq!(url, format!("https://s3.example/bucket/objects/{}", good_hash))
+        }
+        ObjectReadResult::Bytes(_) => panic!("expected a redirect"),
+    }
+
+    // The commit swept the session's staging prefix, and promotion is idempotent.
+    assert_eq!(head.objects.staged_count(), 0, "staging is swept after a commit");
+    head.commit_lift("lift-1", std::slice::from_ref(&good_hash), &[]).expect("retried commit");
 
     // A commit naming an object that was never staged is "not ready".
-    let err = head.commit_lift(&["f".repeat(64)], &[]).expect_err("missing object");
+    let err = head.commit_lift("lift-1", &["f".repeat(64)], &[]).expect_err("missing object");
     assert_eq!(err.status, Status::Unprocessable);
+}
+
+/// A blob is presence-checked at its *canonical* key, which is the proof the staging
+/// verifier already hash-checked it: a blob still in staging reads as not-yet-ready.
+#[test]
+fn a_blob_still_in_staging_is_not_ready_to_commit() {
+    let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
+
+    let blob = b"a large working blob".to_vec();
+    let blob_hash = object_utils::hash_object_bytes(&blob);
+    store.stage("lift-1", &blob_hash, blob);
+
+    let head = Head::new(store, MemoryRefStore::new());
+
+    let err = head
+        .commit_lift("lift-1", &[], std::slice::from_ref(&blob_hash))
+        .expect_err("unpromoted blob");
+    assert_eq!(err.status, Status::Unprocessable);
+
+    // The staging verifier promotes it out of band — the same trait operation the control
+    // plane uses for small objects — and the commit then succeeds.
+    let outcome = head.objects.verify_and_promote("lift-1", &blob_hash).expect("promote");
+    assert_eq!(outcome, PromoteOutcome::Promoted);
+
+    head.commit_lift("lift-1", &[], &[blob_hash]).expect("the blob is verified and present");
+}
+
+/// The control plane and the staging verifier can promote the same hash at the same time.
+/// Exactly one wins; the loser sees the canonical object rather than a spurious "missing",
+/// so a lift never fails because the other promoter got there first.
+#[test]
+fn racing_promoters_serialize_and_never_report_missing() {
+    let store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
+
+    let bytes = b"an object two promoters both want".to_vec();
+    let hash = object_utils::hash_object_bytes(&bytes);
+    store.stage("lift-1", &hash, bytes);
+
+    let barrier = std::sync::Barrier::new(2);
+    let (store, barrier, hash) = (&store, &barrier, &hash);
+
+    let outcomes: Vec<PromoteOutcome> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(move || {
+                    barrier.wait();
+                    store.verify_and_promote("lift-1", hash).expect("promote")
+                })
+            })
+            .collect();
+
+        handles.into_iter().map(|handle| handle.join().expect("promoter thread")).collect()
+    });
+
+    assert_eq!(outcomes.iter().filter(|o| **o == PromoteOutcome::Promoted).count(), 1);
+    assert_eq!(outcomes.iter().filter(|o| **o == PromoteOutcome::AlreadyPresent).count(), 1);
+    assert!(!outcomes.contains(&PromoteOutcome::Missing), "the loser must not see 'missing'");
+    assert_eq!(store.object_count(), 1);
+    assert_eq!(store.staged_count(), 0);
 }
 
 /// `batch` returns a bundle-format stream the negotiation can consume, and the round trip

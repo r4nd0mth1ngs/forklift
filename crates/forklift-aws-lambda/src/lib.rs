@@ -40,6 +40,6 @@ pub mod head;
 pub use error::{HeadError, HeadResult, Status};
 pub use head::Head;
 pub use store::{
-    CasOutcome, ObjectAccess, ObjectStore, PutOutcome, PutTarget, RefStore, SignatureOutcome,
-    TrustOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
+    SignatureOutcome, TrustOutcome,
 };

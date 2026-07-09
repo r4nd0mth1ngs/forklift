@@ -56,7 +56,13 @@ follow redirects for object bodies. The server head serves bytes directly.
 
 1. **Nothing unverified is ever fetchable.** A remote must verify
    `Blake3(body) == {hash}` before an uploaded object becomes visible at its hash key
-   (DESIGN.html §4.2 step 4 / §6.2).
+   (DESIGN.html §4.2 step 4 / §6.2). A head that lets clients upload *around* it (presigned
+   PUTs straight to storage) must therefore take those bytes at a **staging key**, never at
+   the hash key: a client with a presigned PUT to `objects/{hash}` could otherwise park
+   arbitrary bytes at a valid hash and have them served before anything verified them. The
+   staged bytes become fetchable only when the head copies them to the hash key, and it
+   copies them only after the check — a **verify-and-promote**, the single write path into
+   the canonical namespace.
 2. **Clients verify every downloaded object** the same way before storing it.
 3. **Objects travel uncompressed.** The hash covers the full uncompressed object
    (§4.4), so the wire format is the verifiable form. Transport-level compression
@@ -120,12 +126,21 @@ like a bundle import.
 The raw (uncompressed) object bytes, or `404`. The client verifies the hash before
 storing.
 
-### `PUT /v1/objects/{hash}`
+### `PUT /v1/objects/{hash}[?session={id}]`
 
 Body: the raw object bytes. The remote verifies `Blake3(body) == hash` **before** the
 object becomes fetchable; a mismatch is `422` and nothing is stored. Uploading an
 already-present hash is a no-op `200` (objects are immutable, so equal hash means equal
 content). Success is `201`.
+
+A head whose byte plane is object storage answers `307` instead, with a `Location` of a
+presigned PUT under the **staging prefix of the lift session** — `staging/{session}/{hash}`,
+never `objects/{hash}`. Nothing is fetchable at the hash key until
+`POST /lift/{session}/commit` (small control-plane objects) or the staging verifier (large
+blobs) has verified and promoted it. Such a head therefore needs the session: `?session=`
+is **additive and head-specific** (the `forklift-server` head ignores it and verifies the
+body inline), but a staging head answers `422` without one, because bytes staged under no
+session could never be promoted.
 
 ### `GET /v1/signatures/{hash}` · `PUT /v1/signatures/{hash}`
 
@@ -203,13 +218,19 @@ the client asks the head to confirm the session's uploads are ready:
 { "control_plane": ["<parcel/tree/signature hash>", …], "blobs": ["<blob hash>", …] }
 ```
 
-The head **verifies the small control-plane objects synchronously** — it reads each back
-and checks `Blake3(body) == hash`, so a corrupt object staged straight to storage is
-caught here (`422`) rather than becoming fetchable — and **checks large blobs for
-presence only** (they are hash-verified asynchronously by the staging verifier, which
-promotes an object to its canonical hash key only after `Blake3(body) == hash`, upholding
-invariant 1 for them too). `200` when the session is ready to commit; `422` with the
-offending hash when an object is missing or corrupt.
+The head **verifies and promotes the small control-plane objects synchronously** — for each
+it reads the staged bytes, checks `Blake3(bytes) == hash`, and only then copies them to the
+canonical hash key. A corrupt object staged straight to storage is *discarded* here and the
+lift is refused (`422`); it never becomes fetchable, because it was never at the hash key to
+begin with. Large blobs are **checked for presence at the canonical key only** — which is
+itself the proof they were verified, since the staging verifier (an out-of-band worker
+running the same verify-and-promote) is the only thing that could have put them there. A
+blob still sitting in staging simply reads as absent, and the client retries once the
+verifier has caught up.
+
+`200` when the session is ready to commit; `422` with the offending hash when an object is
+missing, still unverified, or corrupt. Promotion is idempotent, so a retried commit is safe.
+On success the session's staging prefix is swept.
 
 The endpoint is **additive and head-specific**: the `forklift-server` head verifies every
 `PUT` inline (a returned `PUT` means the object is present and verified), so it does not

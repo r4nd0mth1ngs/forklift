@@ -3,10 +3,15 @@
 //! and DynamoDB backends must — hash-verified object writes, immutable signatures, an
 //! atomic head CAS, a one-way trust door — in a `HashMap` behind a `Mutex`.
 //!
-//! [`MemoryObjectStore`] can also be put in *redirect mode* to exercise the presigned-URL
-//! branch of the head without a real S3, and offers [`MemoryObjectStore::insert_unverified`]
-//! to seed the store as if a client had uploaded straight to an S3 staging prefix
-//! (bypassing the control plane) — the case the session-commit verification guards.
+//! [`MemoryObjectStore`] can also be put in *staging mode* to exercise the presigned-URL
+//! branch of the head without a real S3, and offers [`MemoryObjectStore::stage`] to seed a
+//! staged upload as if a client had `PUT` it straight to the staging prefix, bypassing the
+//! control plane — the case `verify_and_promote` guards.
+//!
+//! There is deliberately **no way to put unverified bytes at a canonical hash key**: the
+//! only paths into `objects` are `put_verified` and `verify_and_promote`, both of which
+//! check `Blake3(bytes) == hash` first. The fake cannot express the state invariant 1
+//! forbids, so a test cannot accidentally assert it is reachable.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -17,8 +22,8 @@ use forklift_core::util::office_utils::TrustAnchor;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef, DEFAULT_PALLET_NAME};
 
 use crate::store::{
-    CasOutcome, ObjectAccess, ObjectStore, PutOutcome, PutTarget, RefStore, SignatureOutcome,
-    TrustOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
+    SignatureOutcome, TrustOutcome,
 };
 
 /// An in-memory [`ObjectStore`]. Object bytes are the uncompressed wire form, keyed by hash.
@@ -26,6 +31,9 @@ use crate::store::{
 pub struct MemoryObjectStore {
     objects: Mutex<HashMap<String, Vec<u8>>>,
     signatures: Mutex<HashMap<String, Vec<u8>>>,
+    /// Uploads that bypassed the head, keyed by `(session, hash)` — the in-memory stand-in
+    /// for an S3 staging prefix. Invisible to `exists`/`get` until promoted.
+    staged: Mutex<HashMap<(String, String), Vec<u8>>>,
     /// When set, `access`/`put_target` answer with a presigned-style URL under this base
     /// instead of serving bytes directly — the AWS deployment's behaviour.
     redirect_base: Option<String>,
@@ -37,22 +45,27 @@ impl MemoryObjectStore {
         MemoryObjectStore::default()
     }
 
-    /// A store that hands out presigned-style redirect URLs under `base`, so tests can
-    /// exercise the head's `307` branch without S3.
+    /// A store that hands out presigned-style staging URLs under `base`, so tests can
+    /// exercise the head's `307` + verify-and-promote branch without S3.
     pub fn with_redirect(base: impl Into<String>) -> MemoryObjectStore {
         MemoryObjectStore { redirect_base: Some(base.into()), ..Default::default() }
     }
 
-    /// Seed an object *without* verifying its hash — as if the client had uploaded it
-    /// straight to an S3 staging prefix, bypassing the control plane. Used to prove the
-    /// session-commit verification rejects a corrupt upload.
-    pub fn insert_unverified(&self, hash: &str, bytes: Vec<u8>) {
-        self.objects.lock().unwrap().insert(hash.to_string(), bytes);
+    /// Seed a *staged* upload, as if the client had `PUT` these bytes to the presigned
+    /// staging URL for `(session, hash)` without the head ever seeing them. The bytes are
+    /// not verified and not fetchable; only `verify_and_promote` can make them so.
+    pub fn stage(&self, session: &str, hash: &str, bytes: Vec<u8>) {
+        self.staged.lock().unwrap().insert((session.to_string(), hash.to_string()), bytes);
     }
 
-    /// How many objects are stored (for test assertions).
+    /// How many objects are stored at their canonical key (for test assertions).
     pub fn object_count(&self) -> usize {
         self.objects.lock().unwrap().len()
+    }
+
+    /// How many uploads are still sitting in staging (for test assertions).
+    pub fn staged_count(&self) -> usize {
+        self.staged.lock().unwrap().len()
     }
 }
 
@@ -116,11 +129,59 @@ impl ObjectStore for MemoryObjectStore {
         }
     }
 
-    fn put_target(&self, hash: &str) -> Result<PutTarget, String> {
-        match &self.redirect_base {
-            Some(base) => Ok(PutTarget::Redirect(format!("{}/objects/{}", base, hash))),
-            None => Ok(PutTarget::Direct),
+    fn put_target(&self, session: Option<&str>, hash: &str) -> Result<PutTarget, String> {
+        match (&self.redirect_base, session) {
+            // A staging key under the session — never `objects/{hash}`, which is the
+            // canonical key `get`/`exists` read.
+            (Some(base), Some(session)) => {
+                Ok(PutTarget::Staged(format!("{}/staging/{}/{}", base, session, hash)))
+            }
+            (Some(_), None) => Ok(PutTarget::SessionRequired),
+            (None, _) => Ok(PutTarget::Direct),
         }
+    }
+
+    /// Take the staged bytes (so a corrupt upload is *discarded* by the same act that
+    /// rejects it), and promote them only if they hash to `hash`.
+    ///
+    /// The whole check-and-promote runs under the `objects` lock, so the control plane and
+    /// the staging verifier racing on one hash serialize: the loser observes the winner's
+    /// canonical object and reports `AlreadyPresent`, never a spurious `Missing` because it
+    /// found the staged copy already taken. An S3 + DynamoDB backend owes the same
+    /// atomicity (a conditional write on the canonical key).
+    fn verify_and_promote(&self, session: &str, hash: &str) -> Result<PromoteOutcome, String> {
+        let key = (session.to_string(), hash.to_string());
+
+        // Lock order is always `objects` before `staged`; nothing takes them the other way.
+        let mut objects = self.objects.lock().unwrap();
+
+        // Already canonical: the object was verified once, and objects are immutable. Sweep
+        // the now-redundant staged copy.
+        if objects.contains_key(hash) {
+            self.staged.lock().unwrap().remove(&key);
+
+            return Ok(PromoteOutcome::AlreadyPresent);
+        }
+
+        let Some(bytes) = self.staged.lock().unwrap().remove(&key) else {
+            return Ok(PromoteOutcome::Missing);
+        };
+
+        let actual = object_utils::hash_object_bytes(&bytes);
+
+        if actual != hash {
+            return Ok(PromoteOutcome::Corrupt { actual });
+        }
+
+        objects.insert(hash.to_string(), bytes);
+
+        Ok(PromoteOutcome::Promoted)
+    }
+
+    fn discard_session(&self, session: &str) -> Result<(), String> {
+        self.staged.lock().unwrap().retain(|(staged_session, _), _| staged_session != session);
+
+        Ok(())
     }
 }
 

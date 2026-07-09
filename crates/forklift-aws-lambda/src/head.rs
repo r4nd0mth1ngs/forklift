@@ -27,7 +27,8 @@ use forklift_core::util::{audit_utils, bundle_utils, merge_utils, object_utils, 
 use crate::error::{HeadError, HeadResult};
 use crate::scratch::{materialize, Scratch};
 use crate::store::{
-    CasOutcome, ObjectAccess, ObjectStore, PutTarget, RefStore, SignatureOutcome, TrustOutcome,
+    CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutTarget, RefStore, SignatureOutcome,
+    TrustOutcome,
 };
 
 /// How the head answers a byte read: the bytes, or a redirect to a storage URL.
@@ -113,11 +114,27 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         }
     }
 
-    /// `PUT /v1/objects/{hash}` — store the object (hash-verified before it is fetchable),
-    /// or redirect the upload to a presigned storage URL.
-    pub fn object_put(&self, hash: &str, bytes: &[u8]) -> HeadResult<ObjectWriteResult> {
-        match self.objects.put_target(hash).map_err(HeadError::internal)? {
-            PutTarget::Redirect(url) => Ok(ObjectWriteResult::Redirect(url)),
+    /// `PUT /v1/objects/{hash}?session={id}` — store the object (hash-verified before it is
+    /// fetchable), or redirect the upload to a presigned staging URL.
+    ///
+    /// On a direct head the bytes are verified inline and `session` is irrelevant. On a
+    /// staging head the bytes never pass through here: the `307` sends them to a staging
+    /// key under `session`, from which `commit_lift` promotes them. Such a head refuses a
+    /// session-less upload (`422`) — bytes staged under no session could never be promoted,
+    /// and the alternative (staging at the hash key) is exactly the invariant-1 hole.
+    pub fn object_put(
+        &self,
+        session: Option<&str>,
+        hash: &str,
+        bytes: &[u8],
+    ) -> HeadResult<ObjectWriteResult> {
+        match self.objects.put_target(session, hash).map_err(HeadError::internal)? {
+            PutTarget::Staged(url) => Ok(ObjectWriteResult::Redirect(url)),
+            PutTarget::SessionRequired => Err(HeadError::unprocessable(
+                "This warehouse stages uploads in object storage; name the lift session \
+                (`?session=…`) so the upload can be verified and promoted to its hash key."
+                    .to_string(),
+            )),
             PutTarget::Direct => {
                 // A hash mismatch is a client error (`422`): nothing unverified is stored.
                 let outcome =
@@ -386,30 +403,44 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// `POST /lift/{session}/commit` — the additive session-commit step (the split-verify
-    /// decision, 2026-07-06). In the AWS deployment the client uploads straight to S3, so
-    /// the control plane never saw the bytes; before the ref update, this verifies that the
-    /// small control-plane objects it staged are present *and* hash-correct (synchronously),
-    /// while large blobs — verified asynchronously by the staging verifier — are only
-    /// checked for presence. A corrupt control-plane object stops the lift here.
-    pub fn commit_lift(&self, control_plane: &[String], blobs: &[String]) -> HeadResult<()> {
+    /// decision, 2026-07-06). In the AWS deployment the client uploads straight to a staging
+    /// prefix, so the control plane never saw the bytes. This is where the small
+    /// control-plane objects of `session` are **verified and promoted** to their hash keys
+    /// (synchronously, via [`ObjectStore::verify_and_promote`]) — until it runs they are not
+    /// fetchable, and a corrupt one is discarded and stops the lift rather than ever
+    /// becoming visible.
+    ///
+    /// Large blobs are only checked for *presence at their canonical key*, which is itself
+    /// the proof they were verified: the staging verifier promotes a blob only after the
+    /// same `Blake3(bytes) == hash` check. A blob still sitting in staging simply reads as
+    /// absent, and the client retries once the verifier has caught up.
+    ///
+    /// Promotion is idempotent, so a retried commit is safe. Once everything is promoted the
+    /// session's staging prefix is swept.
+    pub fn commit_lift(
+        &self,
+        session: &str,
+        control_plane: &[String],
+        blobs: &[String],
+    ) -> HeadResult<()> {
         for hash in control_plane {
-            match self.objects.get(hash).map_err(HeadError::internal)? {
-                None => {
+            let outcome =
+                self.objects.verify_and_promote(session, hash).map_err(HeadError::internal)?;
+
+            match outcome {
+                PromoteOutcome::Promoted | PromoteOutcome::AlreadyPresent => {}
+                PromoteOutcome::Missing => {
                     return Err(HeadError::unprocessable(format!(
                         "Object {} was not uploaded; the lift session is not ready to commit.",
                         hash
                     )))
                 }
-                Some(bytes) => {
-                    let actual = object_utils::hash_object_bytes(&bytes);
-
-                    if actual != *hash {
-                        return Err(HeadError::unprocessable(format!(
-                            "Staged object {} is corrupt (it hashes to {}); it will not be \
-                            committed.",
-                            hash, actual
-                        )));
-                    }
+                PromoteOutcome::Corrupt { actual } => {
+                    return Err(HeadError::unprocessable(format!(
+                        "Staged object {} is corrupt (it hashes to {}); it was discarded, not \
+                        promoted, and the lift will not commit.",
+                        hash, actual
+                    )))
                 }
             }
         }
@@ -417,11 +448,14 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
         for hash in blobs {
             if !self.objects.exists(hash).map_err(HeadError::internal)? {
                 return Err(HeadError::unprocessable(format!(
-                    "Blob {} was not uploaded; the lift session is not ready to commit.",
+                    "Blob {} is not yet verified and promoted; the lift session is not ready to \
+                    commit.",
                     hash
                 )));
             }
         }
+
+        self.objects.discard_session(session).map_err(HeadError::internal)?;
 
         Ok(())
     }
