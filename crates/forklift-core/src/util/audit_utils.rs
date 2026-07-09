@@ -4,7 +4,7 @@
 //! verification before committing a ref update, so a remote can never be pushed into a
 //! state a local audit would reject.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use crate::util::office_utils::{OfficeState, TrustAnchor};
 use crate::util::{file_utils, graph_utils, object_utils, sign_utils};
 
@@ -280,11 +280,11 @@ fn chains_to_identity_root(key: &crate::util::office_utils::KeyRecord,
 /// decide a security question.
 ///
 /// `known_verified` makes the walk incremental (the remote's ref update): everything
-/// reachable from a committed head was verified when that head was committed, so the
-/// walk stops at it without loading it. On a linear lift that makes the audit
-/// O(new parcels); a merge whose second parent rejoins below `known_verified` re-walks
-/// the shared ancestry (correct, just slower) — the boundary set is only collected
-/// when an unsigned parcel actually turns up, so the common all-signed lift never
+/// reachable from a committed head was verified when that head was committed, so none of
+/// that ancestry is walked. The audit is O(new parcels) — for a merge too, whose second
+/// parent rejoins below `known_verified`: [`new_parcels`] excludes the shared ancestry by
+/// generation number rather than by stopping at a single hash. The boundary set is only
+/// collected when an unsigned parcel actually turns up, so the common all-signed lift never
 /// pays for it.
 ///
 /// # Arguments
@@ -301,31 +301,16 @@ pub fn verify_pallet_history(head: &str,
                              anchor: &TrustAnchor,
                              office_state: &OfficeState,
                              known_verified: Option<&str>) -> Result<(usize, usize), String> {
-    // Phase 1 — discover the parcels to verify: a breadth-first walk of the pallet's
-    // ancestry, stopping at `known_verified` (everything reachable from it was verified
-    // when it was committed). Parent edges come from the commit-graph, which is content-
-    // addressed (a parcel's hash commits to its parents, so a present record's parents are
-    // exactly the real ones) and falls back to decoding the parcel when its record is not
-    // yet built — so the discovery set is always complete, and on a graph-warm warehouse
-    // it is found without decoding a single parcel body. The bodies are proven present in
-    // phase 2 instead, in parallel.
-    let mut queue: VecDeque<String> = VecDeque::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut parcels: Vec<String> = Vec::new();
-
-    queue.push_back(head.to_string());
-
-    while let Some(hash) = queue.pop_front() {
-        if known_verified == Some(hash.as_str()) || !visited.insert(hash.clone()) {
-            continue;
-        }
-
-        for parent in graph_utils::parents(&hash)? {
-            queue.push_back(parent);
-        }
-
-        parcels.push(hash);
-    }
+    // Phase 1 — discover the parcels to verify: everything reachable from `head` and not
+    // from `known_verified`, whose ancestry was verified when it was committed. The walk is
+    // bounded by the gap between the two heads, including across a merge (see
+    // [`new_parcels`]). Parent edges come from the commit-graph, which is content-addressed
+    // (a parcel's hash commits to its parents, so a present record's parents are exactly the
+    // real ones) and falls back to decoding the parcel when its record is not yet built — so
+    // the discovery set is always complete, and on a graph-warm warehouse it is found
+    // without decoding a single parcel body. The bodies are proven present in phase 2
+    // instead, in parallel.
+    let parcels = new_parcels(head, known_verified)?;
 
     // Phase 2 — verify every parcel's signature. Each check is independent: it runs
     // against the immutable `office_state` key registry, not against any neighbour, so the
@@ -529,7 +514,178 @@ fn classify_signature(hash: &str, office_state: &OfficeState) -> Result<Verdict,
     Ok(verdict)
 }
 
+/// Reachable from `head`.
+const FRESH: u8 = 1;
+
+/// Reachable from `known_verified` — already audited when that head was committed.
+const KNOWN: u8 = 2;
+
+/// Every parcel reachable from `head` that is **not** reachable from `known_verified`: the
+/// new segment of a lift, in breadth-first order from `head`.
+///
+/// This is the one ancestry walk the audit needs, and its cost is the *gap* between the two
+/// heads — not the length of history. The lever is the commit-graph's generation numbers
+/// (§B): a parcel's generation is one more than its parents' maximum, so a parent's
+/// generation is strictly less than its child's. Visiting parcels in descending generation
+/// order therefore guarantees that when a parcel is reached, every parcel that could reach
+/// *it* has already been visited — so its "reachable from head" / "reachable from the
+/// verified head" marks are final on arrival, and the walk can stop the moment no
+/// unvisited parcel is still marked fresh.
+///
+/// It replaces two walks that were both O(history) on every lift:
+///
+/// * `collect_reachable(known_verified)`, which decoded every parcel body in the verified
+///   head's ancestry just to build a prune set; and
+/// * a breadth-first discovery that stopped only at the *exact* `known_verified` hash. That
+///   is the right frontier for a linear lift, where the verified head is the unique
+///   boundary — but a merge's boundary is the merge-base *set*, which one hash cannot
+///   express, so a merge walked below the fork point and re-verified ancestry that was
+///   audited when `known_verified` was committed.
+///
+/// Excluding that ancestry is sound on exactly the invariant the incremental audit already
+/// rests on: everything reachable from a committed head was verified when it was committed.
+/// A creation (`known_verified: None`) still walks the whole history.
+///
+/// # Arguments
+/// * `head`           - The parcel whose new ancestry to collect.
+/// * `known_verified` - A head already known good (`None` collects everything).
+///
+/// # Returns
+/// * `Ok(Vec<String>)` - The new parcels, breadth-first from `head`.
+/// * `Err(String)`     - If a parcel is in neither the commit-graph nor the object store.
+pub fn new_parcels(head: &str, known_verified: Option<&str>) -> Result<Vec<String>, String> {
+    let fresh: Option<HashSet<String>> = match known_verified {
+        None => None,
+        Some(bound) if bound == head => return Ok(Vec::new()),
+        Some(bound) => Some(fresh_frontier(head, bound)?),
+    };
+
+    // Breadth-first from `head`, so the order — and therefore the first failure an audit
+    // reports — is exactly what the unbounded walk produced.
+    let mut order: Vec<String> = Vec::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    queue.push_back(head.to_string());
+
+    while let Some(hash) = queue.pop_front() {
+        if fresh.as_ref().is_some_and(|fresh| !fresh.contains(&hash)) {
+            continue;
+        }
+
+        if !visited.insert(hash.clone()) {
+            continue;
+        }
+
+        for parent in graph_utils::parents(&hash)? {
+            queue.push_back(parent);
+        }
+
+        order.push(hash);
+    }
+
+    Ok(order)
+}
+
+/// The set behind [`new_parcels`]: parcels reachable from `head` but not from `bound`.
+///
+/// A max-heap on the generation number drives the walk, so parcels are settled newest-first
+/// and each one's marks are final when it is popped (every parcel that could mark it has a
+/// strictly greater generation, hence was popped earlier). The walk stops as soon as nothing
+/// fresh is left pending: whatever remains is reachable from `bound`, and so is everything
+/// behind it.
+fn fresh_frontier(head: &str, bound: &str) -> Result<HashSet<String>, String> {
+    let mut walk = Frontier::default();
+
+    walk.mark(head, FRESH)?;
+    walk.mark(bound, KNOWN)?;
+
+    // Nothing fresh left pending means nothing new can be discovered: every parcel still on
+    // the heap is reachable from `bound`, and so is all of its ancestry.
+    while walk.fresh_pending > 0 {
+        let Some((_, hash)) = walk.heap.pop() else {
+            break;
+        };
+
+        if !walk.settled.insert(hash.clone()) {
+            continue;
+        }
+
+        let marks = walk.marks[&hash];
+
+        if marks & FRESH != 0 {
+            walk.fresh_pending -= 1;
+        }
+
+        // Reachable from `bound`: none of it is new, and neither is anything behind it.
+        let inherited = if marks & KNOWN != 0 {
+            KNOWN
+        } else {
+            walk.fresh.insert(hash.clone());
+            FRESH
+        };
+
+        for parent in walk.parents_of[&hash].clone() {
+            walk.mark(&parent, inherited)?;
+        }
+    }
+
+    Ok(walk.fresh)
+}
+
+/// The bookkeeping of [`fresh_frontier`].
+#[derive(Default)]
+struct Frontier {
+    /// The `FRESH`/`KNOWN` bits per parcel. Final once the parcel is settled.
+    marks: HashMap<String, u8>,
+
+    /// Parent edges, read from the commit-graph as each parcel is first seen.
+    parents_of: HashMap<String, Vec<String>>,
+
+    /// Unsettled parcels, newest generation first.
+    heap: BinaryHeap<(u32, String)>,
+
+    /// Parcels already popped; their marks will not change again.
+    settled: HashSet<String>,
+
+    /// The answer: fresh and not known.
+    fresh: HashSet<String>,
+
+    /// How many unsettled parcels carry `FRESH` — the walk's reason to keep going.
+    fresh_pending: usize,
+}
+
+impl Frontier {
+    /// Add `flag` to `hash`, enqueueing it under its generation the first time it is seen.
+    fn mark(&mut self, hash: &str, flag: u8) -> Result<(), String> {
+        let before = self.marks.get(hash).copied();
+
+        self.marks.insert(hash.to_string(), before.unwrap_or(0) | flag);
+
+        // Newly fresh: one more parcel worth walking for. A parcel can only gain marks
+        // before it settles, so this never counts a settled parcel.
+        if flag == FRESH && before.unwrap_or(0) & FRESH == 0 {
+            self.fresh_pending += 1;
+        }
+
+        if before.is_none() {
+            let node = graph_utils::node(hash)?;
+
+            self.parents_of.insert(hash.to_string(), node.parents);
+            self.heap.push((node.generation, hash.to_string()));
+        }
+
+        Ok(())
+    }
+}
+
 /// Collect every parcel reachable from the given heads (the heads included).
+///
+/// The audit no longer uses this — see [`new_parcels`], which is bounded. It remains the
+/// right primitive for the callers that genuinely need the whole set (bundle building, pack
+/// reachability, `deliver`), and it decodes parcel bodies on purpose there: those callers go
+/// on to read the objects, so a commit-graph record would not save them the read *and* would
+/// not prove the object is present.
 ///
 /// # Arguments
 /// * `heads` - The starting parcel hashes.
@@ -810,7 +966,16 @@ pub fn verify_one_signature(parcel_hash: &str,
 /// before committing a ref update.
 ///
 /// Everything reachable from `known_complete` is assumed complete (it was verified when
-/// that head was committed), so only the new slice is walked.
+/// that head was committed), so only the new slice is walked — including across a merge
+/// that rejoins below it. Until 2026-07-09 this held for trees and blobs but not for parcel
+/// bodies: the prune set was built with `collect_reachable(known_complete)`, which decoded
+/// every one of them. It no longer touches them, which is what makes an incremental lift
+/// O(new parcels) instead of O(history).
+///
+/// The consequence, stated plainly: a store that has *lost* a parcel behind
+/// `known_complete` no longer fails here. It never failed on a lost tree or blob behind it
+/// either — that ancestry is trusted, by the same induction the signature audit uses. The
+/// full `audit` command (`known_complete: None`) is what proves the whole history present.
 ///
 /// # Arguments
 /// * `head`           - The head whose history to verify.
@@ -845,30 +1010,20 @@ pub fn verify_parcel_closure_with(
     known_complete: Option<&str>,
     blob_exists: &dyn Fn(&str) -> Result<bool, String>,
 ) -> Result<(), String> {
-    let complete = match known_complete {
-        Some(hash) => collect_reachable(&[hash.to_string()])?,
-        None => HashSet::new(),
-    };
+    // Only the new segment: the closure behind `known_complete` was proven complete when
+    // that head was committed. This walk used to build its prune set with
+    // `collect_reachable(known_complete)`, which decoded every parcel body in the ancestry —
+    // O(history) on every ref update, however little the lift added.
+    let parcels = new_parcels(head, known_complete)
+        .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
-    let mut queue: VecDeque<String> = VecDeque::new();
-    let mut visited: HashSet<String> = HashSet::new();
     let mut visited_trees: HashSet<String> = HashSet::new();
 
-    queue.push_back(head.to_string());
-
-    while let Some(hash) = queue.pop_front() {
-        if complete.contains(&hash) || !visited.insert(hash.clone()) {
-            continue;
-        }
-
-        let parcel = object_utils::load_parcel(&hash)
+    for hash in &parcels {
+        let parcel = object_utils::load_parcel(hash)
             .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
         verify_tree_closure(&parcel.tree_hash, &mut visited_trees, blob_exists)?;
-
-        for parent in parcel.parents {
-            queue.push_back(parent);
-        }
     }
 
     Ok(())
