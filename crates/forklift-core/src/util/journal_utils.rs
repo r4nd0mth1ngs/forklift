@@ -165,3 +165,205 @@ fn write(entries: &[JournalEntry]) -> Result<(), String> {
 
     file_utils::write_file_atomically(&path(), json.as_bytes())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::globals::StorageRootScope;
+
+    /// A fresh warehouse root for one test (its own `.forklift` folder exists, but
+    /// nothing is prepared beyond that — the journal only ever needs `bay_root()` to
+    /// resolve, which it does the moment `.forklift` exists).
+    struct Scratch {
+        root: PathBuf,
+        _scope: StorageRootScope,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Scratch {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let root = std::env::temp_dir().join(format!(
+                "forklift-journal-test-{}-{}-{}", name, std::process::id(), id
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+            let scope = StorageRootScope::enter(&root);
+
+            Scratch { root, _scope: scope }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn entry(op: &str, pallet: &str, head: &str) -> JournalEntry {
+        let mut heads = BTreeMap::new();
+        heads.insert(pallet.to_string(), head.to_string());
+
+        JournalEntry {
+            op: op.to_string(),
+            current_pallet: pallet.to_string(),
+            heads,
+            consolidation: None,
+        }
+    }
+
+    #[test]
+    fn capture_reflects_a_bare_warehouses_default_state() {
+        let _scratch = Scratch::new("capture-bare");
+
+        let snapshot = capture("stack").unwrap();
+        assert_eq!(snapshot.current_pallet, crate::util::pallet_utils::DEFAULT_PALLET_NAME);
+        assert!(snapshot.heads.is_empty(), "an unborn warehouse has no pallet refs yet");
+        assert!(snapshot.consolidation.is_none());
+    }
+
+    #[test]
+    fn push_if_changed_is_a_noop_when_the_current_pallet_is_unborn() {
+        let _scratch = Scratch::new("push-unborn");
+
+        // The default pallet has never been stacked to, so `heads` cannot contain it —
+        // exactly the "stack onto an unborn pallet" case `push_if_changed` opts out of.
+        let pre = capture("stack").unwrap();
+        push_if_changed(pre).unwrap();
+
+        assert!(pop().unwrap().is_none(), "an unborn-pallet snapshot must never be journaled");
+    }
+
+    #[test]
+    fn push_if_changed_records_a_real_state_change() {
+        let _scratch = Scratch::new("push-real-change");
+
+        pallet_utils::set_pallet_head("main", &"a".repeat(64)).unwrap();
+        let pre = capture("stack").unwrap();
+
+        // The operation itself: the pallet head actually moves.
+        pallet_utils::set_pallet_head("main", &"b".repeat(64)).unwrap();
+        push_if_changed(pre).unwrap();
+
+        let popped = pop().unwrap().expect("a real change must be journaled");
+        assert_eq!(popped.heads.get("main"), Some(&"a".repeat(64)));
+        assert!(pop().unwrap().is_none(), "popping removes the entry");
+    }
+
+    #[test]
+    fn push_if_changed_skips_a_true_noop() {
+        let _scratch = Scratch::new("push-noop");
+
+        pallet_utils::set_pallet_head("main", &"a".repeat(64)).unwrap();
+        let pre = capture("stack").unwrap();
+
+        // Nothing actually changed between capturing `pre` and calling `push_if_changed`.
+        push_if_changed(pre).unwrap();
+
+        assert!(pop().unwrap().is_none(), "a no-op command must leave no undo entry");
+    }
+
+    #[test]
+    fn pop_returns_entries_most_recent_first() {
+        let _scratch = Scratch::new("pop-lifo");
+
+        push_if_changed(entry("stack", "main", "1".repeat(64).as_str())).unwrap();
+        push_if_changed(entry("shift", "main", "2".repeat(64).as_str())).unwrap();
+
+        assert_eq!(pop().unwrap().unwrap().op, "shift");
+        assert_eq!(pop().unwrap().unwrap().op, "stack");
+        assert!(pop().unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_refs_puts_pallet_heads_current_pallet_and_consolidation_back() {
+        let _scratch = Scratch::new("restore-refs");
+
+        let mut heads = BTreeMap::new();
+        heads.insert("main".to_string(), "a".repeat(64));
+        heads.insert("@office".to_string(), "b".repeat(64));
+
+        let restored = JournalEntry {
+            op: "consolidate".to_string(),
+            current_pallet: "feature".to_string(),
+            heads,
+            consolidation: Some(("c".repeat(64), "their-pallet".to_string())),
+        };
+
+        restore_refs(&restored).unwrap();
+
+        assert_eq!(
+            pallet_utils::get_pallet_head("main").unwrap(),
+            Some("a".repeat(64))
+        );
+        assert_eq!(
+            pallet_utils::get_meta_pallet_head("office").unwrap(),
+            Some("b".repeat(64))
+        );
+        assert_eq!(pallet_utils::get_current_pallet_name().unwrap(), "feature");
+
+        let consolidation = merge_utils::read_consolidation_state().unwrap().unwrap();
+        assert_eq!(consolidation.their_head, "c".repeat(64));
+        assert_eq!(consolidation.their_pallet, "their-pallet");
+    }
+
+    #[test]
+    fn restore_refs_clears_consolidation_when_the_entry_has_none() {
+        let _scratch = Scratch::new("restore-clears-consolidation");
+
+        merge_utils::write_consolidation_state(&ConsolidationState {
+            their_head: "d".repeat(64),
+            their_pallet: "stray".to_string(),
+        }).unwrap();
+
+        restore_refs(&entry("stack", "main", &"a".repeat(64))).unwrap();
+
+        assert!(merge_utils::read_consolidation_state().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_corrupt_journal_file_is_tolerated_as_empty() {
+        let _scratch = Scratch::new("corrupt-journal");
+
+        std::fs::create_dir_all(path().parent().unwrap()).unwrap();
+        std::fs::write(path(), b"not valid json at all").unwrap();
+
+        assert!(read().is_empty(), "a corrupt journal must be treated as empty, never panic");
+        assert!(pop().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_truncated_journal_file_is_tolerated_as_empty() {
+        let _scratch = Scratch::new("truncated-journal");
+
+        push_if_changed(entry("stack", "main", &"a".repeat(64))).unwrap();
+
+        // Truncate the well-formed JSON array the previous push just wrote.
+        let full = std::fs::read_to_string(path()).unwrap();
+        let truncated = &full[..full.len() / 2];
+        std::fs::write(path(), truncated).unwrap();
+
+        assert!(read().is_empty(), "a truncated journal must be tolerated, not panic");
+    }
+
+    #[test]
+    fn the_journal_is_capped_at_max_entries() {
+        let _scratch = Scratch::new("journal-cap");
+
+        // A fixed real head that never matches any of the fake `pre` snapshots below, so
+        // every `push_if_changed` call sees a real change and actually journals.
+        pallet_utils::set_pallet_head("main", &"f".repeat(64)).unwrap();
+
+        for i in 0..(MAX_ENTRIES + 10) {
+            push_if_changed(entry("stack", "main", &format!("{:064x}", i))).unwrap();
+        }
+
+        assert_eq!(read().len(), MAX_ENTRIES, "the journal must never grow past its cap");
+
+        // The oldest entries are the ones dropped: the newest surviving entry is the very
+        // last one pushed.
+        let newest = pop().unwrap().unwrap();
+        assert_eq!(newest.heads.get("main"), Some(&format!("{:064x}", MAX_ENTRIES + 9)));
+    }
+}

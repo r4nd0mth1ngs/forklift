@@ -1593,3 +1593,776 @@ async fn get_bundle(State(state): State<Arc<AppState>>,
         Err(e) => error_response(internal(format!("Error while opening the bundle: {}", e))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use forklift_core::globals::{StorageRootScope, FOLDER_NAME_FORKLIFT_ROOT};
+    use forklift_core::model::operator::Operator;
+    use forklift_core::util::{office_utils, warehouse_utils};
+    use forklift_core::util::office_utils::{IdentityClass, OfficeState, Role, TrustAnchor, UserRecord};
+
+    // ---------------------------------------------------------------------------------
+    // Shared test plumbing
+    // ---------------------------------------------------------------------------------
+
+    /// A fresh `AppState` for a given serving mode, with no auth/hooks configured (tests
+    /// override individual fields with struct-update syntax).
+    fn base_state(mode: ServeMode) -> AppState {
+        AppState {
+            mode,
+            token: None,
+            operator_tokens: HashMap::new(),
+            rebuild_after_lifts: None,
+            warehouses: Mutex::new(HashMap::new()),
+            authentication_hook: None,
+            admission_hook: None,
+            events_hook: None,
+            resolution_hook: None,
+            http: reqwest::Client::new(),
+            authentication_cache: Mutex::new(HashMap::new()),
+            authentication_cache_ttl: std::time::Duration::from_secs(60),
+        }
+    }
+
+    fn single_mode_state(root: PathBuf) -> AppState {
+        base_state(ServeMode::Single(Arc::new(WarehouseHandle::new(root))))
+    }
+
+    fn headers_with_bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {}", token).parse().unwrap());
+        headers
+    }
+
+    fn headers_with_raw(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", value.parse().unwrap());
+        headers
+    }
+
+    /// A unique scratch directory for one test (never shared across tests, so parallel
+    /// tests never collide on disk).
+    fn scratch_dir(name: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let path = std::env::temp_dir().join(format!(
+            "forklift-server-test-{}-{}-{}", name, std::process::id(), id
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// Start an in-process HTTP server that answers every POST with a fixed status and
+    /// body, recording the most recent request body it received and how many requests it
+    /// has handled. The hook protocol is ordinary HTTP, so this is a faithful stand-in for
+    /// a hosting provider's hook endpoint — no subprocess needed.
+    async fn spawn_hook(status: StatusCode, body: &'static str)
+        -> (String, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        let received_for_handler = Arc::clone(&received);
+        let hits_for_handler = Arc::clone(&hits);
+
+        let app = Router::new().route("/hook", post(move |bytes: Bytes| {
+            let received = Arc::clone(&received_for_handler);
+            let hits = Arc::clone(&hits_for_handler);
+
+            async move {
+                if let Ok(mut guard) = received.lock() {
+                    *guard = bytes.to_vec();
+                }
+                hits.fetch_add(1, Ordering::SeqCst);
+
+                (status, body).into_response()
+            }
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{}/hook", addr), received, hits)
+    }
+
+    /// A URL nothing listens on (bound, then immediately released) — a deterministic way
+    /// to exercise the "hook unreachable" fail-closed path without depending on a magic
+    /// port number staying free.
+    fn unreachable_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{}/hook", addr)
+    }
+
+    // ---------------------------------------------------------------------------------
+    // check_auth
+    // ---------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn no_auth_configured_is_fully_open() {
+        let state = single_mode_state(PathBuf::from("/unused"));
+        let principal = check_auth(&state, &HeaderMap::new()).await.unwrap();
+        assert!(principal == Principal::Open);
+    }
+
+    #[tokio::test]
+    async fn the_static_token_authenticates_as_static() {
+        let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
+        let principal = check_auth(&state, &headers_with_bearer("secret")).await.unwrap();
+        assert!(principal == Principal::Static);
+    }
+
+    #[tokio::test]
+    async fn a_known_operator_token_authenticates_as_that_operator() {
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-bob".to_string(), "bob".to_string());
+        let state = AppState { operator_tokens, ..single_mode_state(PathBuf::from("/unused")) };
+
+        let principal = check_auth(&state, &headers_with_bearer("tok-bob")).await.unwrap();
+        assert!(principal == Principal::Operator("bob".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_token_with_no_hook_is_unauthorized() {
+        let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
+        let error = check_auth(&state, &headers_with_bearer("guess")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_missing_authorization_header_is_unauthorized_when_auth_is_configured() {
+        let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
+        let error = check_auth(&state, &HeaderMap::new()).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_non_bearer_scheme_is_unauthorized() {
+        let state = AppState { token: Some("secret".to_string()), ..single_mode_state(PathBuf::from("/unused")) };
+        let error = check_auth(&state, &headers_with_raw("Basic secret")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_hook_answer_authenticates_and_is_cached() {
+        let (url, _received, hits) = spawn_hook(StatusCode::OK, r#"{"identifier":"bob"}"#).await;
+        let state = AppState {
+            authentication_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let first = check_auth(&state, &headers_with_bearer("tok")).await.unwrap();
+        assert!(first == Principal::Operator("bob".to_string()));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // A second request with the same token must reuse the cached answer, not
+        // re-consult the hook (the whole point of the cache on this hot path).
+        let second = check_auth(&state, &headers_with_bearer("tok")).await.unwrap();
+        assert!(second == Principal::Operator("bob".to_string()));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_zero_ttl_cache_never_serves_a_stale_answer() {
+        let (url, _received, hits) = spawn_hook(StatusCode::OK, r#"{"identifier":"bob"}"#).await;
+        let state = AppState {
+            authentication_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            authentication_cache_ttl: std::time::Duration::from_secs(0),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        check_auth(&state, &headers_with_bearer("tok")).await.unwrap();
+        check_auth(&state, &headers_with_bearer("tok")).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "a zero-second TTL must re-check every time");
+    }
+
+    #[tokio::test]
+    async fn a_hook_non_success_status_is_unauthorized() {
+        let (url, _received, _hits) = spawn_hook(StatusCode::FORBIDDEN, "nope").await;
+        let state = AppState {
+            authentication_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let error = check_auth(&state, &headers_with_bearer("tok")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_authentication_hook_fails_closed() {
+        let state = AppState {
+            authentication_hook: Some(HookEndpoint { url: unreachable_url(), secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let error = check_auth(&state, &headers_with_bearer("tok")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_authentication_hook_answer_fails_closed() {
+        let (url, _received, _hits) = spawn_hook(StatusCode::OK, "not json").await;
+        let state = AppState {
+            authentication_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let error = check_auth(&state, &headers_with_bearer("tok")).await.err().unwrap();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // check_admission
+    // ---------------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn no_admission_hook_always_admits() {
+        let state = single_mode_state(PathBuf::from("/unused"));
+        let result = check_admission(
+            &state, &PathParams::new(), &Principal::Operator("bob".to_string()), "upload", None
+        ).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_admission_hook_can_allow() {
+        let (url, _received, _hits) = spawn_hook(StatusCode::OK, r#"{"allow":true}"#).await;
+        let state = AppState {
+            admission_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let result = check_admission(
+            &state, &PathParams::new(), &Principal::Operator("bob".to_string()), "upload", None
+        ).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_admission_hook_denies_with_its_reason() {
+        let (url, _received, _hits) = spawn_hook(
+            StatusCode::OK, r#"{"allow":false,"reason":"quota exceeded"}"#
+        ).await;
+        let state = AppState {
+            admission_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let error = check_admission(
+            &state, &PathParams::new(), &Principal::Operator("bob".to_string()), "upload", None
+        ).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert_eq!(error.1, "quota exceeded");
+    }
+
+    #[tokio::test]
+    async fn a_denial_without_a_reason_uses_the_default_message() {
+        let (url, _received, _hits) = spawn_hook(StatusCode::OK, r#"{"allow":false}"#).await;
+        let state = AppState {
+            admission_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let error = check_admission(
+            &state, &PathParams::new(), &Principal::Operator("bob".to_string()), "upload", None
+        ).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert!(error.1.contains("admission policy"), "{}", error.1);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_admission_hook_fails_closed() {
+        let state = AppState {
+            admission_hook: Some(HookEndpoint { url: unreachable_url(), secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let error = check_admission(
+            &state, &PathParams::new(), &Principal::Operator("bob".to_string()), "upload", None
+        ).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_non_success_admission_status_fails_closed() {
+        let (url, _received, _hits) = spawn_hook(StatusCode::INTERNAL_SERVER_ERROR, "boom").await;
+        let state = AppState {
+            admission_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let error = check_admission(
+            &state, &PathParams::new(), &Principal::Operator("bob".to_string()), "upload", None
+        ).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn malformed_admission_json_fails_closed() {
+        let (url, _received, _hits) = spawn_hook(StatusCode::OK, "not json").await;
+        let state = AppState {
+            admission_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let error = check_admission(
+            &state, &PathParams::new(), &Principal::Operator("bob".to_string()), "upload", None
+        ).await.unwrap_err();
+        assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn the_admission_request_carries_the_tenant_operator_and_pallet() {
+        let (url, received, _hits) = spawn_hook(StatusCode::OK, r#"{"allow":true}"#).await;
+        let state = AppState {
+            admission_hook: Some(HookEndpoint { url, secret: "s".to_string() }),
+            ..single_mode_state(PathBuf::from("/unused"))
+        };
+
+        let mut params = PathParams::new();
+        params.insert("warehouse".to_string(), "tenant-a".to_string());
+
+        check_admission(
+            &state, &params, &Principal::Operator("bob".to_string()), "ref_update", Some("main")
+        ).await.unwrap();
+
+        let body = received.lock().unwrap().clone();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["action"], "ref_update");
+        assert_eq!(value["warehouse"], "tenant-a");
+        assert_eq!(value["operator"], "bob");
+        assert_eq!(value["pallet"], "main");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // validate_warehouse_id / parse_operator_tokens
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn validate_warehouse_id_rejects_the_obvious_bad_shapes() {
+        assert!(validate_warehouse_id("").is_err(), "empty");
+        assert!(validate_warehouse_id(&"a".repeat(101)).is_err(), "too long");
+        assert!(validate_warehouse_id(".hidden").is_err(), "leading dot");
+        assert!(validate_warehouse_id("-flag").is_err(), "leading dash");
+        assert!(validate_warehouse_id("tenant/a").is_err(), "path separator");
+        assert!(validate_warehouse_id("tenant a").is_err(), "space");
+    }
+
+    #[test]
+    fn validate_warehouse_id_accepts_ordinary_ids() {
+        assert!(validate_warehouse_id("tenant-a").is_ok());
+        assert!(validate_warehouse_id("tenant_a.1").is_ok());
+        assert!(validate_warehouse_id(&"a".repeat(100)).is_ok(), "exactly 100 is fine");
+    }
+
+    #[test]
+    fn parses_a_valid_operator_token_file() {
+        let dir = scratch_dir("tokens-ok");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"tok-a\" = \"alice\"\n\"tok-b\" = \"bob\"\n").unwrap();
+
+        let tokens = parse_operator_tokens(path.to_str().unwrap()).unwrap();
+        assert_eq!(tokens.get("tok-a"), Some(&"alice".to_string()));
+        assert_eq!(tokens.get("tok-b"), Some(&"bob".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_a_missing_token_file() {
+        let path = std::env::temp_dir().join("forklift-server-test-tokens-does-not-exist.toml");
+        let _ = std::fs::remove_file(&path);
+        assert!(parse_operator_tokens(path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn rejects_a_token_file_that_is_not_valid_toml() {
+        let dir = scratch_dir("tokens-bad-toml");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "not [ valid toml").unwrap();
+
+        assert!(parse_operator_tokens(path.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_a_token_file_with_no_operators_table() {
+        let dir = scratch_dir("tokens-no-table");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "not_operators = 1\n").unwrap();
+
+        let error = parse_operator_tokens(path.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("[operators]"), "{}", error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_a_token_mapped_to_a_non_string_value() {
+        let dir = scratch_dir("tokens-non-string");
+        let path = dir.join("tokens.toml");
+        std::fs::write(&path, "[operators]\n\"tok-a\" = 42\n").unwrap();
+
+        assert!(parse_operator_tokens(path.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // resolve_warehouse
+    // ---------------------------------------------------------------------------------
+
+    #[test]
+    fn single_mode_always_resolves_the_one_served_handle() {
+        let root = scratch_dir("resolve-single");
+        let state = single_mode_state(root.clone());
+
+        let first = resolve_warehouse(&state, &PathParams::new()).unwrap();
+        let second = resolve_warehouse(&state, &PathParams::new()).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.root, root);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn multi_mode_404s_for_an_unknown_warehouse() {
+        let base = scratch_dir("resolve-multi-404");
+        let state = base_state(ServeMode::Multi { base: base.clone() });
+
+        let mut params = PathParams::new();
+        params.insert("warehouse".to_string(), "ghost".to_string());
+
+        let error = resolve_warehouse(&state, &params).err().unwrap();
+        assert_eq!(error.0, StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn multi_mode_422s_for_an_invalid_warehouse_id() {
+        let base = scratch_dir("resolve-multi-422");
+        let state = base_state(ServeMode::Multi { base: base.clone() });
+
+        let mut params = PathParams::new();
+        params.insert("warehouse".to_string(), "../escape".to_string());
+
+        let error = resolve_warehouse(&state, &params).err().unwrap();
+        assert_eq!(error.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn multi_mode_caches_the_handle_across_requests() {
+        let base = scratch_dir("resolve-multi-cache");
+        std::fs::create_dir_all(base.join("wh1").join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let state = base_state(ServeMode::Multi { base: base.clone() });
+
+        let mut params = PathParams::new();
+        params.insert("warehouse".to_string(), "wh1".to_string());
+
+        let first = resolve_warehouse(&state, &params).unwrap();
+        let second = resolve_warehouse(&state, &params).unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "the same warehouse must reuse one write mutex");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn multi_mode_keeps_tenants_isolated() {
+        let base = scratch_dir("resolve-multi-tenants");
+        std::fs::create_dir_all(base.join("wh1").join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        std::fs::create_dir_all(base.join("wh2").join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+        let state = base_state(ServeMode::Multi { base: base.clone() });
+
+        let mut params1 = PathParams::new();
+        params1.insert("warehouse".to_string(), "wh1".to_string());
+        let mut params2 = PathParams::new();
+        params2.insert("warehouse".to_string(), "wh2".to_string());
+
+        let handle1 = resolve_warehouse(&state, &params1).unwrap();
+        let handle2 = resolve_warehouse(&state, &params2).unwrap();
+
+        assert!(!Arc::ptr_eq(&handle1, &handle2), "two tenants must never share a handle");
+        assert_ne!(handle1.root, handle2.root);
+        assert_eq!(state.warehouses.lock().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // office_user_of / require_uploader (FORK-10 transport authorization)
+    // ---------------------------------------------------------------------------------
+
+    /// Serializes every test that touches key generation/signing: `sign_utils` resolves
+    /// its private-key directory from the `FORKLIFT_KEYS_DIR` environment variable on
+    /// every call, which is process-global (not scoped by `StorageRootScope`). Holding
+    /// this lock for such a test's whole body keeps two tests from ever pointing the
+    /// same process at different key directories at once. Tests that never sign
+    /// anything (most of this file) never take it and run fully in parallel.
+    static KEYS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A real, cryptographically valid office chain: a genesis admin (self-endorsed
+    /// identity root, exactly like `office enroll`), with trust established. Building it
+    /// through the same `office_utils`/`sign_utils` calls the CLI uses means the chain
+    /// this produces is exactly as verifiable as a real one — not a shortcut that only
+    /// happens to satisfy `office_user_of`.
+    struct OfficeFixture {
+        root: PathBuf,
+        _scope: StorageRootScope,
+        _keys_lock: std::sync::MutexGuard<'static, ()>,
+        admin: Operator,
+        admin_key_id: String,
+    }
+
+    impl OfficeFixture {
+        fn genesis(name: &str) -> OfficeFixture {
+            let keys_lock = KEYS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+            let root = scratch_dir(name);
+            let keys_dir = root.join("keys");
+            std::fs::create_dir_all(&keys_dir).unwrap();
+            std::env::set_var("FORKLIFT_KEYS_DIR", &keys_dir);
+
+            let scope = StorageRootScope::enter(&root);
+            warehouse_utils::prepare_warehouse().unwrap();
+
+            let admin = Operator { name: "alice".to_string(), identifier: "alice".to_string() };
+            let (key_id, public_key) = forklift_core::util::sign_utils::generate_keypair(&admin.identifier).unwrap();
+            let pop = office_utils::sign_key_pop(&key_id, &public_key, &admin.identifier).unwrap();
+            let root_key = office_utils::endorse_key(&public_key, &admin.identifier, &key_id, &pop, 1_700_000_000).unwrap();
+
+            let state = OfficeState {
+                users: vec![UserRecord {
+                    identifier: admin.identifier.clone(),
+                    enrolled_at: 1_700_000_000,
+                    role: Role::Admin,
+                    pallets: Vec::new(),
+                    identity_root: key_id.clone(),
+                    class: IdentityClass::Human,
+                    supervisor: None,
+                }],
+                keys: vec![root_key],
+            };
+
+            let genesis = office_utils::stack_office_parcel(
+                &state, &admin, "genesis".to_string(), &key_id
+            ).unwrap();
+
+            office_utils::write_trust_anchor(&TrustAnchor {
+                genesis,
+                enabled_at: 1_700_000_000,
+                boundary: Vec::new(),
+                prior_genesis: None,
+                adopts: None,
+            }).unwrap();
+
+            OfficeFixture { root, _scope: scope, _keys_lock: keys_lock, admin, admin_key_id: key_id }
+        }
+
+        /// Admit an additional user onto the chain (mirrors `office admit`).
+        fn admit(&self,
+                identifier: &str,
+                role: Role,
+                pallets: Vec<String>,
+                class: IdentityClass,
+                supervisor: Option<String>) {
+            let mut state = office_utils::read_office_state().unwrap();
+
+            let (key_id, public_key) = forklift_core::util::sign_utils::generate_keypair(identifier).unwrap();
+            let pop = office_utils::sign_key_pop(&key_id, &public_key, identifier).unwrap();
+            let key = office_utils::endorse_key(
+                &public_key, identifier, &self.admin_key_id, &pop, 1_700_000_001
+            ).unwrap();
+
+            state.users.push(UserRecord {
+                identifier: identifier.to_string(),
+                enrolled_at: 1_700_000_001,
+                role,
+                pallets,
+                identity_root: key_id,
+                class,
+                supervisor,
+            });
+            state.keys.push(key);
+
+            office_utils::stack_office_parcel(
+                &state, &self.admin, format!("admit {}", identifier), &self.admin_key_id
+            ).unwrap();
+        }
+    }
+
+    impl Drop for OfficeFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn no_trust_anchor_means_office_user_of_is_none() {
+        let root = scratch_dir("office-none-anchor");
+        let _scope = StorageRootScope::enter(&root);
+        std::fs::create_dir_all(root.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+
+        assert!(office_user_of("anyone").unwrap().is_none());
+        assert!(require_uploader(&Principal::Operator("anyone".to_string())).is_ok());
+
+        drop(_scope);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_established_anchor_with_no_office_yet_is_the_bootstrap_window() {
+        // Trust set, but the office pallet itself has not been lifted (no key generation
+        // involved, so this test needs no `FORKLIFT_KEYS_DIR` scoping).
+        let root = scratch_dir("office-bootstrap-window");
+        let _scope = StorageRootScope::enter(&root);
+        std::fs::create_dir_all(root.join(FOLDER_NAME_FORKLIFT_ROOT)).unwrap();
+
+        office_utils::write_trust_anchor(&TrustAnchor {
+            genesis: "0".repeat(64),
+            enabled_at: 0,
+            boundary: Vec::new(),
+            prior_genesis: None,
+            adopts: None,
+        }).unwrap();
+
+        assert!(office_user_of("anyone").unwrap().is_none());
+        assert!(require_uploader(&Principal::Operator("anyone".to_string())).is_ok());
+
+        drop(_scope);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_uploader_bypasses_the_office_for_static_and_open_principals() {
+        // No storage scope at all: neither variant ever reaches `office_user_of`.
+        assert!(require_uploader(&Principal::Static).is_ok());
+        assert!(require_uploader(&Principal::Open).is_ok());
+    }
+
+    #[test]
+    fn an_enrolled_reader_is_found_with_their_role_and_identity_class() {
+        let fixture = OfficeFixture::genesis("office-reader");
+        fixture.admit(
+            "bob", Role::Reader, Vec::new(), IdentityClass::Agent, Some("alice".to_string())
+        );
+
+        let user = office_user_of("bob").unwrap().expect("bob must be enrolled");
+        assert_eq!(user.role, Role::Reader);
+        assert_eq!(user.class, IdentityClass::Agent);
+        assert_eq!(user.supervisor.as_deref(), Some("alice"));
+
+        let error = require_uploader(&Principal::Operator("bob".to_string())).unwrap_err();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert!(error.1.contains("readers cannot upload"), "{}", error.1);
+    }
+
+    #[test]
+    fn an_unenrolled_operator_is_forbidden_once_an_office_exists() {
+        let fixture = OfficeFixture::genesis("office-unenrolled");
+
+        let error = office_user_of("mallory").err().unwrap();
+        assert_eq!(error.0, StatusCode::FORBIDDEN);
+        assert!(error.1.contains("is not enrolled"), "{}", error.1);
+
+        drop(fixture);
+    }
+
+    #[test]
+    fn require_uploader_allows_writers_and_admins() {
+        let fixture = OfficeFixture::genesis("office-writer-admin");
+        fixture.admit(
+            "carol", Role::Writer, vec!["main".to_string()], IdentityClass::Bot, None
+        );
+
+        assert!(require_uploader(&Principal::Operator("carol".to_string())).is_ok());
+        assert!(require_uploader(&Principal::Operator(fixture.admin.identifier.clone())).is_ok());
+    }
+
+    // ---------------------------------------------------------------------------------
+    // post_ref_update — the FORK-10 transport-authorization gate
+    // ---------------------------------------------------------------------------------
+
+    fn ref_update_params(name: &str) -> PathParams {
+        let mut params = PathParams::new();
+        params.insert("name".to_string(), name.to_string());
+        params
+    }
+
+    #[tokio::test]
+    async fn a_reader_may_not_transport_the_office_meta_pallet() {
+        let fixture = OfficeFixture::genesis("post-ref-reader-office");
+        fixture.admit("dana", Role::Reader, Vec::new(), IdentityClass::Human, None);
+
+        let state = Arc::new(single_mode_state(fixture.root.clone()));
+        let params = ref_update_params("@office");
+        let body = RefUpdateRequest { old_head: None, new_head: "a".repeat(64) };
+
+        // The transport layer authenticates via the bearer-token map; give "dana" a
+        // token so `check_auth` yields `Principal::Operator("dana")`.
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-dana".to_string(), "dana".to_string());
+        let state = Arc::new(AppState { operator_tokens, ..Arc::try_unwrap(state).ok().unwrap() });
+
+        let response = post_ref_update(
+            State(state), headers_with_bearer("tok-dana"), Path(params), Json(body)
+        ).await;
+
+        assert_eq!(response.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_writer_outside_their_grant_may_not_move_a_pallet() {
+        let fixture = OfficeFixture::genesis("post-ref-writer-outside-grant");
+        fixture.admit(
+            "erin", Role::Writer, vec!["only-this-one".to_string()], IdentityClass::Human, None
+        );
+
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-erin".to_string(), "erin".to_string());
+        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+
+        let params = ref_update_params("someone-elses-pallet");
+        let body = RefUpdateRequest { old_head: None, new_head: "a".repeat(64) };
+
+        let response = post_ref_update(
+            State(state), headers_with_bearer("tok-erin"), Path(params), Json(body)
+        ).await;
+
+        assert_eq!(response.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_writer_inside_their_grant_clears_the_authorization_gate() {
+        let fixture = OfficeFixture::genesis("post-ref-writer-inside-grant");
+        fixture.admit(
+            "frank", Role::Writer, vec!["main".to_string()], IdentityClass::Human, None
+        );
+
+        let mut operator_tokens = HashMap::new();
+        operator_tokens.insert("tok-frank".to_string(), "frank".to_string());
+        let state = Arc::new(AppState { operator_tokens, ..single_mode_state(fixture.root.clone()) });
+
+        let params = ref_update_params("main");
+        // A `new_head` that was never uploaded: this must fail *later*, on object
+        // presence, never on authorization — the FORBIDDEN branch must not fire for an
+        // operator who is allowed to write this pallet.
+        let body = RefUpdateRequest { old_head: None, new_head: "b".repeat(64) };
+
+        let response = post_ref_update(
+            State(state), headers_with_bearer("tok-frank"), Path(params), Json(body)
+        ).await;
+
+        let status = response.into_response().status();
+        assert_ne!(status, StatusCode::FORBIDDEN, "an in-grant writer must clear the auth gate");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "it must instead fail on the missing object");
+    }
+}
