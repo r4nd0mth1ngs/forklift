@@ -516,11 +516,96 @@ fn classify_signature(hash: &str, office_state: &OfficeState) -> Result<Verdict,
 }
 
 /// Verified office chains, remembered per `(warehouse, anchor, office head)`.
-static VERIFIED_OFFICE_CHAINS: OnceLock<Mutex<HashMap<String, OfficeState>>> = OnceLock::new();
+static VERIFIED_OFFICE_CHAINS: OnceLock<Mutex<OfficeChainMemo>> = OnceLock::new();
 
-/// How many verified chains to remember before starting over. A server serves few
-/// warehouses and the office head moves rarely, so this never needs to be an LRU.
+/// How many verified chains to remember before evicting the least-recently-used one to
+/// make room for a new key. A hosting server can carry many more than sixteen tenants, so
+/// this bound is about keeping the memo small, not about how many warehouses are expected.
 const MAX_MEMOIZED_OFFICE_CHAINS: usize = 16;
+
+/// One remembered chain verification, tagged with when it was last touched.
+///
+/// "When" is a logical clock local to the memo, not a wall-clock timestamp: every hit and
+/// every insert draws the next tick from a counter that only ever increases, so entries can
+/// be ordered by recency without depending on the system clock.
+struct MemoEntry {
+    state: OfficeState,
+    last_used: u64,
+}
+
+/// A bounded memo of verified office chains, keyed by `(warehouse, anchor, office head)`
+/// (see [`office_chain_key`]).
+///
+/// At capacity, an insert of a new key evicts the single least-recently-used entry rather
+/// than clearing the whole memo. A server hosts as many warehouses as it has tenants, and
+/// each lands its own key here — clearing everything on the seventeenth distinct key would
+/// evict every other tenant's verified state along with it, degrading past the point of
+/// having no memo at all: constant recompute, plus the lock contention of a map that never
+/// gets to stay warm. Evicting one entry keeps the other tenants' memoized state intact.
+struct OfficeChainMemo {
+    entries: HashMap<String, MemoEntry>,
+    clock: u64,
+}
+
+impl OfficeChainMemo {
+    fn new() -> Self {
+        OfficeChainMemo { entries: HashMap::new(), clock: 0 }
+    }
+
+    // Only the tests below inspect size directly; production code only ever hits, inserts
+    // or clears the memo.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.clock = 0;
+    }
+
+    /// Look up `key`, marking it most-recently-used on a hit.
+    fn get(&mut self, key: &str) -> Option<OfficeState> {
+        let tick = self.next_tick();
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = tick;
+
+        Some(entry.state.clone())
+    }
+
+    /// Remember `state` under `key`, marking it most-recently-used.
+    ///
+    /// If the memo is already at [`MAX_MEMOIZED_OFFICE_CHAINS`] and `key` is not already
+    /// present, the entry with the smallest `last_used` is evicted first to make room — a
+    /// linear scan over at most sixteen entries, which is cheap enough not to need anything
+    /// fancier (a heap, an intrusive list) at this size.
+    fn insert(&mut self, key: String, state: OfficeState) {
+        if self.entries.len() >= MAX_MEMOIZED_OFFICE_CHAINS && !self.entries.contains_key(&key) {
+            let lru_key = self.entries.iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(k, _)| k.clone());
+
+            if let Some(lru_key) = lru_key {
+                self.entries.remove(&lru_key);
+            }
+        }
+
+        let tick = self.next_tick();
+        self.entries.insert(key, MemoEntry { state, last_used: tick });
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        let tick = self.clock;
+        self.clock += 1;
+
+        tick
+    }
+}
 
 /// [`verify_office_chain`], remembered for the life of the process.
 ///
@@ -537,27 +622,25 @@ const MAX_MEMOIZED_OFFICE_CHAINS: usize = 16;
 ///
 /// Use this from a long-lived head. The `audit` command verifies once and exits, so it calls
 /// [`verify_office_chain`] directly and never consults a memo.
+///
+/// The memo (see [`OfficeChainMemo`]) holds at most [`MAX_MEMOIZED_OFFICE_CHAINS`] entries and
+/// evicts the least-recently-used one to make room for a new key, so a busy tenant's state
+/// stays warm and only idle tenants age out.
 pub fn verify_office_chain_memoized(
     anchor: &TrustAnchor,
     office_head: &str,
 ) -> Result<OfficeState, String> {
     let key = office_chain_key(anchor, office_head);
-    let memo = VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(HashMap::new()));
+    let memo = VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(OfficeChainMemo::new()));
 
     if let Some(state) = lock_memo(memo).get(&key) {
-        return Ok(state.clone());
+        return Ok(state);
     }
 
     // Verified outside the lock: a slow chain must not block the other warehouses.
     let state = verify_office_chain(anchor, office_head)?;
 
-    let mut chains = lock_memo(memo);
-
-    if chains.len() >= MAX_MEMOIZED_OFFICE_CHAINS {
-        chains.clear();
-    }
-
-    chains.insert(key, state.clone());
+    lock_memo(memo).insert(key, state.clone());
 
     Ok(state)
 }
@@ -582,11 +665,11 @@ fn office_chain_key(anchor: &TrustAnchor, office_head: &str) -> String {
 /// never the caller's doing. Both server heads map a failure of the memoized verification to
 /// `422 Unprocessable`, so returning an error here would tell a client its lift was invalid
 /// because the server had a bug. And there is nothing to protect: this is a cache of results
-/// that can always be recomputed. So the poison is cleared, whatever was in the map is
+/// that can always be recomputed. So the poison is cleared, whatever was in the memo is
 /// dropped, and the next verification simply repopulates it.
 fn lock_memo(
-    memo: &Mutex<HashMap<String, OfficeState>>,
-) -> std::sync::MutexGuard<'_, HashMap<String, OfficeState>> {
+    memo: &Mutex<OfficeChainMemo>,
+) -> std::sync::MutexGuard<'_, OfficeChainMemo> {
     match memo.lock() {
         Ok(chains) => chains,
         Err(poisoned) => {
@@ -1460,7 +1543,7 @@ mod tests {
     /// a bug. Nothing is lost — the memo only holds results that can be recomputed.
     #[test]
     fn a_poisoned_office_memo_recovers_instead_of_failing() {
-        let memo = VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(HashMap::new()));
+        let memo = VERIFIED_OFFICE_CHAINS.get_or_init(|| Mutex::new(OfficeChainMemo::new()));
 
         // Panic while holding the lock, exactly as an internal fault would.
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1482,5 +1565,60 @@ mod tests {
         assert_eq!(lock_memo(memo).len(), 1, "and the entry survives the next lock");
 
         lock_memo(memo).clear();
+    }
+
+    /// A blank office state, cheap to construct, for tests that only care about the memo's
+    /// bookkeeping and not about what it stores.
+    fn blank_office_state() -> OfficeState {
+        OfficeState { users: Vec::new(), keys: Vec::new() }
+    }
+
+    /// A server hosting more warehouses than [`MAX_MEMOIZED_OFFICE_CHAINS`] must never grow
+    /// the memo past that bound — this is exercised against a locally constructed memo, not
+    /// the process-global one, so it stays deterministic under parallel test execution.
+    #[test]
+    fn the_office_memo_never_exceeds_its_capacity() {
+        let mut memo = OfficeChainMemo::new();
+
+        for i in 0..(MAX_MEMOIZED_OFFICE_CHAINS * 2) {
+            memo.insert(format!("key-{i}"), blank_office_state());
+            assert!(
+                memo.len() <= MAX_MEMOIZED_OFFICE_CHAINS,
+                "the memo grew past capacity after inserting key-{i}"
+            );
+        }
+
+        assert_eq!(memo.len(), MAX_MEMOIZED_OFFICE_CHAINS);
+    }
+
+    /// At capacity, a new key must evict only the least-recently-used entry — not the whole
+    /// memo — and a recent hit must protect an entry from being that victim.
+    #[test]
+    fn the_office_memo_evicts_only_the_least_recently_used_entry() {
+        let mut memo = OfficeChainMemo::new();
+
+        for i in 0..MAX_MEMOIZED_OFFICE_CHAINS {
+            memo.insert(format!("key-{i}"), blank_office_state());
+        }
+
+        // Touch "key-0" so it is now the most-recently-used; "key-1" becomes the least.
+        assert!(memo.get("key-0").is_some());
+
+        // One more distinct key, at capacity, forces exactly one eviction.
+        memo.insert("key-new".to_string(), blank_office_state());
+
+        assert_eq!(
+            memo.len(),
+            MAX_MEMOIZED_OFFICE_CHAINS,
+            "capacity is preserved, not cleared"
+        );
+        assert!(memo.get("key-0").is_some(), "the recently-hit entry survives");
+        assert!(memo.get("key-1").is_none(), "the least-recently-used entry was evicted");
+        assert!(memo.get("key-new").is_some(), "the new entry was inserted");
+
+        // Every other entry from the original fill is untouched — this was not a clear-all.
+        for i in 2..MAX_MEMOIZED_OFFICE_CHAINS {
+            assert!(memo.get(&format!("key-{i}")).is_some(), "key-{i} should not have been evicted");
+        }
     }
 }
