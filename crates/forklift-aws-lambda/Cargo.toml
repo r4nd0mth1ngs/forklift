@@ -15,6 +15,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 
+# The HTTP edge speaks the lightweight `http` crate (already in the tree via the AWS SDK), not
+# `lambda_http`, so the pure router `entrypoint::handle` is testable without any Lambda runtime
+# and the runtime crates stay out of the library entirely (see the `lambda` feature below).
+http = "1"
+
 # The AWS SDK layer (milestone C): real S3 + DynamoDB implementations of the store seams.
 #
 # TLS is deliberately routed through a ring-based rustls connector, built explicitly in
@@ -29,3 +34,34 @@ aws-sdk-dynamodb = { version = "1.110", default-features = false, features = ["r
 aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-ring"] }
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 aws-smithy-types = "1"
+
+# The Lambda runtime adapters (milestone C, stage 2): only the two binaries need them, so they
+# are optional and gated behind `lambda`. A plain `cargo build`/`cargo test` never compiles
+# them, and their default features are trimmed — the Runtime API is plaintext localhost, so no
+# TLS provider is pulled in and `aws-lc` stays out of the tree (the same `ring`-only stance the
+# store layer takes). Enable with `--features lambda` to build the deploy artifacts.
+lambda_http = { version = "0.17", default-features = false, features = ["apigw_http", "apigw_rest"], optional = true }
+lambda_runtime = { version = "0.14", default-features = false, optional = true }
+aws_lambda_events = { version = "0.18", default-features = false, features = ["s3"], optional = true }
+
+[features]
+# The two deploy binaries and the runtime crates they need. Off by default so the library and
+# its test suites build without a Lambda runtime.
+lambda = ["dep:lambda_http", "dep:lambda_runtime", "dep:aws_lambda_events"]
+
+# The control-plane function behind API Gateway: routes the protocol to `Head` methods.
+[[bin]]
+name = "forklift-aws-control-plane"
+path = "src/bin/control-plane.rs"
+required-features = ["lambda"]
+
+# The staging verifier triggered by S3 object-created events: verify-and-promote for large blobs.
+[[bin]]
+name = "forklift-aws-verifier"
+path = "src/bin/verifier.rs"
+required-features = ["lambda"]
+
+[dev-dependencies]
+# Following a `307` to a presigned S3 URL by hand in the LocalStack-gated end-to-end test —
+# the workspace's existing (ring-based) client, added only for tests.
+reqwest = { workspace = true }

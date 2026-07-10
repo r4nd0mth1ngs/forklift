@@ -124,6 +124,25 @@ pub struct RefUpdateRequest {
     pub new_head: String,
 }
 
+/// The body of `POST /v1/lift/{session}/commit` (additive; the serverless head). After a
+/// client has `PUT` its objects straight to storage via presigned staging URLs, it asks the
+/// head to verify and promote the session's uploads before the ref update. The head promotes
+/// the small `control_plane` objects synchronously and only presence-checks the large `blobs`
+/// (the staging verifier promotes those out of band). A direct head verifies every `PUT`
+/// inline and never needs this call.
+#[derive(Serialize, Deserialize)]
+pub struct CommitLiftRequest {
+    /// Small objects — parcels, trees, signature sidecars — the head verifies and promotes
+    /// synchronously: it reads the staged bytes, checks `Blake3(bytes) == hash`, and only
+    /// then copies them to the canonical hash key. A corrupt one refuses the commit.
+    pub control_plane: Vec<String>,
+
+    /// Large working blobs, checked for presence at their canonical key only — which is the
+    /// proof the staging verifier already hash-checked them. One still in staging simply
+    /// reads as not-yet-ready, and the client retries.
+    pub blobs: Vec<String>,
+}
+
 /// The body of `POST /v1/resolve` — operator identifiers to resolve to display
 /// names. Resolution is server-mediated on purpose (DESIGN.html §8.12): the client
 /// never talks to the resolution service directly, so the policy that decides *which*

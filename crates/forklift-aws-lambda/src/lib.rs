@@ -34,6 +34,7 @@
 
 pub mod aws;
 pub mod blocking;
+pub mod entrypoint;
 pub mod error;
 pub mod store;
 pub mod memory;
@@ -42,6 +43,7 @@ pub mod head;
 
 pub use aws::{AwsConfig, DynamoRefStore, S3ObjectStore};
 pub use blocking::AsyncBridge;
+pub use entrypoint::{config_from_env, handle, Routing};
 pub use error::{HeadError, HeadResult, Status};
 pub use head::{BatchResult, Head};
 pub use store::{
