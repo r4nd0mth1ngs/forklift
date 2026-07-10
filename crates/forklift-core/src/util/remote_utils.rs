@@ -942,9 +942,18 @@ fn collect_changed_closure(tree_hash: &str,
                            seen_trees: &mut HashSet<String>,
                            seen_blobs: &mut HashSet<String>,
                            candidates: &mut Vec<String>) -> Result<(), String> {
+    // Record the visit before checking base-explained, not after: content-addressing means the
+    // same subtree hash can recur at another path in the same walk (e.g. a merge adopting one
+    // side's out-of-scope subtree under two names), and that recurrence must be recognized even
+    // when the FIRST visit returned early because a parent explained it. Skipping it there is
+    // still complete — same hash means same content, and a base-explained tree's own closure is
+    // already covered (its parent is remote-known or was walked earlier in this same session) —
+    // the identical induction this function's ancestry guarantee already relies on.
+    let first_visit = seen_trees.insert(tree_hash.to_string());
+
     // Explained by some parent at this path (or already walked): the remote has it, so it needs
     // neither upload nor descent — and, critically, its object is never loaded.
-    if base_tree_hashes.iter().any(|hash| hash == tree_hash) || !seen_trees.insert(tree_hash.to_string()) {
+    if base_tree_hashes.iter().any(|hash| hash == tree_hash) || !first_visit {
         return Ok(());
     }
 
@@ -1798,5 +1807,44 @@ mod tests {
 
         assert!(multi.len() < single.len(),
             "the multi-parent base prunes strictly more here: {} vs {}", multi.len(), single.len());
+    }
+
+    /// A base-explained tree must be recorded as seen even though it returns early — otherwise
+    /// the identical (content-deduplicated) hash reappearing at a second path, where no base
+    /// explains it there, gets redundantly loaded and walked. Two paths reference the SAME
+    /// subtree hash; the first is base-explained (skipped), the second is not. Deleting the
+    /// object from the store before the walk proves it is never loaded at the second path either
+    /// — the walk must recognize the hash as already seen, not attempt to load and descend it.
+    #[test]
+    fn a_base_explained_tree_is_marked_seen_so_a_second_path_does_not_reload_it() {
+        use crate::enums::dir_entry_type::DirEntryType::{Normal, Tree};
+
+        let _scratch = Scratch::new("closure-dedup-seen");
+
+        let shared_file = store_blob("shared content");
+        let shared = store_tree(&[("f.txt", &shared_file, Normal)]);
+
+        // The base has `shared` at "one" only. The new tree references the SAME `shared` hash at
+        // both "one" (base-explained there) and "two" (no base entry there at all).
+        let base_root = store_tree(&[("one", &shared, Tree)]);
+        let new_root = store_tree(&[("one", &shared, Tree), ("two", &shared, Tree)]);
+
+        // Prove the object is never loaded on the "two" path: delete it from the store up front
+        // and confirm the walk still succeeds and never collects it — a load on the "two" path
+        // would fail (and the walk would error) because the object is gone.
+        let (folder, file_name) = crate::util::file_utils::get_path_for_object(&shared).unwrap();
+        std::fs::remove_file(PathBuf::from(folder).join(file_name))
+            .expect("the shared tree object must exist to delete");
+
+        let mut seen_trees = HashSet::new();
+        let mut seen_blobs = HashSet::new();
+        let mut candidates = Vec::new();
+        collect_changed_closure(&new_root, &[base_root], &mut seen_trees, &mut seen_blobs, &mut candidates)
+            .expect("the second path must be recognized as already-seen, not re-loaded");
+
+        assert!(!candidates.contains(&shared),
+            "the base-explained subtree must not be re-collected at the second path");
+        assert!(seen_trees.contains(&shared),
+            "the base-explained subtree must be marked seen so a second path skips it too");
     }
 }
