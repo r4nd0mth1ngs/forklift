@@ -126,6 +126,14 @@ fn current_head(warehouse: &Path) -> Option<String> {
 /// against. Each call fully completes and folds into the real history — that's fine, it's the same
 /// warehouse the kill loop continues from, just with a known head established before it starts.
 fn calibrate_stack_duration(area: &Area, file: &Path, base_line: &str, label: &str, samples: usize) -> Duration {
+    // The caller may be re-entering right after a kill spread whose last kill landed mid-write and
+    // left `.forklift/lock` behind (SIGKILL runs no destructor) — `run_kill_spread` only clears the
+    // stale lock at the *start* of its own next iteration, so a caller that jumps straight from a
+    // spread into recalibration (the attempt-1-landed-nothing retry) would otherwise hit a locked
+    // warehouse on the very first `load`/`stack` below. Clear it here too, same as `run_kill_spread`
+    // does, so calibration never fails on a lock left behind by the run it's re-measuring after.
+    area.clear_stale_lock();
+
     let mut slowest = Duration::ZERO;
     for i in 0..samples {
         rewrite_corpus(file, base_line, &format!("{label} {i}"));
@@ -143,11 +151,16 @@ fn calibrate_stack_duration(area: &Area, file: &Path, base_line: &str, label: &s
     slowest
 }
 
-/// Derive `count` kill delays spread across `[low_frac, high_frac]` of one measured, uninterrupted
-/// `stack` duration, so the spread scales with how slow *this* machine actually is instead of
-/// assuming a fixed millisecond budget. Consecutive delays are never closer than `MIN_STEP_MS`
-/// apart: Windows' ~15ms timer-tick granularity quantizes finer sleeps away, which would collapse
-/// several nominally-distinct delays onto the same wall-clock kill point.
+/// Derive `count` kill delays spread across at least `[low_frac, high_frac]` of one measured,
+/// uninterrupted `stack` duration, so the spread scales with how slow *this* machine actually is
+/// instead of assuming a fixed millisecond budget. The fractions set a *floor* for the spread, not
+/// an exact bound: consecutive delays are never closer than `MIN_STEP_MS` apart (Windows' ~15ms
+/// timer-tick granularity quantizes finer sleeps away, which would collapse several
+/// nominally-distinct delays onto the same wall-clock kill point), and on a fast measurement that
+/// floor dominates the requested step, stretching the top of the spread well past `high_frac`. That
+/// overshoot is desirable, not a bug to tighten: a fast machine gets extra post-completion coverage
+/// at negligible cost, and the guard needs some kills to land after completion regardless of how
+/// small the measured duration was.
 fn kill_delay_spread(measured: Duration, count: usize, low_frac: f64, high_frac: f64) -> Vec<Duration> {
     const MIN_STEP_MS: u64 = 15;
     assert!(count >= 2);
