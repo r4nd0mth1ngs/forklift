@@ -10,9 +10,10 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use crate::model::remote::{
-    ErrorResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
-    ResolveRequest, ResolveResponse, TrustAnchorDto, WarehouseInfo, MAX_MISSING_BATCH,
-    PROTOCOL_VERSION,
+    CommitLiftRequest, ErrorResponse, MissingObjectsRequest, MissingObjectsResponse,
+    RefUpdateRequest, ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest,
+    UploadTargetsResponse, WarehouseInfo, LIFT_SESSION_BLOB_NOT_READY, MAX_MISSING_BATCH,
+    MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
 };
 use crate::util::office_utils::OFFICE_PALLET_NAME;
 use crate::util::{
@@ -26,6 +27,50 @@ pub const CONCURRENT_TRANSFERS: usize = 24;
 /// How many objects one batch-fetch request asks for: bounds the response the server
 /// builds in memory while still amortizing the round trip over many objects.
 const BATCH_FETCH_CHUNK: usize = 512;
+
+/// How many times a staged lift retries its session commit while the staging verifier catches
+/// up, and the backoff between attempts. A storage-backed head promotes a blob within seconds
+/// of its staging `PUT` in the hosted deployment; the schedule (~0.2s doubling to a 3s cap)
+/// spans about 24s of sleep (0.2+0.4+0.8+1.6+3×7), so a slow verifier still commits, while a
+/// genuinely stuck one surfaces as an error rather than hanging the lift forever. Only the transient
+/// blob-not-ready case is retried — a corrupt or missing object fails at once.
+const MAX_COMMIT_ATTEMPTS: usize = 12;
+const COMMIT_BACKOFF_START: std::time::Duration = std::time::Duration::from_millis(200);
+const COMMIT_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The outcome of one lift-session commit attempt.
+enum CommitOutcome {
+    /// The session's objects are verified and promoted; the ref update may proceed.
+    Committed,
+
+    /// A blob is still being promoted out of band by the staging verifier — retry with backoff.
+    BlobNotReady,
+}
+
+/// Whether a status means the remote does not implement an endpoint at all (an older build):
+/// a `404` (no such route) or `405` (the path exists for other methods only). The caller falls
+/// back to the legacy path. Any other non-success status is a real error, not an absence.
+fn endpoint_absent(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+}
+
+/// Whether a failed commit response is the one *transient* case — a blob the staging verifier
+/// has not promoted yet — versus a terminal one (a corrupt staged object, a control-plane
+/// object never uploaded, an over-cap request). The retriable signal is the shared
+/// [`LIFT_SESSION_BLOB_NOT_READY`] marker the head embeds, matched on a `422`; keeping the
+/// decision here (pure) is what makes it unit-testable and keeps the retry policy in one place.
+fn is_transient_commit_failure(status: reqwest::StatusCode, message: &str) -> bool {
+    status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        && message.contains(LIFT_SESSION_BLOB_NOT_READY)
+}
+
+/// A fresh client-side lift session id — a random v4 UUID (the same in-tree generator that
+/// mints pseudonymous operator ids, so no new dependency). It scopes one pallet lift's staging
+/// keys (`staging/{session}/{hash}`) on a storage-backed head and is a safe single path
+/// component; a direct head ignores it.
+fn new_lift_session() -> String {
+    config_utils::mint_uuid_v4()
+}
 
 /// What a fetch pass actually transferred (objects already present are skipped).
 #[derive(Default)]
@@ -259,7 +304,10 @@ impl RemoteClient {
             .map_err(|e| format!("Error while reading object {}: {}", hash, e))
     }
 
-    /// Upload one object's raw bytes.
+    /// Upload one object's raw bytes to the control plane (`PUT /v1/objects/{hash}`), where the
+    /// remote verifies the hash inline before the object becomes fetchable. This is the direct
+    /// path — for the objects `upload-targets` returns in `direct`, and the whole missing set on
+    /// the legacy fallback.
     pub async fn upload_object(&self, hash: &str, bytes: Vec<u8>) -> Result<(), String> {
         let response = self.request(reqwest::Method::PUT, &format!("/v1/objects/{}", hash))
             .body(bytes)
@@ -272,6 +320,110 @@ impl RemoteClient {
         }
 
         Ok(())
+    }
+
+    /// Negotiate where to upload the given objects (`POST /v1/objects/upload-targets`, batched
+    /// at the protocol cap). `Ok(None)` when the remote predates the endpoint (a `404`/`405`) —
+    /// the caller falls back to `missing` + a per-object control-plane `PUT`.
+    ///
+    /// A storage-backed head answers `targets` (presigned staging `PUT` URLs) for what it wants
+    /// staged and `direct` for what it verifies inline; a direct head answers every missing hash
+    /// in `direct` with empty `targets`, so one client code path serves both heads. `present`
+    /// (the complement of `missing`) is skipped.
+    pub async fn upload_targets(&self,
+                                session: &str,
+                                hashes: &[String]) -> Result<Option<UploadTargetsResponse>, String> {
+        let mut merged = UploadTargetsResponse {
+            present: Vec::new(),
+            targets: BTreeMap::new(),
+            direct: Vec::new(),
+        };
+
+        for batch in hashes.chunks(MAX_UPLOAD_TARGETS_BATCH) {
+            let response = self.request(reqwest::Method::POST, "/v1/objects/upload-targets")
+                .json(&UploadTargetsRequest { session: session.to_string(), hashes: batch.to_vec() })
+                .send()
+                .await
+                .map_err(|e| format!("Error while negotiating upload targets: {}", e))?;
+
+            if endpoint_absent(response.status()) {
+                return Ok(None);
+            }
+
+            if !response.status().is_success() {
+                return Err(Self::error_of(response, "the upload negotiation").await);
+            }
+
+            let body: UploadTargetsResponse = response.json()
+                .await
+                .map_err(|e| format!("The remote's upload-targets response is not valid JSON: {}", e))?;
+
+            merged.present.extend(body.present);
+            merged.targets.extend(body.targets);
+            merged.direct.extend(body.direct);
+        }
+
+        Ok(Some(merged))
+    }
+
+    /// Upload one object's bytes straight to a presigned storage URL (a staging `PUT`). The
+    /// URL's own signature is the authorization, so this deliberately carries **no** bearer
+    /// token — and because the bearer is attached per request (in `request`, never as a client
+    /// default header), a plain `self.http.put(url)` cannot leak it to the storage host, even
+    /// were the storage host the remote itself.
+    async fn put_presigned(&self, url: &str, bytes: Vec<u8>) -> Result<(), String> {
+        let response = self.http.put(url)
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|e| format!("Error while uploading to a staging URL: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!(
+                "A staged upload was refused by object storage ({}).",
+                response.status().as_u16()
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// One `POST /v1/lift/{session}/commit` attempt: ask a storage-backed head to verify and
+    /// promote the session's staged control-plane objects and presence-check its blobs, before
+    /// the ref update. `Ok(Committed)` when the session is ready; `Ok(BlobNotReady)` for the one
+    /// transient case — a blob the staging verifier has not promoted yet, which the caller
+    /// retries with backoff; `Err` for a terminal failure (a corrupt staged object, a
+    /// control-plane object never uploaded, or a transport error).
+    async fn commit_lift(&self,
+                         session: &str,
+                         control_plane: &[String],
+                         blobs: &[String]) -> Result<CommitOutcome, String> {
+        let body = CommitLiftRequest {
+            control_plane: control_plane.to_vec(),
+            blobs: blobs.to_vec(),
+        };
+
+        let response = self.request(reqwest::Method::POST, &format!("/v1/lift/{}/commit", session))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Error while committing the lift session: {}", e))?;
+
+        if response.status().is_success() {
+            return Ok(CommitOutcome::Committed);
+        }
+
+        let status = response.status();
+        let message = match response.json::<ErrorResponse>().await {
+            Ok(body) => body.error,
+            Err(_) => status.canonical_reason().unwrap_or("unknown error").to_string(),
+        };
+
+        if is_transient_commit_failure(status, &message) {
+            return Ok(CommitOutcome::BlobNotReady);
+        }
+
+        Err(format!("The remote refused the lift commit ({}): {}", status.as_u16(), message))
     }
 
     /// Fetch a parcel's signature sidecar (`None` for unsigned parcels).
@@ -736,9 +888,18 @@ async fn lift_pallet_inner(client: &RemoteClient,
                                 &mut seen_trees, &mut seen_blobs, &mut candidates)?;
     }
 
-    let missing = client.missing_objects(&candidates).await?;
+    // Control-plane objects — parcels and trees — are promoted synchronously when a storage-
+    // backed head commits the session; working blobs are promoted out of band by the staging
+    // verifier and only presence-checked. Classify from the sets the closure walk already built
+    // (`new_parcels` and `seen_trees`), rather than re-deriving each object's type on the wire.
+    let mut control_plane: HashSet<String> = new_parcels.iter().cloned().collect();
+    control_plane.extend(seen_trees.iter().cloned());
 
-    upload_objects(client, &missing).await?;
+    // One flow serves both heads: negotiate upload targets, PUT the missing objects straight to
+    // presigned staging URLs and/or to the control plane, and commit the staged session. Falls
+    // back to `missing` + per-object `PUT` against a remote that predates `upload-targets`.
+    let session = new_lift_session();
+    let uploaded_objects = negotiate_and_upload(client, &session, &candidates, &control_plane).await?;
 
     // The signatures of the new parcels travel with them.
     let mut uploaded_signatures = 0usize;
@@ -754,7 +915,7 @@ async fn lift_pallet_inner(client: &RemoteClient,
 
     Ok(LiftResult::Lifted(LiftStats {
         new_parcels: new_parcels.len(),
-        uploaded_objects: missing.len(),
+        uploaded_objects,
         uploaded_signatures,
         old_head: remote_head.map(|hash| hash.to_string()),
     }))
@@ -838,6 +999,112 @@ async fn upload_objects(client: &RemoteClient, hashes: &[String]) -> Result<(), 
     }
 
     join_all(tasks).await
+}
+
+/// The one upload flow that serves both a storage-backed (staging) head and a direct head.
+/// Negotiates targets, uploads the missing objects — straight to presigned staging URLs and/or
+/// to the control plane — commits the staged session when there is one, and returns how many
+/// objects it uploaded (for [`LiftStats`], staged and direct alike). Falls back to the legacy
+/// `missing` + per-object `PUT` against a remote that predates `upload-targets`.
+///
+/// `control_plane` names the hashes that are parcels or trees — small objects the commit
+/// verifies and promotes synchronously; every other staged hash is a working blob, promoted out
+/// of band by the staging verifier and only presence-checked at commit.
+async fn negotiate_and_upload(client: &RemoteClient,
+                              session: &str,
+                              candidates: &[String],
+                              control_plane: &HashSet<String>) -> Result<usize, String> {
+    let Some(negotiation) = client.upload_targets(session, candidates).await? else {
+        // An older remote with no `upload-targets`: negotiate the missing set and PUT each body
+        // to the control plane, exactly as before.
+        let missing = client.missing_objects(candidates).await?;
+        upload_objects(client, &missing).await?;
+        return Ok(missing.len());
+    };
+
+    // `present` is already on the remote (skip). `direct` goes to the control plane for inline
+    // verification; `targets` go straight to storage under the session's staging prefix.
+    upload_objects(client, &negotiation.direct).await?;
+    upload_to_targets(client, &negotiation.targets).await?;
+
+    // Only a staging head hands back targets; a direct head's are empty and it needs no commit
+    // (every `direct` PUT was verified inline). When there was staging, the commit verifies and
+    // promotes it before the ref update — nothing staged is fetchable until then.
+    if !negotiation.targets.is_empty() {
+        let (control, blobs) = classify_staged(&negotiation.targets, control_plane);
+        commit_staged_session(client, session, &control, &blobs).await?;
+    }
+
+    Ok(negotiation.direct.len() + negotiation.targets.len())
+}
+
+/// Split the staged hashes into the control-plane objects (parcels and trees — promoted
+/// synchronously at commit) and the working blobs (promoted out of band, presence-checked).
+/// Pure, so the split is unit-testable without a remote.
+fn classify_staged(targets: &BTreeMap<String, String>,
+                   control_plane: &HashSet<String>) -> (Vec<String>, Vec<String>) {
+    targets.keys()
+        .cloned()
+        .partition(|hash| control_plane.contains(hash))
+}
+
+/// Upload (concurrently) the staged objects to their presigned storage URLs — the same bounded
+/// fan-out the fetch and direct-upload paths use ([`CONCURRENT_TRANSFERS`]).
+async fn upload_to_targets(client: &RemoteClient,
+                           targets: &BTreeMap<String, String>) -> Result<(), String> {
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let semaphore = Arc::new(Semaphore::new(CONCURRENT_TRANSFERS));
+    let mut tasks: JoinSet<Result<(), String>> = JoinSet::new();
+
+    for (hash, url) in targets {
+        let client = client.clone();
+        let hash = hash.clone();
+        let url = url.clone();
+        let semaphore = Arc::clone(&semaphore);
+
+        tasks.spawn(async move {
+            let _permit = semaphore.acquire().await
+                .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
+
+            let bytes = file_utils::retrieve_object_by_hash(&hash)?;
+
+            client.put_presigned(&url, bytes).await
+        });
+    }
+
+    join_all(tasks).await
+}
+
+/// Commit a staged lift session, retrying with bounded backoff while a blob is still being
+/// promoted out of band by the staging verifier (the one transient failure — every other
+/// commit failure surfaces at once). Gives up with a clear, safe-to-retry error rather than
+/// hanging on a stuck verifier.
+async fn commit_staged_session(client: &RemoteClient,
+                               session: &str,
+                               control_plane: &[String],
+                               blobs: &[String]) -> Result<(), String> {
+    let mut delay = COMMIT_BACKOFF_START;
+
+    for attempt in 1..=MAX_COMMIT_ATTEMPTS {
+        match client.commit_lift(session, control_plane, blobs).await? {
+            CommitOutcome::Committed => return Ok(()),
+            CommitOutcome::BlobNotReady => {}
+        }
+
+        if attempt < MAX_COMMIT_ATTEMPTS {
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(COMMIT_BACKOFF_CAP);
+        }
+    }
+
+    Err(format!(
+        "The remote's staging verifier has not finished promoting this lift's blobs after {} \
+        attempts. The upload is safe — retry the lift once the remote has caught up.",
+        MAX_COMMIT_ATTEMPTS
+    ))
 }
 
 /// Await every task of a set, surfacing the first failure.
@@ -1315,5 +1582,116 @@ mod tests {
         // `unrelated` (checked first) is not an ancestry match; `child` (checked second)
         // is — the loop must not stop at the first miss.
         assert!(is_known_complete(&root, &[unrelated, child]).unwrap());
+    }
+
+    /// The classification split the staged-lift commit relies on: parcels and trees go to the
+    /// control plane (promoted synchronously), everything else is a blob (presence-checked).
+    #[test]
+    fn staged_objects_split_into_control_plane_and_blobs() {
+        let parcel = "a".repeat(64);
+        let tree = "b".repeat(64);
+        let blob_one = "c".repeat(64);
+        let blob_two = "d".repeat(64);
+
+        let control_plane: HashSet<String> =
+            [parcel.clone(), tree.clone()].into_iter().collect();
+
+        let mut targets = BTreeMap::new();
+        for hash in [&parcel, &tree, &blob_one, &blob_two] {
+            targets.insert(hash.clone(), format!("https://storage/staging/s/{}", hash));
+        }
+
+        let (mut control, mut blobs) = classify_staged(&targets, &control_plane);
+        control.sort();
+        blobs.sort();
+
+        assert_eq!(control, vec![parcel.clone(), tree.clone()]);
+        assert_eq!(blobs, vec![blob_one, blob_two]);
+    }
+
+    /// A staged set of only control-plane objects (a metadata-only lift with no file content)
+    /// yields no blobs, so the commit promotes everything synchronously and never waits on the
+    /// out-of-band verifier.
+    #[test]
+    fn a_control_plane_only_stage_has_no_blobs() {
+        let parcel = "a".repeat(64);
+        let tree = "b".repeat(64);
+        let control_plane: HashSet<String> =
+            [parcel.clone(), tree.clone()].into_iter().collect();
+
+        let mut targets = BTreeMap::new();
+        targets.insert(parcel.clone(), "u1".to_string());
+        targets.insert(tree.clone(), "u2".to_string());
+
+        let (control, blobs) = classify_staged(&targets, &control_plane);
+        assert_eq!(control.len(), 2);
+        assert!(blobs.is_empty());
+    }
+
+    /// The fallback decision: only a `404`/`405` means the remote lacks the endpoint; every
+    /// other non-success status is a real error the caller must surface, not silently fall back
+    /// on (falling back on, say, a `500` would mask it).
+    #[test]
+    fn only_404_and_405_trigger_the_legacy_fallback() {
+        assert!(endpoint_absent(reqwest::StatusCode::NOT_FOUND));
+        assert!(endpoint_absent(reqwest::StatusCode::METHOD_NOT_ALLOWED));
+
+        for status in [
+            reqwest::StatusCode::OK,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::CONFLICT,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(!endpoint_absent(status), "{} must not fall back", status);
+        }
+    }
+
+    /// The commit-retry decision: only a `422` carrying the shared blob-not-ready marker is
+    /// transient. A control-plane object never uploaded, a corrupt staged object, and any
+    /// non-`422` are all terminal — retrying them would just waste the backoff budget.
+    #[test]
+    fn only_the_blob_not_ready_marker_is_retried() {
+        let unprocessable = reqwest::StatusCode::UNPROCESSABLE_ENTITY;
+
+        // The exact message a staging head builds for a blob still in staging (mirrors head.rs).
+        let not_ready = format!(
+            "Blob {} is {}; the lift session is not ready to commit.",
+            "a".repeat(64), LIFT_SESSION_BLOB_NOT_READY
+        );
+        assert!(is_transient_commit_failure(unprocessable, &not_ready));
+
+        // Terminal 422s: a missing control-plane object and a corrupt staged object.
+        assert!(!is_transient_commit_failure(
+            unprocessable,
+            "Object x was not uploaded; the lift session is not ready to commit."
+        ));
+        assert!(!is_transient_commit_failure(
+            unprocessable,
+            "Staged object x is corrupt (it hashes to y); it was discarded, not promoted."
+        ));
+
+        // The marker on a non-422 status is not transient either (only a 422 carries it).
+        assert!(!is_transient_commit_failure(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR, &not_ready
+        ));
+    }
+
+    /// A lift session id is a distinct, hyphenated uuid-shaped string — a safe single path
+    /// component for a `staging/{session}/{hash}` key.
+    #[test]
+    fn lift_session_ids_are_unique_and_path_safe() {
+        let one = new_lift_session();
+        let two = new_lift_session();
+
+        assert_ne!(one, two);
+        assert_eq!(one.len(), 36);
+        assert_eq!(one.matches('-').count(), 4);
+        assert!(
+            one.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+            "a session id must be a safe path component: {}", one
+        );
     }
 }

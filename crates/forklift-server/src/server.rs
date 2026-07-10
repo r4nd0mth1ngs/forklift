@@ -30,8 +30,8 @@ use forklift_core::model::hooks::{
 };
 use forklift_core::model::remote::{
     ErrorResponse, MissingObjectsRequest, MissingObjectsResponse, RefUpdateRequest,
-    ResolveRequest, ResolveResponse, TrustAnchorDto, WarehouseInfo, MAX_MISSING_BATCH,
-    PROTOCOL_VERSION,
+    ResolveRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, UploadTargetsResponse,
+    WarehouseInfo, MAX_MISSING_BATCH, MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::lock_utils::ServeLock;
@@ -309,6 +309,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
     let protocol = Router::new()
         .route("/warehouse", get(get_warehouse))
         .route("/objects/missing", post(post_missing))
+        .route("/objects/upload-targets", post(post_upload_targets))
         .route("/objects/batch", post(post_objects_batch))
         .route("/objects/{hash}", get(get_object).put(put_object))
         .route("/signatures/{hash}", get(get_signature).put(put_signature))
@@ -943,6 +944,64 @@ async fn post_missing(State(state): State<Arc<AppState>>,
         }
 
         Ok(MissingObjectsResponse { missing })
+    }).await;
+
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err(error) => error_response(error),
+    }
+}
+
+/// `POST /v1/objects/upload-targets` — the body-less upload negotiation. The direct head
+/// serves object bytes itself and verifies every `PUT` inline, so it has no staging prefix and
+/// no presigned targets: it answers with what it already has (`present`) and every missing hash
+/// in `direct` (upload those to `/v1/objects/{hash}` for inline verification), with `targets`
+/// empty. That is exactly what lets one client code path serve both this head and a storage-
+/// backed one (`REMOTE_PROTOCOL.md`), and it subsumes `missing` on the upload path.
+async fn post_upload_targets(State(state): State<Arc<AppState>>,
+                             headers: HeaderMap,
+                             Path(params): Path<PathParams>,
+                             Json(request): Json<UploadTargetsRequest>) -> Response {
+    if let Err(error) = check_auth(&state, &headers).await {
+        return error_response(error);
+    }
+
+    let warehouse = match resolve_warehouse(&state, &params) {
+        Ok(warehouse) => warehouse,
+        Err(error) => return error_response(error),
+    };
+
+    if request.hashes.len() > MAX_UPLOAD_TARGETS_BATCH {
+        return error_response(unprocessable(format!(
+            "At most {} hashes per upload-targets request; batch larger sets.",
+            MAX_UPLOAD_TARGETS_BATCH
+        )));
+    }
+
+    let result = blocking(warehouse, move || {
+        let mut response = UploadTargetsResponse {
+            present: Vec::new(),
+            targets: std::collections::BTreeMap::new(),
+            direct: Vec::new(),
+        };
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for hash in request.hashes {
+            if !seen.insert(hash.clone()) {
+                continue;
+            }
+
+            if file_utils::does_object_exist(&hash).map_err(unprocessable)? {
+                response.present.push(hash);
+            } else {
+                // No staging prefix here — the client PUTs the body and the head verifies it
+                // inline (invariant 1 is upheld by the inline hash check, not a staging copy).
+                response.direct.push(hash);
+            }
+        }
+
+        Ok(response)
     }).await;
 
     match result {

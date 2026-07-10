@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aws_sdk_dynamodb::types::{
@@ -941,4 +942,199 @@ fn prepare(area: &Area, dir: &str) {
     area.forklift(dir, &["prepare"]);
     area.forklift(dir, &["config", "--global", "operator.name", "AWS Integration Tester"]);
     area.forklift(dir, &["config", "--global", "operator.identifier", "tester@forklift"]);
+}
+
+// ---------------------------------------------------------------------------------------
+// The money test: the REAL CLI drives the whole presigned staging flow end to end over the
+// real S3 + DynamoDB, proving the founding-bet loop (lift → lower) closes byte-for-byte.
+// ---------------------------------------------------------------------------------------
+
+/// A local HTTP head that serves `entrypoint::handle` over the real S3 + DynamoDB stores, plus
+/// a background "staging verifier" that promotes whatever lands under the `staging/` prefix.
+///
+/// The verifier stands in for the S3-object-created Lambda that does verify-and-promote in the
+/// hosted deployment (that trait operation is already proven over real S3 by
+/// `s3_verify_and_promote_gates_the_canonical_namespace`); here it lets the CLI's staging lift
+/// complete — the control plane promotes the small control-plane objects synchronously at
+/// commit, this poller promotes the working blobs, and the client's bounded commit retry
+/// bridges the timing.
+struct StagingHead {
+    url: String,
+    server: tokio::task::JoinHandle<()>,
+    verifier: tokio::task::JoinHandle<()>,
+}
+
+impl StagingHead {
+    async fn start(config: &AwsConfig, bridge: AsyncBridge) -> StagingHead {
+        let (s3, dynamodb) = build_clients(config).await.expect("build clients for the shim");
+
+        let state = Arc::new(ShimState {
+            s3: s3.clone(),
+            dynamodb,
+            bridge: bridge.clone(),
+            config: config.clone(),
+        });
+
+        let app = axum::Router::new().fallback(shim_handler).with_state(state);
+
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind the shim listener");
+        let addr = listener.local_addr().expect("the shim's bound address");
+
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let verifier = tokio::spawn(run_staging_verifier(s3, config.clone(), bridge));
+
+        StagingHead { url: format!("http://{}", addr), server, verifier }
+    }
+}
+
+impl Drop for StagingHead {
+    fn drop(&mut self) {
+        self.server.abort();
+        self.verifier.abort();
+    }
+}
+
+/// The shim's shared state: the clients the per-request [`Head`] is built from.
+struct ShimState {
+    s3: aws_sdk_s3::Client,
+    dynamodb: aws_sdk_dynamodb::Client,
+    bridge: AsyncBridge,
+    config: AwsConfig,
+}
+
+/// One request: buffer it into the `http::Request` the pure router speaks, run `handle` on a
+/// blocking thread (every `Head` method blocks on its store's futures — R4), convert back.
+/// Headers are dropped on purpose: `handle`'s authentication is an open passthrough, so only
+/// the method, path/query and body matter.
+async fn shim_handler(
+    axum::extract::State(state): axum::extract::State<Arc<ShimState>>,
+    method: http::Method,
+    uri: http::Uri,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    let request =
+        http::Request::builder().method(method).uri(uri).body(body.to_vec()).expect("a request");
+
+    let routing = Routing::Single(state.config.warehouse_id.clone());
+    let s3 = state.s3.clone();
+    let dynamodb = state.dynamodb.clone();
+    let bridge = state.bridge.clone();
+    let config = state.config.clone();
+
+    let response = tokio::task::spawn_blocking(move || {
+        handle(
+            &routing,
+            move |warehouse_id| {
+                let objects = S3ObjectStore::new(s3, config.bucket.clone(), bridge.clone());
+                let refs = DynamoRefStore::new(
+                    dynamodb,
+                    config.table.clone(),
+                    warehouse_id.to_string(),
+                    config.default_pallet.clone(),
+                    bridge,
+                );
+                Ok(Head::pooled(objects, refs, warehouse_id.to_string()))
+            },
+            request,
+        )
+    })
+    .await
+    .expect("the shim routing task");
+
+    let (parts, bytes) = response.into_parts();
+    http::Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
+/// The stand-in staging verifier: promote every object sitting under the `staging/` prefix,
+/// exactly as the S3-event Lambda would. Idempotent and race-safe (a control-plane object the
+/// commit also promotes just reads `AlreadyPresent`; a swept key reads `Missing`), so running
+/// it continuously is harmless.
+async fn run_staging_verifier(s3: aws_sdk_s3::Client, config: AwsConfig, bridge: AsyncBridge) {
+    loop {
+        if let Ok(listed) =
+            s3.list_objects_v2().bucket(&config.bucket).prefix("staging/").send().await
+        {
+            for object in listed.contents() {
+                let Some(key) = object.key() else { continue };
+
+                // key == "staging/{session}/{hash}"
+                let parts: Vec<&str> = key.splitn(3, '/').collect();
+                if parts.len() != 3 || parts[0] != "staging" {
+                    continue;
+                }
+
+                let session = parts[1].to_string();
+                let hash = parts[2].to_string();
+                let s3 = s3.clone();
+                let bucket = config.bucket.clone();
+                let bridge = bridge.clone();
+
+                let _ = tokio::task::spawn_blocking(move || {
+                    let objects = S3ObjectStore::new(s3, bucket, bridge);
+                    let _ = objects.verify_and_promote(&session, &hash);
+                })
+                .await;
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The founding-bet loop, end to end through the real CLI: a warehouse the CLI built and lifted
+/// through the presigned staging flow (`upload-targets` → presigned staging `PUT`s →
+/// `commit_lift` → the DynamoDB ref CAS), franchised back down through the same head, and its
+/// content is byte-identical. Then a second round proves incremental lift/lower over staging.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cli_lifts_and_lowers_through_the_staging_flow_over_s3_and_dynamodb() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let head = StagingHead::start(&config, bridge).await;
+
+    // A real warehouse the CLI builds, points at the staging head, and lifts.
+    let area = Area::new("cli-staging");
+    prepare(&area, "wh");
+    area.write_file("wh/readme.txt", "hello staging\n");
+    area.write_file("wh/src/main.txt", "fn main\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+    area.forklift("wh", &["config", "remote.url", &head.url]);
+
+    // The money shot: lift through the staging flow (a failed staging PUT, commit, or ref update
+    // would make `forklift lift` exit non-zero, which `Area::forklift` turns into a panic).
+    area.forklift("wh", &["lift"]);
+
+    // Franchise a fresh copy back down through the same head; the content must be byte-identical.
+    area.forklift(".", &["franchise", &head.url, "clone"]);
+    assert_eq!(
+        std::fs::read_to_string(area.path("clone/readme.txt")).expect("clone readme"),
+        "hello staging\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(area.path("clone/src/main.txt")).expect("clone main"),
+        "fn main\n"
+    );
+
+    // Incremental: new work in `wh` lifts through staging and lowers into `clone`.
+    area.write_file("wh/readme.txt", "hello staging, twice\n");
+    area.forklift("wh", &["load", "readme.txt"]);
+    area.forklift("wh", &["stack", "second"]);
+    area.forklift("wh", &["lift"]);
+
+    area.forklift("clone", &["lower"]);
+    assert_eq!(
+        std::fs::read_to_string(area.path("clone/readme.txt")).expect("clone readme v2"),
+        "hello staging, twice\n"
+    );
 }

@@ -65,3 +65,8 @@ required-features = ["lambda"]
 # Following a `307` to a presigned S3 URL by hand in the LocalStack-gated end-to-end test —
 # the workspace's existing (ring-based) client, added only for tests.
 reqwest = { workspace = true }
+
+# A tiny in-test HTTP shim that serves `entrypoint::handle` over the real stores, so the real
+# `forklift` CLI can drive the whole staging lift end to end against LocalStack. The workspace's
+# existing axum (used by `forklift-server`), only for the LocalStack-gated integration test.
+axum = { workspace = true }

@@ -26,8 +26,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use forklift_core::model::remote::{
-    RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo, MAX_MISSING_BATCH,
-    PROTOCOL_VERSION,
+    RefUpdateRequest, TrustAnchorDto, UploadTargetsResponse, WarehouseInfo,
+    LIFT_SESSION_BLOB_NOT_READY, MAX_MISSING_BATCH, PROTOCOL_VERSION,
 };
 use forklift_core::util::office_utils::OFFICE_PALLET_NAME;
 use forklift_core::util::pallet_utils::{PalletNamespace, PalletRef};
@@ -576,10 +576,13 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
 
         for hash in blobs {
             if !self.objects.exists(hash).map_err(HeadError::internal)? {
+                // The one *transient* commit failure: the staging verifier has not promoted this
+                // blob to its canonical key yet. The message embeds `LIFT_SESSION_BLOB_NOT_READY`
+                // so the client can tell this retriable case apart from a terminal one (a
+                // control-plane object never uploaded, or a corrupt staged object) and back off.
                 return Err(HeadError::unprocessable(format!(
-                    "Blob {} is not yet verified and promoted; the lift session is not ready to \
-                    commit.",
-                    hash
+                    "Blob {} is {}; the lift session is not ready to commit.",
+                    hash, LIFT_SESSION_BLOB_NOT_READY
                 )));
             }
         }
