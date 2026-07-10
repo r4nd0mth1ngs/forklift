@@ -40,9 +40,9 @@ aws-smithy-types = "1"
 # them, and their default features are trimmed — the Runtime API is plaintext localhost, so no
 # TLS provider is pulled in and `aws-lc` stays out of the tree (the same `ring`-only stance the
 # store layer takes). Enable with `--features lambda` to build the deploy artifacts.
-lambda_http = { version = "0.14", default-features = false, features = ["apigw_http", "apigw_rest"], optional = true }
+lambda_http = { version = "0.17", default-features = false, features = ["apigw_http", "apigw_rest"], optional = true }
 lambda_runtime = { version = "0.14", default-features = false, optional = true }
-aws_lambda_events = { version = "0.16", default-features = false, features = ["s3"], optional = true }
+aws_lambda_events = { version = "0.18", default-features = false, features = ["s3"], optional = true }
 
 [features]
 # The two deploy binaries and the runtime crates they need. Off by default so the library and
