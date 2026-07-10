@@ -13,3 +13,18 @@ forklift-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+
+# The AWS SDK layer (milestone C): real S3 + DynamoDB implementations of the store seams.
+#
+# TLS is deliberately routed through a ring-based rustls connector, built explicitly in
+# `aws::config` and injected via `.http_client(...)`. The SDKs' own default connector
+# (`default-https-client`) pulls `rustls-aws-lc` → `aws-lc-sys`, a C/cmake build; `ring`
+# is already in the workspace tree (reqwest), needs no native toolchain, and is the crypto
+# provider forklift already trusts. So the service crates carry only `rt-tokio` (no default
+# features, no TLS feature) and the connector comes from `aws-smithy-http-client/rustls-ring`.
+aws-config = { version = "1.8", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.128", default-features = false, features = ["rt-tokio"] }
+aws-sdk-dynamodb = { version = "1.110", default-features = false, features = ["rt-tokio"] }
+aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-ring"] }
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+aws-smithy-types = "1"
