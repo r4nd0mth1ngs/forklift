@@ -212,6 +212,29 @@ fn http_status(server_url: &str, method: &str, path: &str, token: Option<&str>) 
     response.lines().next().unwrap_or_default().to_string()
 }
 
+/// POST a JSON body over raw HTTP and return `(status line, response body)`. Keeps the
+/// upload-targets contract test honest — it asserts the exact wire shape the one client flow
+/// depends on, without going through the client that consumes it.
+fn http_post_json(server_url: &str, path: &str, body: &str) -> (String, String) {
+    let address = server_url.strip_prefix("http://").unwrap();
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+
+    write!(
+        stream,
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+        Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path, address, body.len(), body
+    ).unwrap();
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+
+    let status = response.lines().next().unwrap_or_default().to_string();
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or_default().to_string();
+
+    (status, body)
+}
+
 fn assert_success(output: &Output) {
     assert!(
         output.status.success(),
@@ -297,6 +320,52 @@ fn lift_franchise_lower_round_trip() {
     let lowered_again = area.forklift("b", &["lower"]);
     assert_success(&lowered_again);
     assert!(stdout(&lowered_again).contains("Already up to date"), "{}", stdout(&lowered_again));
+}
+
+#[test]
+fn the_direct_head_answers_upload_targets_all_direct() {
+    // The direct head (`forklift-server`) has no staging prefix, so its `upload-targets`
+    // negotiation answers with `present` for what it holds and every missing hash in `direct`
+    // (empty `targets`) — the exact shape that lets ONE client code path serve both this head
+    // and a storage-backed one. The whole suite already lifts through this endpoint; this pins
+    // the wire contract directly.
+    let area = TestArea::new("upload-targets-direct");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "a", &server.url);
+    area.write_file("a/doc.txt", "content\n");
+    assert_success(&area.forklift("a", &["load", "."]));
+
+    let stacked = area.forklift("a", &["stack", "first"]);
+    assert_success(&stacked);
+    let head = stdout(&stacked)
+        .split_whitespace()
+        .find(|word| word.len() == 64)
+        .expect("the stack output carries the parcel hash")
+        .to_string();
+
+    let request = format!("{{\"session\":\"lift-x\",\"hashes\":[\"{}\"]}}", head);
+
+    // Before the lift the new head is missing: `direct`, never staged.
+    let (status, body) = http_post_json(&server.url, "/v1/objects/upload-targets", &request);
+    assert!(status.starts_with("HTTP/1.1 200"), "{} / {}", status, body);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["targets"], serde_json::json!({}), "a direct head stages nothing: {}", body);
+    assert!(
+        json["direct"].as_array().unwrap().iter().any(|h| h == &serde_json::json!(head)),
+        "the missing head must be offered as a direct upload: {}", body
+    );
+
+    // After the lift the same hash is `present`, nothing left to upload.
+    assert_success(&area.forklift("a", &["lift"]));
+    let (_, body) = http_post_json(&server.url, "/v1/objects/upload-targets", &request);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        json["present"].as_array().unwrap().iter().any(|h| h == &serde_json::json!(head)),
+        "after lifting the object is present: {}", body
+    );
+    assert!(json["direct"].as_array().unwrap().is_empty(), "nothing left to upload: {}", body);
+    assert_eq!(json["targets"], serde_json::json!({}), "{}", body);
 }
 
 #[test]

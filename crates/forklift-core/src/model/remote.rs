@@ -14,6 +14,26 @@ pub const PROTOCOL_VERSION: &str = "2026-07-05";
 /// clients batch larger sets.
 pub const MAX_MISSING_BATCH: usize = 10_000;
 
+/// The largest number of hashes accepted by one `POST /v1/objects/upload-targets` request —
+/// smaller than [`MAX_MISSING_BATCH`] because, unlike `missing`'s bare-hash answer, this
+/// endpoint answers with a presigned URL per requested hash. A `MAX_MISSING_BATCH`-sized
+/// request would answer with several megabytes of JSON (~500-byte presigned URLs × 10 000
+/// keys) — at or over a Lambda synchronous response's ~6 MB limit. 1 000 keeps a max-size
+/// response comfortably under 1 MB while staying well above what one lift session needs in
+/// practice. Clients batch larger sets, and both heads reject an over-cap request; the client
+/// (`remote_utils`), the storage-backed head (`forklift-aws-lambda`) and the direct head
+/// (`forklift-server`) all read this one number so they can never drift.
+pub const MAX_UPLOAD_TARGETS_BATCH: usize = 1_000;
+
+/// The stable, refactor-safe marker every storage-backed head embeds in the `422` it answers
+/// when a lift session's blob is still being verified and promoted out of band (the staging
+/// verifier has not caught up yet). It is the one *transient* commit failure — distinct from a
+/// control-plane object that was never uploaded, or a corrupt staged object, both of which are
+/// terminal — so the client keys its bounded commit retry on this phrase rather than the exact
+/// wording of the whole message. The head builds its message around this constant; the client
+/// (`remote_utils::commit_lift`) matches on it. Changing it changes both sides at once.
+pub const LIFT_SESSION_BLOB_NOT_READY: &str = "not yet verified and promoted";
+
 /// The `GET /v1/warehouse` handshake: protocol version, refs and trust in one round trip.
 #[derive(Serialize, Deserialize)]
 pub struct WarehouseInfo {

@@ -1221,6 +1221,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "aws_lambda_events",
+ "axum",
  "blake3",
  "forklift-core",
  "http 1.4.2",

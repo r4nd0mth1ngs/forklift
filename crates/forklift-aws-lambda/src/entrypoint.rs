@@ -41,6 +41,7 @@ use serde::Serialize;
 use forklift_core::model::remote::{
     CommitLiftRequest, ErrorResponse, MissingObjectsRequest, MissingObjectsResponse,
     RefUpdateRequest, ResolveResponse, TrustAnchorDto, UploadTargetsRequest, MAX_MISSING_BATCH,
+    MAX_UPLOAD_TARGETS_BATCH,
 };
 use forklift_core::util::pallet_utils::DEFAULT_PALLET_NAME;
 
@@ -260,15 +261,6 @@ fn match_endpoint(method: &Method, segments: &[&str], query: Option<&str>) -> Op
         _ => None,
     }
 }
-
-/// `POST /v1/objects/upload-targets`'s own response-size cap — smaller than the protocol's
-/// shared `MAX_MISSING_BATCH` (10 000). Unlike `missing`'s bare-hash response, this endpoint
-/// answers with a presigned URL per requested hash: a `MAX_MISSING_BATCH`-sized request would
-/// answer with several megabytes of JSON (~500-byte presigned URLs × 10 000 hash keys) — at or
-/// over a Lambda synchronous response's ~6 MB limit. 1 000 keeps a max-size response
-/// comfortably under 1 MB (1 000 × ~700 bytes per hash-key-plus-URL entry ≈ 700 KB) while
-/// staying well above what one lift session's negotiation needs in practice.
-const MAX_UPLOAD_TARGETS_BATCH: usize = 1000;
 
 /// The `422` for an `upload-targets` request over [`MAX_UPLOAD_TARGETS_BATCH`] — reads exactly
 /// like `Head::reject_oversized_batch`, just against the smaller, response-shaped ceiling this
