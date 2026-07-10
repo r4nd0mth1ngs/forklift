@@ -29,15 +29,17 @@ use aws_sdk_dynamodb::types::{
     AttributeDefinition, BillingMode, KeySchemaElement, KeyType, ScalarAttributeType, TableStatus,
 };
 
+use http::{Request, Response};
+
 use forklift_aws_lambda::aws::{build_clients, build_stores, AwsConfig};
 use forklift_aws_lambda::store::{
     CasOutcome, ObjectAccess, ObjectStore, PromoteOutcome, PutOutcome, PutTarget, RefStore,
     SignatureOutcome, TrustOutcome,
 };
-use forklift_aws_lambda::{AsyncBridge, Head};
+use forklift_aws_lambda::{handle, AsyncBridge, DynamoRefStore, Head, Routing, S3ObjectStore};
 
 use forklift_core::globals::StorageRootScope;
-use forklift_core::model::remote::{RefUpdateRequest, TrustAnchorDto};
+use forklift_core::model::remote::{CommitLiftRequest, RefUpdateRequest, TrustAnchorDto};
 use forklift_core::util::pallet_utils::{self, PalletNamespace};
 use forklift_core::util::{file_utils, object_utils, sign_utils};
 
@@ -593,6 +595,217 @@ async fn a_head_untrusted_lift_commits_over_s3_and_dynamodb() {
     })
     .await
     .expect("the blocking lift");
+}
+
+// ---------------------------------------------------------------------------------------
+// End to end through the HTTP edge: `handle` over the real stores, following a 307 by hand.
+// ---------------------------------------------------------------------------------------
+
+/// Route one request through `entrypoint::handle` over freshly-built S3 + DynamoDB stores, on a
+/// blocking thread (every `Head` method blocks on its store's futures — the R4 contract this
+/// suite is built around). The clients are cheap to clone, so a per-request store matches how
+/// the control-plane binary serves each invocation.
+async fn edge(
+    s3: aws_sdk_s3::Client,
+    dynamodb: aws_sdk_dynamodb::Client,
+    bridge: AsyncBridge,
+    config: AwsConfig,
+    request: Request<Vec<u8>>,
+) -> Response<Vec<u8>> {
+    let routing = Routing::Single(config.warehouse_id.clone());
+
+    tokio::task::spawn_blocking(move || {
+        handle(
+            &routing,
+            move |warehouse_id| {
+                let objects = S3ObjectStore::new(s3, config.bucket.clone(), bridge.clone());
+                let refs = DynamoRefStore::new(
+                    dynamodb,
+                    config.table.clone(),
+                    warehouse_id.to_string(),
+                    config.default_pallet.clone(),
+                    bridge,
+                );
+
+                Ok(Head::pooled(objects, refs, warehouse_id.to_string()))
+            },
+            request,
+        )
+    })
+    .await
+    .expect("the edge task")
+}
+
+/// The end-to-end proof the HTTP edge asks for: a client drives the control-plane router over
+/// real S3 + DynamoDB, and the `307`s it answers actually carry bytes. One object travels the
+/// whole presigned staging path — `PUT` answered `307`, bytes `PUT` straight to the presigned
+/// staging URL, `commit_lift` verifying and promoting it — and is then read back through the
+/// `307` a `GET` answers, byte-identical. The lift commits its ref over the DynamoDB CAS, and a
+/// stale replay conflicts.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_http_edge_drives_a_staged_lift_over_s3_and_dynamodb_following_307s() {
+    let Some(endpoint) = endpoint() else {
+        eprintln!("skipping: FORKLIFT_AWS_TEST_ENDPOINT is unset");
+        return;
+    };
+
+    let config = test_config(&endpoint);
+    provision(&config).await;
+
+    // A real warehouse to harvest valid objects and a valid head from.
+    let area = Area::new("edge-lift");
+    prepare(&area, "wh");
+    area.write_file("wh/readme.txt", "hello\n");
+    area.write_file("wh/src/main.txt", "fn main\n");
+    area.forklift("wh", &["load", "."]);
+    area.forklift("wh", &["stack", "first"]);
+
+    let harvest = harvest(&area.path("wh"));
+    let main_head = harvest.head_of("main").expect("main has a head");
+
+    let bridge = AsyncBridge::current().expect("a multi-thread runtime");
+    let (s3, dynamodb) = build_clients(&config).await.expect("clients");
+
+    // One object travels the whole staged way; the rest are seeded straight into the canonical
+    // namespace (the staging → promote path is proven for the one, and the closure needs all).
+    let staged_hash = harvest.objects.keys().next().expect("an object").clone();
+    let staged_bytes = harvest.objects[&staged_hash].clone();
+
+    // Handshake: a fresh warehouse.
+    let response =
+        edge(s3.clone(), dynamodb.clone(), bridge.clone(), config.clone(), get("/v1/warehouse")).await;
+    assert_eq!(response.status().as_u16(), 200);
+
+    // 1. `PUT` the staged object: the head answers `307` to a presigned *staging* URL.
+    let response = edge(
+        s3.clone(),
+        dynamodb.clone(),
+        bridge.clone(),
+        config.clone(),
+        put_body(&format!("/v1/objects/{}?session=lift-edge", staged_hash), b"ignored".to_vec()),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 307, "a staging head redirects the upload");
+    let staging_url = location(&response);
+    assert!(staging_url.contains(&format!("staging/lift-edge/{}", staged_hash)), "{}", staging_url);
+    assert!(!staging_url.contains("/objects/"), "an upload never targets the hash key");
+
+    // 2. Follow the redirect by hand: `PUT` the real bytes straight to storage.
+    let client = reqwest::Client::new();
+    let put =
+        client.put(&staging_url).body(staged_bytes.clone()).send().await.expect("presigned PUT");
+    assert!(put.status().is_success(), "the presigned staging PUT failed: {}", put.status());
+
+    // Not fetchable yet — nothing at the hash key until it is promoted (invariant 1).
+    let response = edge(
+        s3.clone(),
+        dynamodb.clone(),
+        bridge.clone(),
+        config.clone(),
+        get(&format!("/v1/objects/{}", staged_hash)),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 404, "a staged object is not fetchable before commit");
+
+    // 3. `commit_lift`: the head verifies and promotes the staged object to its canonical key.
+    let commit = CommitLiftRequest { control_plane: vec![staged_hash.clone()], blobs: vec![] };
+    let response = edge(
+        s3.clone(),
+        dynamodb.clone(),
+        bridge.clone(),
+        config.clone(),
+        post_body("/v1/lift/lift-edge/commit", &commit),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 200, "the clean commit promotes the staged object");
+
+    // Seed the rest of the closure straight into the canonical namespace.
+    {
+        let objects = S3ObjectStore::new(s3.clone(), config.bucket.clone(), bridge.clone());
+        let harvest_objects = harvest.objects.clone();
+        let harvest_signatures = harvest.signatures.clone();
+        let staged = staged_hash.clone();
+
+        tokio::task::spawn_blocking(move || {
+            for (hash, bytes) in &harvest_objects {
+                if *hash == staged {
+                    continue; // already promoted through the staging path
+                }
+                objects.put_verified(hash, bytes).expect("seed object");
+            }
+            for (hash, sidecar) in &harvest_signatures {
+                objects.put_signature(hash, sidecar).expect("seed signature");
+            }
+        })
+        .await
+        .expect("seeding");
+    }
+
+    // 4. The lift commits over the DynamoDB CAS.
+    let update = RefUpdateRequest { old_head: None, new_head: main_head.clone() };
+    let response = edge(
+        s3.clone(),
+        dynamodb.clone(),
+        bridge.clone(),
+        config.clone(),
+        post_body("/v1/pallets/main", &update),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 200, "the lift commits");
+
+    // The handshake reflects the committed head.
+    let response =
+        edge(s3.clone(), dynamodb.clone(), bridge.clone(), config.clone(), get("/v1/warehouse")).await;
+    let info: serde_json::Value = serde_json::from_slice(response.body()).expect("handshake json");
+    assert_eq!(info["pallets"]["main"], serde_json::Value::String(main_head.clone()));
+
+    // 5. Read the promoted object back through the `307` a GET answers, and follow it by hand:
+    // the bytes are exactly what the client staged.
+    let response = edge(
+        s3.clone(),
+        dynamodb.clone(),
+        bridge.clone(),
+        config.clone(),
+        get(&format!("/v1/objects/{}", staged_hash)),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 307, "a present object reads back as a redirect");
+    let canonical_url = location(&response);
+    assert!(canonical_url.contains(&format!("objects/{}", staged_hash)), "{}", canonical_url);
+    let fetched = client.get(&canonical_url).send().await.expect("presigned GET");
+    assert!(fetched.status().is_success(), "the presigned GET failed: {}", fetched.status());
+    let fetched = fetched.bytes().await.expect("read the object").to_vec();
+    assert_eq!(fetched, staged_bytes, "the object fetched through the redirect is byte-identical");
+
+    // 6. A stale replay conflicts.
+    let response = edge(s3, dynamodb, bridge, config, post_body("/v1/pallets/main", &update)).await;
+    assert_eq!(response.status().as_u16(), 409, "a stale replay conflicts");
+}
+
+/// A GET request with an empty body.
+fn get(uri: &str) -> Request<Vec<u8>> {
+    Request::builder().method("GET").uri(uri).body(Vec::new()).unwrap()
+}
+
+/// A PUT request with a raw body.
+fn put_body(uri: &str, body: Vec<u8>) -> Request<Vec<u8>> {
+    Request::builder().method("PUT").uri(uri).body(body).unwrap()
+}
+
+/// A POST request with a JSON body.
+fn post_body<T: serde::Serialize>(uri: &str, body: &T) -> Request<Vec<u8>> {
+    Request::builder().method("POST").uri(uri).body(serde_json::to_vec(body).unwrap()).unwrap()
+}
+
+/// The `Location` header of a redirect response.
+fn location(response: &Response<Vec<u8>>) -> String {
+    response
+        .headers()
+        .get(http::header::LOCATION)
+        .expect("a Location header")
+        .to_str()
+        .unwrap()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------------------
