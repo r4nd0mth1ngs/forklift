@@ -7,7 +7,7 @@ use forklift_core::util::shift_utils::FileOp;
 use serde::Serialize;
 use forklift_core::util::{
     config_utils, inventory_utils, merge_utils, object_utils, pallet_utils, park_utils,
-    shift_utils, sign_utils, stack_utils, tree_utils,
+    scope_utils, shift_utils, sign_utils, stack_utils, tree_utils,
 };
 use crate::output::{self, CommandOutput};
 
@@ -48,8 +48,21 @@ pub async fn park_changes() -> Result<(), String> {
     // tracked files become staged removals. Untracked files stay untracked.
     inventory_utils::refresh_tracked_entries()?;
 
-    let root_tree = tree_utils::build_tree_from_inventory().await?
+    let partial_root = tree_utils::build_tree_from_inventory().await?
         .ok_or("There is nothing to park.".to_string())?;
+
+    // In a scoped (sparse) bay the dock only materializes the in-scope subtree(s); splice it
+    // onto the head's spine exactly like `stack` does (§3.2), so the parked parcel commits the
+    // same root a full bay would — `park` is documented to inherit the overlay, and a truncated
+    // parked tree would silently break that. The "nothing to park" check below must compare the
+    // *spliced* root against head, or it never fires in a scoped bay (M2).
+    let scope = scope_utils::current_scope()?;
+
+    let root_tree = if scope.is_full() {
+        partial_root
+    } else {
+        tree_utils::build_scoped_root_tree(Some(&head_tree_hash), &partial_root, &scope)?
+    };
 
     if root_tree.hash == head_tree_hash {
         return Err("There is nothing to park: the warehouse matches the pallet head.".to_string());

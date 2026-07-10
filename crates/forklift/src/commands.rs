@@ -15,6 +15,7 @@ pub mod deliver;
 pub mod conflicts;
 pub mod diff;
 pub mod restore;
+pub mod scope;
 pub mod shift;
 pub mod stocktake;
 pub mod stack;

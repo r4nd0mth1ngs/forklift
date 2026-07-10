@@ -6,7 +6,7 @@ use crate::model::parcel::Parcel;
 use crate::model::parcel_action::ParcelAction;
 use crate::util::{
     cherry_pick_utils, config_utils, inventory_utils, merge_utils, object_utils, office_utils,
-    pallet_utils, sign_utils, tree_utils,
+    pallet_utils, scope_utils, sign_utils, tree_utils,
 };
 
 /// Resolve the key a parcel must be signed with: `None` while trust is not established,
@@ -86,8 +86,25 @@ pub async fn stack_parcel(description: Option<String>) -> Result<(String, String
     let pallet = pallet_utils::get_current_pallet_name()?;
     let head = pallet_utils::get_pallet_head(&pallet)?;
 
-    let root_tree = tree_utils::build_tree_from_inventory().await?
+    let partial_root = tree_utils::build_tree_from_inventory().await?
         .ok_or("There is nothing to stack. Use the \"load\" command to stage changes first.".to_string())?;
+
+    // In a scoped (sparse) bay the dock materializes only the in-scope subtree(s), so the freshly
+    // built root above is a sparse partial that would drop every out-of-scope sibling. The overlay
+    // splices it onto the head's spine — copying out-of-scope siblings verbatim by hash — so the
+    // stacked root tree is byte-identical to what a full workspace would produce (§3.2).
+    let scope = scope_utils::current_scope()?;
+
+    let root_tree = if scope.is_full() {
+        partial_root
+    } else {
+        let head_root_hash = match &head {
+            Some(head_hash) => Some(object_utils::load_parcel(head_hash)?.tree_hash),
+            None => None,
+        };
+
+        tree_utils::build_scoped_root_tree(head_root_hash.as_deref(), &partial_root, &scope)?
+    };
 
     let root_is_empty = root_tree.get_files().len() == 0 && root_tree.get_subtrees().len() == 0;
 

@@ -49,13 +49,16 @@ Every failure carries a stable `code` an agent can branch on, and the process ex
 with a deterministic status (§7.8) so a script can branch without parsing prose. `2`
 is reserved for argument/usage errors (clap); `0` is success.
 
-| `code`             | exit | Meaning                                                |
-|--------------------|------|--------------------------------------------------------|
-| `error`            | 1    | Anything without a more specific classification yet    |
-| `not_a_warehouse`  | 3    | The command needs a warehouse; this directory is none  |
-| `conflict`         | 4    | Working state blocks the operation (unresolved / dirty)|
-| `diverged`         | 5    | A remote ref moved under a lift — lower, retry          |
-| `warehouse_locked` | 6    | Another forklift process holds the warehouse lock      |
+| `code`                    | exit | Meaning                                                          |
+|---------------------------|------|-------------------------------------------------------------------|
+| `error`                   | 1    | Anything without a more specific classification yet               |
+| `not_a_warehouse`         | 3    | The command needs a warehouse; this directory is none             |
+| `conflict`                | 4    | Working state blocks the operation (unresolved / dirty)           |
+| `diverged`                | 5    | A remote ref moved under a lift — lower, retry                     |
+| `warehouse_locked`        | 6    | Another forklift process holds the warehouse lock                 |
+| `out_of_scope`            | 7    | A path argument is outside a scoped (sparse) bay's scope (§7.6)   |
+| `scope_path_type_changed` | 8    | A scoped bay's spine path flipped dir↔file; scope no longer valid |
+| `sparse_workspace`        | 9    | A whole-tree verb is not supported in a scoped (sparse) bay yet   |
 
 The codes and exit numbers are a contract: they get added to, never repurposed.
 
@@ -112,6 +115,11 @@ fails CI if that ever drifts. Tools (arguments in parentheses):
   (model, transcript?, message?) / `manifest_show`, `haul_open` / `haul_list` / `haul_show` /
   `haul_comment` / `haul_review` / `haul_merge` / `haul_close` / `haul_reopen`,
   `tag_create` / `tag_show` / `tag_list`, `office_list`.
+- **Sandboxing (§7.5, §7.6):** `bay_add` (name, path?, scope?), `bay_list`, `bay_remove`
+  (name), `scope` — an orchestrator agent opens task-scoped (optionally sparse) sandboxes for
+  its sub-agents directly. The scope a bay records is advisory local setup, not the agent's
+  own security boundary; enforcement of what an identity may touch lives remote-side
+  (FORK-10).
 
 **Pagination:** `history` reads in pages — pass `limit`, and the result's `data.next`
 cursor back as `after` for the following page (absent once exhausted). This is the
@@ -127,11 +135,16 @@ is *signed*, so who recorded it is forge-proof; the transport-derivation just re
 model's own output from the `tool`/`session` it can't be trusted to report about itself.
 
 **Not exposed** (deliberately human-only): warehouse/identity setup (`prepare`, `config`,
-`profile`, `franchise`, `import-git`, `export-git`), host-machine concerns (`bay`,
-`self-update`), and meta (`mcp`, `help`, `version`). `config` in particular can rewrite
+`profile`, `franchise`, `import-git`, `export-git`), the host-machine concerns `alias` and
+`self-update`, and meta (`mcp`, `help`, `version`). `config` in particular can rewrite
 `remote.url` / `remote.token`, which is not an agent-workflow action; the `office`
 *mutations* (enrol/admit/rotate/…) are likewise held back — an agent operates within a
 warehouse whose trust is already set up. (`office_list` is exposed, read-only.)
+
+`bay` **is** exposed, despite also being a host working directory: §7.6's agent story is an
+orchestrator creating task-scoped sandboxes for sub-agents over MCP, and `bay` is how it does
+that. Every bay operation is non-destructive — `bay_add` refuses onto a non-empty directory,
+`bay_remove` only deletes forklift's own bookkeeping, never the materialized files.
 
 Example session:
 

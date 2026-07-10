@@ -574,6 +574,19 @@ pub enum Command {
         summary: bool,
     },
 
+    /// Show this bay's sparse materialization scope, and the warehouse fetch scope (§7.6)
+    #[command(
+        long_about = "Show the sparse-workspace scope (§7.6): this bay's materialization scope \
+                      (the subtree path(s) it checks out, stages and stacks) and the warehouse's \
+                      fetch scope (what the store has fetched at all — full in stage 1). An \
+                      unscoped bay (or the main tree) reports a full scope: the whole tree. Scope \
+                      is local to the checkout and never tracked. Read-only."
+    )]
+    Scope {
+        #[command(subcommand)]
+        action: Option<ScopeAction>,
+    },
+
     /// Report object-store health: loose vs packed objects, packs, and whether compaction is due
     #[command(
         long_about = "Report the health of the object store — the counterpart of \"stocktake\" \
@@ -679,6 +692,20 @@ pub enum BayAction {
 
         /// Where to create the working directory (default: a sibling of the warehouse)
         path: Option<String>,
+
+        /// Limit the bay to one or more subtree paths — a scoped (sparse) bay (§7.6). Repeatable.
+        #[arg(
+            long = "scope",
+            value_name = "PATH",
+            long_help = "Open a scoped (sparse) bay (§7.6): materialize and operate on only the \
+                         given subtree path(s) of the working tree, not the whole tree. The object \
+                         store still holds everything (stage 1 is materialization-only sparseness); \
+                         the bay just checks out, stages and stacks its in-scope subtree(s), copying \
+                         every out-of-scope sibling forward by the hash the signed head already \
+                         commits. Repeatable to scope several subtrees. Scope is local to this bay \
+                         and never tracked."
+        )]
+        scope: Vec<String>,
     },
 
     /// De-register a bay (its pallet ref and materialized files are kept)
@@ -691,6 +718,12 @@ pub enum BayAction {
         /// The bay to remove
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum ScopeAction {
+    /// Show the current bay's materialization scope and the warehouse fetch scope (the default)
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1197,6 +1230,7 @@ impl Command {
                 | Command::Park { .. }
                 | Command::Peek { .. }
                 | Command::Restore { .. }
+                | Command::Scope { .. }
                 | Command::Shift { .. }
                 | Command::Stack { .. }
                 | Command::Stocktake { .. }

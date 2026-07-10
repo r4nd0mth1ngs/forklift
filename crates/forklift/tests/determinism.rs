@@ -63,6 +63,21 @@ impl Warehouse {
         output
     }
 
+    /// Run at an arbitrary directory (e.g. a bay outside the warehouse root), keeping the
+    /// test's isolated home for global config + keys.
+    fn run_ok_at(&self, dir: &PathBuf, args: &[&str]) -> Output {
+        let output = Command::new(FORKLIFT)
+            .args(args)
+            .current_dir(dir)
+            .env("FORKLIFT_GLOBAL_CONFIG", self.home.join("global-config.toml"))
+            .env("FORKLIFT_KEYS_DIR", self.home.join("keys"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(),
+            "`{}` failed: {}", args.join(" "), String::from_utf8_lossy(&output.stderr));
+        output
+    }
+
     fn prepare(&self) {
         self.run_ok(&["prepare"]);
         self.run_ok(&["config", "operator.name", "determinism@forklift"]);
@@ -78,6 +93,16 @@ impl Warehouse {
     /// parcel hash, which embeds the wall clock).
     fn head_tree_hash(&self) -> String {
         let output = self.run_ok(&["--json", "peek", &self.head()]);
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        value["data"]["tree"].as_str().unwrap().to_string()
+    }
+
+    /// The root tree hash a named pallet's head parcel commits (a shared ref, read from the
+    /// warehouse; deterministic content, no wall clock).
+    fn parcel_tree_hash(&self, pallet: &str) -> String {
+        let head = std::fs::read_to_string(self.root.join(".forklift").join("pallets").join(pallet))
+            .unwrap().trim().to_string();
+        let output = self.run_ok(&["--json", "peek", &head]);
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         value["data"]["tree"].as_str().unwrap().to_string()
     }
@@ -136,6 +161,60 @@ fn identical_worktrees_produce_identical_tree_hashes() {
     }
     assert!(hashes.iter().all(|h| *h == hashes[0]),
         "identical worktrees produced different tree hashes across runs: {hashes:?}");
+}
+
+#[test]
+fn a_scoped_stack_is_byte_reproducible_and_matches_a_full_stack() {
+    // The scoped overlay (§7.6) reuses the parallel per-directory tree build for its in-scope
+    // subtree, then splices the out-of-scope siblings back by hash. Two properties must hold under
+    // the worker pool's scheduling: independent runs reassemble the *same* content address, and it
+    // is byte-identical to a full workspace stacking the same change (the stage-1 invariant).
+    let mut hashes = Vec::new();
+
+    for run in 0..3 {
+        let warehouse = Warehouse::new(&format!("scoped-{run}"));
+        warehouse.prepare();
+        populate(&warehouse);
+        warehouse.run_ok(&["load", "."]);
+        warehouse.run_ok(&["stack", "base"]);
+
+        let siblings = warehouse.root.parent().unwrap();
+        let full_dir = siblings.join("full-bay");
+        let scoped_dir = siblings.join("scoped-bay");
+        let _ = std::fs::remove_dir_all(&full_dir);
+        let _ = std::fs::remove_dir_all(&scoped_dir);
+
+        warehouse.run_ok(&["bay", "add", "full", full_dir.to_str().unwrap()]);
+        warehouse.run_ok(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "dir0/sub0"]);
+
+        // The same in-scope edit across several files in both bays, so the parallel build fans out.
+        for file in 0..8 {
+            let relative = format!("dir0/sub0/file{file}.txt");
+            let content = format!("scoped edit of file {file}\nshared boilerplate line one\n");
+            if full_dir.join(&relative).exists() {
+                std::fs::write(full_dir.join(&relative), &content).unwrap();
+                std::fs::write(scoped_dir.join(&relative), &content).unwrap();
+            }
+        }
+
+        warehouse.run_ok_at(&full_dir, &["load", "."]);
+        warehouse.run_ok_at(&full_dir, &["stack", "edit in full"]);
+        warehouse.run_ok_at(&scoped_dir, &["load", "."]);
+        warehouse.run_ok_at(&scoped_dir, &["stack", "edit in scoped"]);
+
+        let full_tree = warehouse.parcel_tree_hash("full");
+        let scoped_tree = warehouse.parcel_tree_hash("scoped");
+        assert_eq!(full_tree, scoped_tree,
+            "a scoped stack must produce a byte-identical root tree to a full stack");
+
+        hashes.push(scoped_tree);
+
+        let _ = std::fs::remove_dir_all(&full_dir);
+        let _ = std::fs::remove_dir_all(&scoped_dir);
+    }
+
+    assert!(hashes.iter().all(|hash| *hash == hashes[0]),
+        "a scoped stack must be byte-reproducible across independent runs: {hashes:?}");
 }
 
 #[test]

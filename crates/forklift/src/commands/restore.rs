@@ -4,6 +4,7 @@ use forklift_core::enums::inventory_item_state::InventoryItemState;
 use forklift_core::model::inventory::Inventory;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::WarehousePath;
+use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use forklift_core::util::{file_utils, inventory_utils, object_utils, pallet_utils, shift_utils};
 use crate::output;
 
@@ -33,6 +34,12 @@ enum HeadEntry {
 /// * `Err(String)` - If there was an error while handling the command.
 pub fn handle_command(staged: bool, target: &str) -> Result<(), String> {
     let path = WarehousePath::from_user_input(target)?;
+
+    // An out-of-scope path is sealed by hash in a scoped bay and was never materialized;
+    // restoring it (worktree or staged) would have nothing to restore from/to and, for
+    // `--staged`, would smuggle out-of-scope content into the inventory (§7.6, M3). Refuse
+    // cleanly rather than let the walk below silently do the wrong thing.
+    crate::commands::scope::ensure_path_in_scope(path.as_key())?;
 
     if staged {
         restore_staged(&path)
@@ -216,7 +223,12 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
         let mut shards: BTreeMap<String, Inventory> = BTreeMap::new();
 
         if let Some(HeadEntry::Tree(tree)) = &head_entry {
-            build_stale_shards(tree, path.as_key(), &mut shards)?;
+            // In a scoped bay, only in-scope directories were ever materialized — the walk
+            // must not resurrect out-of-scope shards for content that was never actually
+            // written to this bay's working directory (§7.6, M3).
+            let scope = scope_utils::current_scope()?;
+
+            build_stale_shards(tree, path.as_key(), &mut shards, &scope)?;
         }
 
         inventory_utils::replace_subtree_inventories(path.as_key(), &shards)?;
@@ -266,20 +278,49 @@ fn restore_staged(path: &WarehousePath) -> Result<(), String> {
 
 /// Build stale-stat inventory shards for a head subtree (see `build_stale_inventory_item`).
 ///
+/// Scope-aware (§7.6, M3): only in-scope content is ever written to a scoped bay's working
+/// directory, so restoring "to head" must not resurrect shards for out-of-scope files or
+/// subtrees — those are sealed by hash and were never materialized here. A head file where
+/// the scope expects a directory (a spine ancestor, or an in-scope prefix itself) is the
+/// §3.1 type-change: refuse rather than guess, exactly like the stack overlay does.
+///
 /// # Arguments
 /// * `tree`   - The (loaded) head tree of the directory.
 /// * `key`    - The warehouse path key of the directory.
 /// * `shards` - The collected shards.
+/// * `scope`  - The active bay's materialization scope.
+///
+/// Once a level is itself fully in scope (`ScopeClass::InScope`), everything below it is
+/// included without further per-entry classification — the classifier's own "nothing below
+/// needs re-classifying" contract; only a `ScopeClass::Spine` level needs the per-entry checks.
 ///
 /// # Returns
 /// * `Ok(())`      - If the shards were built.
-/// * `Err(String)` - If a subtree object could not be loaded.
+/// * `Err(String)` - If a subtree object could not be loaded, or a spine path's type changed.
 fn build_stale_shards(tree: &TreeItem,
                       key: &str,
-                      shards: &mut BTreeMap<String, Inventory>) -> Result<(), String> {
+                      shards: &mut BTreeMap<String, Inventory>,
+                      scope: &MaterializationScope) -> Result<(), String> {
+    // Hoisted once per directory (not per entry): a full (unscoped) scope, or a level already
+    // fully in scope, never needs the per-entry classify calls below — short-circuit them away
+    // entirely on that hot, common path.
+    let fully_in_scope = scope.is_full() || scope.classify(key) == ScopeClass::InScope;
+
     let mut inventory = Inventory::new();
 
     for (name, item) in tree.get_files() {
+        if !fully_in_scope {
+            let child_key = join_key(key, name);
+
+            match scope.classify(&child_key) {
+                ScopeClass::OutOfScope => continue,
+                // A file where the scope expects a directory (a spine ancestor, or the
+                // in-scope prefix itself) is the §3.1 type change — refuse rather than guess.
+                ScopeClass::InScope | ScopeClass::Spine =>
+                    return Err(scope_utils::type_changed_refusal(&child_key)),
+            }
+        }
+
         inventory.add_item(inventory_utils::build_stale_inventory_item(
             name,
             item.hash.clone(),
@@ -290,17 +331,28 @@ fn build_stale_shards(tree: &TreeItem,
     shards.insert(key.to_string(), inventory);
 
     for (name, subtree) in tree.get_subtrees() {
-        let child_key = if key.is_empty() {
-            name.clone()
-        } else {
-            format!("{}/{}", key, name)
-        };
+        let child_key = join_key(key, name);
+
+        // Out-of-scope subtrees are sealed by hash and were never materialized — restoring
+        // "to head" must not smuggle them into the scoped bay's staging area.
+        if !fully_in_scope && scope.classify(&child_key) == ScopeClass::OutOfScope {
+            continue;
+        }
 
         let subtree_loaded = object_utils::load_tree(&subtree.hash)?;
-        build_stale_shards(&subtree_loaded, &child_key, shards)?;
+        build_stale_shards(&subtree_loaded, &child_key, shards, scope)?;
     }
 
     Ok(())
+}
+
+/// Join a directory key and an entry name into the entry's warehouse path.
+fn join_key(key: &str, name: &str) -> String {
+    if key.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", key, name)
+    }
 }
 
 /// Resolve a warehouse path inside the head tree.

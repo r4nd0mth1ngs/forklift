@@ -5,6 +5,7 @@ use forklift_core::enums::diff_type::DiffType;
 use forklift_core::model::diff::Diff;
 use forklift_core::model::tree_item::TreeItem;
 use forklift_core::util::path_utils::WarehousePath;
+use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use forklift_core::util::stocktake_utils::ChangeKind;
 use forklift_core::util::{
     diff, fanout_utils, file_utils, merge_utils, object_utils, pallet_utils, stocktake_utils,
@@ -37,6 +38,12 @@ pub async fn handle_command(staged: bool, targets: &[String], verbose: bool) -> 
                 None => None,
             };
 
+            // An out-of-scope path filter would report nothing in a scoped bay (the subtree is
+            // sealed and unmaterialized) — refuse it clearly instead (§7.6).
+            if let Some(filter) = &filter {
+                crate::commands::scope::ensure_path_in_scope(filter.as_key())?;
+            }
+
             if staged {
                 diff_staged(filter.as_ref(), verbose).await
             } else {
@@ -55,6 +62,10 @@ pub async fn handle_command(staged: bool, targets: &[String], verbose: bool) -> 
                 Some(target) => Some(WarehousePath::from_user_input(target)?),
                 None => None,
             };
+
+            if let Some(filter) = &filter {
+                crate::commands::scope::ensure_path_in_scope(filter.as_key())?;
+            }
 
             diff_pallets(from_pallet, to_pallet, filter.as_ref(), verbose)
         }
@@ -225,8 +236,13 @@ fn diff_pallets(from_pallet: &str,
     let from_tree = object_utils::load_tree(&from_tree_hash)?;
     let to_tree = object_utils::load_tree(&to_tree_hash)?;
 
+    // In a scoped bay the walk is pruned to the in-scope subtree(s): out-of-scope subtrees are
+    // sealed by hash, so a scoped diff reports only what the bay actually works on (and never
+    // loads an out-of-scope object). Full scope walks the whole tree, unchanged.
+    let scope = scope_utils::current_scope()?;
+
     let mut changes: Vec<TreeChange> = Vec::new();
-    collect_tree_changes(Some(&from_tree), Some(&to_tree), "", &mut changes)?;
+    collect_tree_changes(Some(&from_tree), Some(&to_tree), "", &mut changes, &scope)?;
 
     detect_tree_moves(&mut changes);
 
@@ -425,7 +441,14 @@ fn detect_tree_moves(changes: &mut Vec<TreeChange>) {
 fn collect_tree_changes(from: Option<&TreeItem>,
                         to: Option<&TreeItem>,
                         key: &str,
-                        changes: &mut Vec<TreeChange>) -> Result<(), String> {
+                        changes: &mut Vec<TreeChange>,
+                        scope: &MaterializationScope) -> Result<(), String> {
+    // Hoisted once per directory level (not per entry): a full (unscoped) scope always
+    // classifies everything in scope, so the classify (and its `join_key` allocation) is
+    // pure overhead on the hot, common full-bay path — short-circuit it away entirely there,
+    // the same way `stack_parcel` gates the whole overlay on `is_full()`.
+    let scope_is_full = scope.is_full();
+
     let from_files: BTreeMap<&String, &TreeItem> = from
         .map(|tree| tree.get_files().collect())
         .unwrap_or_default();
@@ -434,6 +457,11 @@ fn collect_tree_changes(from: Option<&TreeItem>,
         .unwrap_or_default();
 
     for (name, to_item) in &to_files {
+        // Out-of-scope files are sealed by hash in a scoped bay; never report them.
+        if !scope_is_full && scope.classify(&join_key(key, name)) == ScopeClass::OutOfScope {
+            continue;
+        }
+
         match from_files.get(*name) {
             None => changes.push(TreeChange {
                 kind: ChangeKind::Added,
@@ -458,6 +486,10 @@ fn collect_tree_changes(from: Option<&TreeItem>,
     }
 
     for (name, from_item) in &from_files {
+        if !scope_is_full && scope.classify(&join_key(key, name)) == ScopeClass::OutOfScope {
+            continue;
+        }
+
         if !to_files.contains_key(*name) {
             changes.push(TreeChange {
                 kind: ChangeKind::Removed,
@@ -477,6 +509,11 @@ fn collect_tree_changes(from: Option<&TreeItem>,
         .unwrap_or_default();
 
     for (name, to_subtree) in &to_subtrees {
+        // An out-of-scope subtree is sealed by hash — never load or descend into it.
+        if !scope_is_full && scope.classify(&join_key(key, name)) == ScopeClass::OutOfScope {
+            continue;
+        }
+
         let from_subtree = from_subtrees.get(*name);
 
         // Identical subtree hashes mean identical content all the way down.
@@ -494,15 +531,20 @@ fn collect_tree_changes(from: Option<&TreeItem>,
             from_loaded.as_ref(),
             Some(&to_loaded),
             &join_key(key, name),
-            changes
+            changes,
+            scope,
         )?;
     }
 
     for (name, from_subtree) in &from_subtrees {
+        if !scope_is_full && scope.classify(&join_key(key, name)) == ScopeClass::OutOfScope {
+            continue;
+        }
+
         if !to_subtrees.contains_key(*name) {
             let from_loaded = object_utils::load_tree(&from_subtree.hash)?;
 
-            collect_tree_changes(Some(&from_loaded), None, &join_key(key, name), changes)?;
+            collect_tree_changes(Some(&from_loaded), None, &join_key(key, name), changes, scope)?;
         }
     }
 

@@ -38,6 +38,15 @@ use crate::output::{self, CommandOutput};
 /// * `Err(String)` - If `path` is not a git repository, trust is already established, a
 ///   pallet would collide, or git could not be read.
 pub fn handle_command(path: &str, no_compact: bool) -> Result<(), String> {
+    // Import builds each pallet's parcels straight from the git tree (bypassing the overlay
+    // entirely, unlike `stack`/`park`) and materializes the whole imported HEAD into the
+    // working directory — importing into a scoped bay is not a sensible operation (§7.6).
+    // Refuse cleanly, like export-git.
+    crate::commands::scope::refuse_in_scoped_bay(
+        "import-git",
+        "Run import-git from a full workspace (or the main tree), not a scoped bay.",
+    )?;
+
     // Imported parcels are unsigned; a trusted warehouse rejects those, so import must
     // come first — enrolling afterwards records the imported heads as the legacy boundary.
     if office_utils::read_trust_anchor()?.is_some() {

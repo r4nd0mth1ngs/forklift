@@ -15,6 +15,7 @@
 
 use std::sync::OnceLock;
 use serde::Serialize;
+use forklift_core::util::scope_utils;
 
 /// The output schema version, carried on every JSON envelope as `forklift_json`.
 /// It changes only when the envelope or a command's `data` shape changes
@@ -164,17 +165,30 @@ pub enum ErrorCode {
 
     /// A remote ref moved under a lift (the CAS failed): lower, consolidate, retry.
     Diverged,
+
+    /// A path argument is outside the bay's materialization scope (§7.6).
+    OutOfScope,
+
+    /// A scoped bay's spine path flipped between a directory and a file (§7.6): the scope
+    /// is no longer valid there and the operation refuses rather than guess.
+    ScopePathTypeChanged,
+
+    /// A whole-tree verb is not (yet) supported in a scoped (sparse) bay (§7.6).
+    SparseWorkspace,
 }
 
 impl ErrorCode {
     /// The stable string an agent branches on.
     pub fn as_str(&self) -> &'static str {
         match self {
-            ErrorCode::Generic         => "error",
-            ErrorCode::NotAWarehouse   => "not_a_warehouse",
-            ErrorCode::WarehouseLocked => "warehouse_locked",
-            ErrorCode::Conflict        => "conflict",
-            ErrorCode::Diverged        => "diverged",
+            ErrorCode::Generic              => "error",
+            ErrorCode::NotAWarehouse        => "not_a_warehouse",
+            ErrorCode::WarehouseLocked      => "warehouse_locked",
+            ErrorCode::Conflict             => "conflict",
+            ErrorCode::Diverged             => "diverged",
+            ErrorCode::OutOfScope           => scope_utils::CODE_OUT_OF_SCOPE,
+            ErrorCode::ScopePathTypeChanged => scope_utils::CODE_SCOPE_PATH_TYPE_CHANGED,
+            ErrorCode::SparseWorkspace      => scope_utils::CODE_SPARSE_WORKSPACE,
         }
     }
 
@@ -182,11 +196,24 @@ impl ErrorCode {
     /// parsing prose (§7.8). `2` is reserved for clap's usage errors; `0` is success.
     pub fn exit_code(&self) -> i32 {
         match self {
-            ErrorCode::Generic         => 1,
-            ErrorCode::NotAWarehouse   => 3,
-            ErrorCode::Conflict        => 4,
-            ErrorCode::Diverged        => 5,
-            ErrorCode::WarehouseLocked => 6,
+            ErrorCode::Generic              => 1,
+            ErrorCode::NotAWarehouse        => 3,
+            ErrorCode::Conflict             => 4,
+            ErrorCode::Diverged             => 5,
+            ErrorCode::WarehouseLocked      => 6,
+            ErrorCode::OutOfScope           => 7,
+            ErrorCode::ScopePathTypeChanged => 8,
+            ErrorCode::SparseWorkspace      => 9,
+        }
+    }
+
+    /// Map a scope-refusal code (a `scope_utils::CODE_*` string) to its `ErrorCode`.
+    fn from_scope_code(code: &str) -> Option<ErrorCode> {
+        match code {
+            _ if code == scope_utils::CODE_OUT_OF_SCOPE           => Some(ErrorCode::OutOfScope),
+            _ if code == scope_utils::CODE_SCOPE_PATH_TYPE_CHANGED => Some(ErrorCode::ScopePathTypeChanged),
+            _ if code == scope_utils::CODE_SPARSE_WORKSPACE       => Some(ErrorCode::SparseWorkspace),
+            _ => None,
         }
     }
 }
@@ -212,9 +239,30 @@ impl ForkliftError {
 }
 
 /// A bare `Err(String)` from a handler is a generic failure with no next step — the
-/// `?`-friendly default. Specific sites construct a classified [`ForkliftError`].
+/// `?`-friendly default. Scope refusals (§7.6) are the exception: `forklift-core` cannot
+/// build a `ForkliftError` (it never prints, and the type is CLI-local), so it frames the
+/// refusal as a sentinel-tagged string that this conversion decodes into a classified error
+/// with the matching stable code, exit code and next step.
+///
+/// A frame whose `code` this build does not recognize (e.g. a newer `forklift-core` added a
+/// scope code this CLI predates) still decodes — the frame itself is well-formed — so it
+/// still uses the decoded human message and next step rather than falling through to the
+/// raw framed string, which would leak the `\u{1f}` field separators into human/JSON output.
+/// It just classifies as `Generic` instead of the (unknown) specific code. Only a string that
+/// is not a scope refusal at all — `decode_refusal` returns `None` — is treated as a plain
+/// generic error verbatim.
 impl From<String> for ForkliftError {
     fn from(message: String) -> ForkliftError {
+        if let Some((code, human, next_step)) = scope_utils::decode_refusal(&message) {
+            let code = ErrorCode::from_scope_code(code).unwrap_or(ErrorCode::Generic);
+
+            return ForkliftError {
+                code,
+                message: human.to_string(),
+                next_step: Some(next_step.to_string()),
+            };
+        }
+
         ForkliftError { code: ErrorCode::Generic, message, next_step: None }
     }
 }
@@ -228,4 +276,42 @@ macro_rules! human {
             println!($($arg)*);
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_known_scope_code_classifies_and_keeps_the_next_step() {
+        let refusal = scope_utils::out_of_scope_refusal("src/web");
+        let error: ForkliftError = refusal.into();
+
+        assert_eq!(error.code.as_str(), scope_utils::CODE_OUT_OF_SCOPE);
+        assert!(!error.message.contains('\u{1f}'));
+        assert!(error.next_step.is_some());
+    }
+
+    #[test]
+    fn an_unrecognized_scope_code_still_decodes_instead_of_leaking_the_raw_frame() {
+        // A well-formed frame whose code this build has never heard of — as if a newer
+        // `forklift-core` introduced a scope code this CLI predates.
+        let frame = scope_utils::refusal("some_future_code", "a human explanation", "do this");
+
+        let error: ForkliftError = frame.into();
+
+        assert_eq!(error.code.as_str(), "error"); // ErrorCode::Generic
+        assert_eq!(error.message, "a human explanation");
+        assert_eq!(error.next_step.as_deref(), Some("do this"));
+        assert!(!error.message.contains('\u{1f}'), "the raw frame must never leak into the message");
+    }
+
+    #[test]
+    fn a_plain_string_is_a_generic_error_with_no_next_step() {
+        let error: ForkliftError = "something ordinary went wrong".to_string().into();
+
+        assert_eq!(error.code.as_str(), "error");
+        assert_eq!(error.message, "something ordinary went wrong");
+        assert!(error.next_step.is_none());
+    }
 }
