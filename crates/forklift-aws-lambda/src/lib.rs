@@ -22,7 +22,8 @@
 //! DynamoDB-backed consistency point). The whole protocol suite runs in CI against the
 //! real handler logic using the in-memory fakes in [`memory`]; the AWS SDK
 //! implementations of the two traits (S3 + DynamoDB, with an endpoint override for
-//! LocalStack/MinIO) are a separate layer that slots in without touching [`Head`].
+//! LocalStack/MinIO) live in [`aws`] as a separate layer that slots in without touching
+//! [`Head`].
 //!
 //! Verification is *reused, not reimplemented*: the ref-update handler mirrors the small
 //! objects `forklift_core`'s audit must read (parcels, trees, office-record blobs,
@@ -31,6 +32,7 @@
 //! serverless head varies, the working-blob existence check, routed to `ObjectStore`
 //! (an S3 `HEAD`) via `audit_utils::verify_parcel_closure_with`.
 
+pub mod aws;
 pub mod blocking;
 pub mod error;
 pub mod store;
@@ -38,6 +40,7 @@ pub mod memory;
 pub mod scratch;
 pub mod head;
 
+pub use aws::{AwsConfig, DynamoRefStore, S3ObjectStore};
 pub use blocking::AsyncBridge;
 pub use error::{HeadError, HeadResult, Status};
 pub use head::{BatchResult, Head};
