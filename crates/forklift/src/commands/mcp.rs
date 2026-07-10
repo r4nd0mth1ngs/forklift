@@ -263,6 +263,7 @@ fn build_args(name: &str, arguments: &Value) -> Result<Vec<String>, String> {
             }
         }
         "conflicts" => args.push("conflicts".to_string()),
+        "scope" => args.push("scope".to_string()),
         "store" => args.push("store".to_string()),
         "compact" => {
             args.push("compact".to_string());
@@ -519,6 +520,8 @@ fn tool_definitions() -> Value {
         tool("compact", "Compact the object store: pack loose objects (delta-compressed) into a few dense pack files. Safe to run anytime; worth running after a large import. Pass all=true for a full repack that also rewrites existing packs, dropping unreachable garbage and consolidating.",
             object(json!({ "all": boolean }), json!([]))),
         tool("store", "Report object-store health: loose vs packed object counts, pack files and how delta-dense they are, on-disk sizes, and whether an incremental compaction or a repack is due. Read-only (the counterpart of compact).",
+            object(json!({}), json!([]))),
+        tool("scope", "Report the sparse-workspace scope (§7.6): this bay's materialization scope (the subtrees it works on) and the warehouse fetch scope. Read-only.",
             object(json!({}), json!([]))),
         tool("audit", "Verify the warehouse's signed history offline (a pallet, default: the current one).",
             object(json!({ "pallet": string }), json!([]))),

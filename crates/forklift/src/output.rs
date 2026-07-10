@@ -15,6 +15,7 @@
 
 use std::sync::OnceLock;
 use serde::Serialize;
+use forklift_core::util::scope_utils;
 
 /// The output schema version, carried on every JSON envelope as `forklift_json`.
 /// It changes only when the envelope or a command's `data` shape changes
@@ -164,17 +165,30 @@ pub enum ErrorCode {
 
     /// A remote ref moved under a lift (the CAS failed): lower, consolidate, retry.
     Diverged,
+
+    /// A path argument is outside the bay's materialization scope (§7.6).
+    OutOfScope,
+
+    /// A scoped bay's spine path flipped between a directory and a file (§7.6): the scope
+    /// is no longer valid there and the operation refuses rather than guess.
+    ScopePathTypeChanged,
+
+    /// A whole-tree verb is not (yet) supported in a scoped (sparse) bay (§7.6).
+    SparseWorkspace,
 }
 
 impl ErrorCode {
     /// The stable string an agent branches on.
     pub fn as_str(&self) -> &'static str {
         match self {
-            ErrorCode::Generic         => "error",
-            ErrorCode::NotAWarehouse   => "not_a_warehouse",
-            ErrorCode::WarehouseLocked => "warehouse_locked",
-            ErrorCode::Conflict        => "conflict",
-            ErrorCode::Diverged        => "diverged",
+            ErrorCode::Generic              => "error",
+            ErrorCode::NotAWarehouse        => "not_a_warehouse",
+            ErrorCode::WarehouseLocked      => "warehouse_locked",
+            ErrorCode::Conflict             => "conflict",
+            ErrorCode::Diverged             => "diverged",
+            ErrorCode::OutOfScope           => scope_utils::CODE_OUT_OF_SCOPE,
+            ErrorCode::ScopePathTypeChanged => scope_utils::CODE_SCOPE_PATH_TYPE_CHANGED,
+            ErrorCode::SparseWorkspace      => scope_utils::CODE_SPARSE_WORKSPACE,
         }
     }
 
@@ -182,11 +196,24 @@ impl ErrorCode {
     /// parsing prose (§7.8). `2` is reserved for clap's usage errors; `0` is success.
     pub fn exit_code(&self) -> i32 {
         match self {
-            ErrorCode::Generic         => 1,
-            ErrorCode::NotAWarehouse   => 3,
-            ErrorCode::Conflict        => 4,
-            ErrorCode::Diverged        => 5,
-            ErrorCode::WarehouseLocked => 6,
+            ErrorCode::Generic              => 1,
+            ErrorCode::NotAWarehouse        => 3,
+            ErrorCode::Conflict             => 4,
+            ErrorCode::Diverged             => 5,
+            ErrorCode::WarehouseLocked      => 6,
+            ErrorCode::OutOfScope           => 7,
+            ErrorCode::ScopePathTypeChanged => 8,
+            ErrorCode::SparseWorkspace      => 9,
+        }
+    }
+
+    /// Map a scope-refusal code (a `scope_utils::CODE_*` string) to its `ErrorCode`.
+    fn from_scope_code(code: &str) -> Option<ErrorCode> {
+        match code {
+            _ if code == scope_utils::CODE_OUT_OF_SCOPE           => Some(ErrorCode::OutOfScope),
+            _ if code == scope_utils::CODE_SCOPE_PATH_TYPE_CHANGED => Some(ErrorCode::ScopePathTypeChanged),
+            _ if code == scope_utils::CODE_SPARSE_WORKSPACE       => Some(ErrorCode::SparseWorkspace),
+            _ => None,
         }
     }
 }
@@ -212,9 +239,22 @@ impl ForkliftError {
 }
 
 /// A bare `Err(String)` from a handler is a generic failure with no next step — the
-/// `?`-friendly default. Specific sites construct a classified [`ForkliftError`].
+/// `?`-friendly default. Scope refusals (§7.6) are the exception: `forklift-core` cannot
+/// build a `ForkliftError` (it never prints, and the type is CLI-local), so it frames the
+/// refusal as a sentinel-tagged string that this conversion decodes into a classified error
+/// with the matching stable code, exit code and next step. Any other string is generic.
 impl From<String> for ForkliftError {
     fn from(message: String) -> ForkliftError {
+        if let Some((code, human, next_step)) = scope_utils::decode_refusal(&message) {
+            if let Some(code) = ErrorCode::from_scope_code(code) {
+                return ForkliftError {
+                    code,
+                    message: human.to_string(),
+                    next_step: Some(next_step.to_string()),
+                };
+            }
+        }
+
         ForkliftError { code: ErrorCode::Generic, message, next_step: None }
     }
 }

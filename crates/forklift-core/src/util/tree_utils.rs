@@ -13,6 +13,7 @@ use crate::model::tree_item::TreeItem;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
 use crate::types::task::Task;
+use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{file_utils, inventory_utils, object_utils};
 
 const FILENAME_METADATA_SUFFIX: &str = ".metadata";
@@ -212,6 +213,211 @@ fn build_tree_for_inventory_key(context: Arc<TreeBuilderContext>,
 
         Ok(())
     }
+}
+
+/// Splice freshly built in-scope subtree(s) over the current head's spine to produce the
+/// root tree of a *scoped* (sparse) stack (design §3.2).
+///
+/// A scoped bay materializes only its in-scope subtree(s); a plain [`build_tree_from_inventory`]
+/// over that dock would emit a root that has *only* the in-scope path, with every out-of-scope
+/// sibling silently gone. This overlay instead walks the head's spine, copies each out-of-scope
+/// sibling's hash **verbatim** (present, by definition of spine, in the spine tree objects it
+/// already holds — no blob load, no descent) and splices in the freshly built in-scope
+/// subtree(s). It replicates [`build_tree_from_inventory`]'s empty-subtree pruning exactly
+/// (`:173-178`), bottom-up, so a scoped stack's tree hash is **byte-identical** to what a full
+/// workspace stacking the same content would produce — the stage-1 invariant.
+///
+/// # Arguments
+/// * `head_root_hash` - The current head parcel's root tree hash (`None` for an unborn pallet).
+/// * `partial_root`   - The freshly built (sparse) root from [`build_tree_from_inventory`]: its
+///                      in-scope subtree objects are already stored with correct hashes.
+/// * `scope`          - The bay's materialization scope (the caller gates on it not being full).
+///
+/// # Returns
+/// * `Ok(TreeItem)` - The spliced root tree (its hash set, every new spine tree object stored).
+/// * `Err(String)`  - On a spine-path type flip (`scope_path_type_changed`), or a failed load
+///                    or store.
+pub fn build_scoped_root_tree(head_root_hash: Option<&str>,
+                              partial_root: &TreeItem,
+                              scope: &MaterializationScope) -> Result<TreeItem, String> {
+    let head_root = match head_root_hash {
+        Some(hash) => Some(object_utils::load_tree(hash)?),
+        None => None,
+    };
+
+    // The root is never pruned, even when empty — matching build_tree_from_inventory, which
+    // always keeps (and stores) the root tree object.
+    match splice_spine_level(head_root.as_ref(), Some(partial_root), "", scope)? {
+        Some(tree) => Ok(tree),
+        None => {
+            let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
+            store_tree(&mut tree)?;
+            Ok(tree)
+        }
+    }
+}
+
+/// Splice one spine directory level: emit a new tree whose entries are the head's
+/// out-of-scope siblings copied verbatim and the continuing in-scope / spine children rebuilt
+/// from the dock. Returns `None` when the level ends up empty (pruned from its parent), exactly
+/// as [`build_tree_from_inventory`]'s bottom-up build prunes an empty child.
+///
+/// The `head` tree is one level deep (its subtree children carry hashes; descending requires a
+/// load), while the `dock` tree is the fully in-memory partial root — so out-of-scope siblings
+/// are copied by hash off `head` with no load, and in-scope subtrees are taken straight off
+/// `dock`.
+fn splice_spine_level(head: Option<&TreeItem>,
+                      dock: Option<&TreeItem>,
+                      key: &str,
+                      scope: &MaterializationScope) -> Result<Option<TreeItem>, String> {
+    let mut tree = TreeItem::new(last_component(key).to_string(), String::new(), DirEntryType::Tree);
+
+    let head_files: BTreeMap<&String, &TreeItem> = head
+        .map(|tree| tree.get_files().collect())
+        .unwrap_or_default();
+    let head_subtrees: BTreeMap<&String, &TreeItem> = head
+        .map(|tree| tree.get_subtrees().collect())
+        .unwrap_or_default();
+    let dock_files: BTreeMap<&String, &TreeItem> = dock
+        .map(|tree| tree.get_files().collect())
+        .unwrap_or_default();
+    let dock_subtrees: BTreeMap<&String, &TreeItem> = dock
+        .map(|tree| tree.get_subtrees().collect())
+        .unwrap_or_default();
+
+    // A spine level's own files are all out-of-scope (an in-scope path is a directory prefix),
+    // so they are copied verbatim — unless the path is where an in-scope directory is expected,
+    // i.e. the entry flipped from a directory to a file at this revision (§3.1 type-change).
+    for (name, item) in &head_files {
+        let child_key = join_key(key, name);
+
+        match scope.classify(&child_key) {
+            ScopeClass::OutOfScope => tree.add_child(shallow_entry(item)),
+            ScopeClass::InScope | ScopeClass::Spine =>
+                return Err(scope_utils::type_changed_refusal(&child_key)),
+        }
+    }
+
+    // The symmetric check from the *dock* (working-tree) side: a file here means the working
+    // tree has replaced what the scope expects to be a directory (the in-scope prefix itself,
+    // or a spine ancestor of one) with a plain file. Without this check such a file lands in no
+    // other branch below (`dock_subtrees.get` finds nothing under its name) and is silently
+    // dropped from the signed tree — a scoped stack would then diverge from a full stack of the
+    // same content. Refuse instead, exactly mirroring the head-files case above — on the first
+    // dock file found, since any one of them is already a refusal (a `BTreeMap`, so this is the
+    // alphabetically-first name, deterministic either way).
+    if let Some((name, _)) = dock_files.iter().next() {
+        let child_key = join_key(key, name);
+
+        return Err(match scope.classify(&child_key) {
+            ScopeClass::InScope | ScopeClass::Spine => scope_utils::type_changed_refusal(&child_key),
+            // Not producible by the current materialize/load model (the working tree only ever
+            // holds content on the path to an in-scope prefix) — refused defensively rather
+            // than silently spliced into a signed tree unsealed.
+            ScopeClass::OutOfScope => scope_utils::out_of_scope_refusal(&child_key),
+        });
+    }
+
+    // Head subtrees: out-of-scope ones are copied verbatim; the in-scope subtree is taken fresh
+    // from the dock (pruned when empty or deleted); a deeper spine recurses.
+    for (name, item) in &head_subtrees {
+        let child_key = join_key(key, name);
+
+        match scope.classify(&child_key) {
+            ScopeClass::OutOfScope => tree.add_child(shallow_entry(item)),
+            ScopeClass::InScope => {
+                if let Some(dock_subtree) = dock_subtrees.get(name) {
+                    if !is_tree_empty(dock_subtree) {
+                        tree.add_child(shallow_entry(dock_subtree));
+                    }
+                }
+            }
+            ScopeClass::Spine => {
+                let head_subtree = object_utils::load_tree(&item.hash)?;
+                let dock_subtree = dock_subtrees.get(name).copied();
+
+                if let Some(spliced) =
+                    splice_spine_level(Some(&head_subtree), dock_subtree, &child_key, scope)?
+                {
+                    tree.add_child(spliced);
+                }
+            }
+        }
+    }
+
+    // In-scope / spine subtrees the dock has but the head does not — a newly added in-scope
+    // directory (or the spine leading to one). A head *file* of the same name would already
+    // have been refused above as a type change, so nothing here can collide with one.
+    for (name, dock_subtree) in &dock_subtrees {
+        if head_subtrees.contains_key(*name) {
+            continue;
+        }
+
+        let child_key = join_key(key, name);
+
+        match scope.classify(&child_key) {
+            ScopeClass::InScope => {
+                if !is_tree_empty(dock_subtree) {
+                    tree.add_child(shallow_entry(dock_subtree));
+                }
+            }
+            ScopeClass::Spine => {
+                if let Some(spliced) =
+                    splice_spine_level(None, Some(dock_subtree), &child_key, scope)?
+                {
+                    tree.add_child(spliced);
+                }
+            }
+            // The dock never holds an out-of-scope subtree; ignore defensively.
+            ScopeClass::OutOfScope => {}
+        }
+    }
+
+    if is_tree_empty(&tree) {
+        return Ok(None);
+    }
+
+    store_tree(&mut tree)?;
+
+    Ok(Some(tree))
+}
+
+/// A shallow copy of a tree entry — its `(name, hash, item_type)` with no children. The tree
+/// object format serializes only that triple per entry (subtrees first, files second, each set
+/// name-sorted), so a shallow entry builds a byte-identical parent object while carrying no
+/// descendants; the child object it names is already stored.
+fn shallow_entry(item: &TreeItem) -> TreeItem {
+    TreeItem::new(item.name.clone(), item.hash.clone(), item.item_type)
+}
+
+/// Whether a tree has no files and no subtrees — the emptiness test
+/// [`build_tree_from_inventory`] prunes on (`:173-178`).
+fn is_tree_empty(tree: &TreeItem) -> bool {
+    tree.get_files().len() == 0 && tree.get_subtrees().len() == 0
+}
+
+/// Build, store and hash a tree object (setting the item's hash), like the per-directory step
+/// of [`build_tree_from_inventory`].
+fn store_tree(tree: &mut TreeItem) -> Result<(), String> {
+    let mut object = LooseObjectBuilder::build_tree(tree);
+    tree.hash = object.hash.clone();
+    object.store()?;
+
+    Ok(())
+}
+
+/// Join a directory key and an entry name into the entry's warehouse path.
+fn join_key(key: &str, name: &str) -> String {
+    if key.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", key, name)
+    }
+}
+
+/// The final component (the directory's own name) of a warehouse path key.
+fn last_component(key: &str) -> &str {
+    key.rsplit_once('/').map(|(_, name)| name).unwrap_or(key)
 }
 
 /// Create tree objects for the given directory and all of its subdirectories.

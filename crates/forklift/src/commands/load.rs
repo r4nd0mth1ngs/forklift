@@ -14,6 +14,11 @@ use crate::output::{self, CommandOutput};
 /// * `Err(String)` - If there was an error while handling the command.
 pub async fn handle_command(target: &str) -> Result<(), String> {
     let path = WarehousePath::from_user_input(target)?;
+
+    // In a scoped bay an out-of-scope path is not materialized, so staging it would be a
+    // confusing "not in the inventory" (or a silent no-op) — refuse it clearly instead (§7.6).
+    crate::commands::scope::ensure_path_in_scope(path.as_key())?;
+
     inventory_utils::add_changes_to_inventory(&path).await?;
 
     output::emit("load", &Loaded { path: path.as_key().to_string() });

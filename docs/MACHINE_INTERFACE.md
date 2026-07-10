@@ -49,13 +49,16 @@ Every failure carries a stable `code` an agent can branch on, and the process ex
 with a deterministic status (§7.8) so a script can branch without parsing prose. `2`
 is reserved for argument/usage errors (clap); `0` is success.
 
-| `code`             | exit | Meaning                                                |
-|--------------------|------|--------------------------------------------------------|
-| `error`            | 1    | Anything without a more specific classification yet    |
-| `not_a_warehouse`  | 3    | The command needs a warehouse; this directory is none  |
-| `conflict`         | 4    | Working state blocks the operation (unresolved / dirty)|
-| `diverged`         | 5    | A remote ref moved under a lift — lower, retry          |
-| `warehouse_locked` | 6    | Another forklift process holds the warehouse lock      |
+| `code`                    | exit | Meaning                                                          |
+|---------------------------|------|-------------------------------------------------------------------|
+| `error`                   | 1    | Anything without a more specific classification yet               |
+| `not_a_warehouse`         | 3    | The command needs a warehouse; this directory is none             |
+| `conflict`                | 4    | Working state blocks the operation (unresolved / dirty)           |
+| `diverged`                | 5    | A remote ref moved under a lift — lower, retry                     |
+| `warehouse_locked`        | 6    | Another forklift process holds the warehouse lock                 |
+| `out_of_scope`            | 7    | A path argument is outside a scoped (sparse) bay's scope (§7.6)   |
+| `scope_path_type_changed` | 8    | A scoped bay's spine path flipped dir↔file; scope no longer valid |
+| `sparse_workspace`        | 9    | A whole-tree verb is not supported in a scoped (sparse) bay yet   |
 
 The codes and exit numbers are a contract: they get added to, never repurposed.
 

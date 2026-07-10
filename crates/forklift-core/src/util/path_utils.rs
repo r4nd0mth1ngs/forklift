@@ -25,8 +25,22 @@ impl WarehousePath {
     ///
     /// # Returns
     /// * `Ok(WarehousePath)` - The normalized path.
-    /// * `Err(String)`       - If the path points outside the warehouse or is not valid UTF-8.
+    /// * `Err(String)`       - If the path points outside the warehouse, is not valid UTF-8,
+    ///                        or contains an ASCII control character.
     pub fn from_user_input(raw: &str) -> Result<WarehousePath, String> {
+        // A control character is never legitimate in a warehouse path (defense in depth,
+        // §7.6 u7): beyond being nonsensical input, the §7.4 machine-interface envelope and
+        // the scope-refusal framing (`scope_utils::REFUSAL_PREFIX`) both use a reserved
+        // control byte (ASCII Unit Separator) to delimit their fields — a path containing one
+        // would mangle those messages downstream. Reject at the boundary instead.
+        if let Some(control) = raw.chars().find(|c| c.is_control()) {
+            return Err(format!(
+                "Path \"{}\" contains a control character ({:?}), which is never valid in a \
+                warehouse path.",
+                raw.escape_debug(), control
+            ));
+        }
+
         let raw_path = Path::new(raw);
 
         let root_relative = if raw_path.is_absolute() {
@@ -163,6 +177,22 @@ mod tests {
         assert!(WarehousePath::from_user_input("..").is_err());
         assert!(WarehousePath::from_user_input("../sibling").is_err());
         assert!(WarehousePath::from_user_input("src/../../sibling").is_err());
+    }
+
+    #[test]
+    fn rejects_ascii_control_characters() {
+        // A control character is never legitimate in a warehouse path (§7.6 u7): beyond being
+        // nonsensical input, one particular control byte (ASCII Unit Separator, 0x1F) is the
+        // field delimiter of the scope-refusal envelope (`scope_utils::REFUSAL_PREFIX`) — a
+        // path carrying it into a refusal message would mangle that framing.
+        assert!(WarehousePath::from_user_input("src/\u{1f}api").is_err());
+        assert!(WarehousePath::from_user_input("src/\u{0}api").is_err());
+        assert!(WarehousePath::from_user_input("src/\tapi").is_err());
+        assert!(WarehousePath::from_user_input("src/\napi").is_err());
+        assert!(WarehousePath::from_user_input("\u{7f}").is_err());
+
+        // Ordinary paths (including non-ASCII, non-control Unicode) are unaffected.
+        assert_eq!(WarehousePath::from_user_input("src/café").unwrap().as_key(), "src/café");
     }
 
     #[test]

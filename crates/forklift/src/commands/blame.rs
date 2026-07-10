@@ -3,6 +3,7 @@ use serde::Serialize;
 use forklift_core::model::parcel::Parcel;
 use forklift_core::enums::parcel_action_type::ParcelActionType;
 use forklift_core::util::office_utils::OfficeState;
+use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::{blame_utils, object_utils, office_utils, pallet_utils, remote_utils};
 use crate::output::{self, CommandOutput};
 
@@ -24,6 +25,10 @@ use crate::output::{self, CommandOutput};
 /// * `Err(String)` - If the revision cannot be resolved, the path is not a file there, or
 ///                   an object could not be read.
 pub async fn handle_command(path: &str, revision: Option<String>) -> Result<(), String> {
+    // An out-of-scope path is sealed by hash in a scoped bay; blaming it would hit an object
+    // read the bay never materialized — refuse cleanly with a stable code instead (§7.6 D6).
+    crate::commands::scope::ensure_path_in_scope(WarehousePath::from_user_input(path)?.as_key())?;
+
     let head = match revision {
         Some(revision) => pallet_utils::resolve_revision(&revision)?,
         None => {

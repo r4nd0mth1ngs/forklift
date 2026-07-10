@@ -3818,3 +3818,368 @@ fn a_mutating_command_runs_maintenance_when_due() {
         4, "history must survive maintenance"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Task-scoped sparse workspaces (§7.6), stage 1: scoped bays on a full object store.
+//
+// Materialization-only sparseness — the store holds everything; a scoped bay materializes and
+// operates on only its subtree(s). The load-bearing invariant is that a scoped stack produces a
+// **byte-identical** root tree to a full stack of the same content.
+// ---------------------------------------------------------------------------------------------
+
+/// The head parcel hash of a (shared) pallet ref, read from the main tree.
+fn pallet_head_hash(warehouse: &TestWarehouse, pallet: &str) -> String {
+    std::fs::read_to_string(warehouse.root.join(".forklift").join("pallets").join(pallet))
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+/// The root tree hash a parcel commits (pure content, no wall-clock) — read via `peek`.
+fn parcel_tree_hash(warehouse: &TestWarehouse, parcel: &str) -> String {
+    let output = warehouse.run(&["--json", "peek", parcel]);
+    assert_success(&output);
+    json(&output)["data"]["tree"].as_str().unwrap().to_string()
+}
+
+/// A warehouse with an in-scope subtree, an out-of-scope sibling subtree and an out-of-scope
+/// root file, stacked as `base`. Returns the warehouse.
+fn scoped_fixture(name: &str) -> TestWarehouse {
+    let warehouse = TestWarehouse::new(name);
+    warehouse.write_file("src/api/a.txt", "api a v1\n");
+    warehouse.write_file("src/api/b.txt", "api b v1\n");
+    warehouse.write_file("src/web/w.txt", "web v1\n");
+    warehouse.write_file("README.md", "readme v1\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+    warehouse
+}
+
+#[test]
+fn a_scoped_bay_materializes_only_its_subtree_and_reports_the_scope() {
+    let warehouse = scoped_fixture("scoped-materialize");
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    let added = warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]);
+    assert_success(&added);
+    assert!(stdout(&added).contains("Scoped"), "{}", stdout(&added));
+
+    // Only the in-scope subtree is materialized; the out-of-scope sibling and root file are not.
+    assert!(scoped_dir.join("src/api/a.txt").exists());
+    assert!(scoped_dir.join("src/api/b.txt").exists());
+    assert!(!scoped_dir.join("src/web").exists(), "out-of-scope subtree must not be materialized");
+    assert!(!scoped_dir.join("README.md").exists(), "out-of-scope file must not be materialized");
+
+    // `scope` reports the bay's materialization scope; the main tree is full.
+    let scoped_status = warehouse.run_at(&scoped_dir, &["--json", "scope"]);
+    assert_success(&scoped_status);
+    let value = json(&scoped_status);
+    assert_eq!(value["data"]["scoped"], true);
+    assert_eq!(value["data"]["materialization_scope"][0], "src/api");
+
+    let main_status = warehouse.run(&["--json", "scope"]);
+    assert_success(&main_status);
+    assert_eq!(json(&main_status)["data"]["scoped"], false);
+}
+
+#[test]
+fn a_scoped_stack_produces_a_byte_identical_root_tree_to_a_full_stack() {
+    let warehouse = scoped_fixture("scoped-identical");
+
+    let full_dir = warehouse.home.join("bay-full");
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "full", full_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    // The identical in-scope edit in both bays (branched from the same head).
+    std::fs::write(full_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "edit in full"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit in scoped"]));
+
+    // The stage-1 invariant: the scoped overlay spliced the out-of-scope siblings back by hash,
+    // so the two roots are byte-for-byte the same content address.
+    let full_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "full"));
+    let scoped_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "scoped"));
+    assert_eq!(full_tree, scoped_tree,
+        "a scoped stack must produce a byte-identical root tree to a full stack of the same content");
+}
+
+#[test]
+fn a_scoped_stack_prunes_an_emptied_subtree_identically_to_a_full_stack() {
+    // A `lonely` directory whose only descendant is the in-scope leaf, so emptying the leaf must
+    // prune `lonely/deep` and then `lonely` itself — recursively up the spine, exactly as a full
+    // build does — or the two root hashes diverge.
+    let warehouse = TestWarehouse::new("scoped-prune");
+    warehouse.write_file("src/api/a.txt", "api\n");
+    warehouse.write_file("lonely/deep/only.txt", "only\n");
+    warehouse.write_file("README.md", "r\n");
+    assert_success(&warehouse.run(&["prepare"]));
+    configure_operator(&warehouse);
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "base"]));
+
+    let full_dir = warehouse.home.join("bay-full");
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "full", full_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "lonely/deep"]));
+
+    // Delete the only in-scope file in both bays and stack the removal.
+    std::fs::remove_file(full_dir.join("lonely/deep/only.txt")).unwrap();
+    std::fs::remove_file(scoped_dir.join("lonely/deep/only.txt")).unwrap();
+    assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "drop it (full)"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "drop it (scoped)"]));
+
+    let full_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "full"));
+    let scoped_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "scoped"));
+    assert_eq!(full_tree, scoped_tree,
+        "emptying the in-scope subtree must prune the spine identically to a full build");
+}
+
+#[test]
+fn a_scoped_stocktake_does_not_report_out_of_scope_paths_as_removed() {
+    let warehouse = scoped_fixture("scoped-stocktake");
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    // A fresh scoped bay is clean: the out-of-scope head content (src/web, README) is sealed by
+    // hash, not "Removed" — without the scope-aware staged walk it would be reported as removed.
+    let status = warehouse.run_at(&scoped_dir, &["--json", "stocktake"]);
+    assert_success(&status);
+    let value = json(&status);
+    assert_eq!(value["data"]["staged_count"], 0,
+        "a fresh scoped bay stages nothing: {}", stdout(&status));
+
+    let human = stdout(&warehouse.run_at(&scoped_dir, &["stocktake"]));
+    assert!(!human.contains("src/web"), "out-of-scope path leaked into stocktake: {}", human);
+    assert!(!human.contains("README"), "out-of-scope path leaked into stocktake: {}", human);
+
+    // A staged in-scope edit is reported normally.
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    let staged = warehouse.run_at(&scoped_dir, &["--json", "diff", "--staged"]);
+    assert_success(&staged);
+    let files = json(&staged)["data"]["files"].as_array().unwrap().clone();
+    assert_eq!(files.len(), 1, "only the in-scope edit is staged");
+    assert_eq!(files[0]["path"], "src/api/a.txt");
+}
+
+#[test]
+fn a_scoped_bay_refuses_out_of_scope_path_arguments() {
+    let warehouse = scoped_fixture("scoped-refuse-path");
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    // load / unload / blame / diff on an out-of-scope path refuse with the stable code + exit 7.
+    for args in [
+        vec!["--json", "load", "src/web/w.txt"],
+        vec!["--json", "unload", "src/web/w.txt"],
+        vec!["--json", "blame", "src/web/w.txt"],
+        vec!["--json", "diff", "main", "scoped", "src/web"],
+    ] {
+        let refused = warehouse.run_at(&scoped_dir, &args);
+        assert_eq!(refused.status.code(), Some(7), "expected out_of_scope exit for {:?}", args);
+        assert_eq!(json(&refused)["error"]["code"], "out_of_scope", "for {:?}", args);
+        assert!(json(&refused)["error"]["next_step"].is_string(), "for {:?}", args);
+    }
+
+    // In-scope path arguments still work.
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "src/api/a.txt"]));
+}
+
+#[test]
+fn a_scoped_bay_refuses_whole_tree_verbs_with_a_stable_code() {
+    let warehouse = scoped_fixture("scoped-refuse-verb");
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    // consolidate (scoped-bay merge is a later stage) and export-git (would silently truncate)
+    // refuse with the sparse_workspace code + exit 9.
+    let consolidate = warehouse.run_at(&scoped_dir, &["--json", "consolidate", "main"]);
+    assert_eq!(consolidate.status.code(), Some(9));
+    assert_eq!(json(&consolidate)["error"]["code"], "sparse_workspace");
+
+    let export_dir = warehouse.home.join("export-git-out");
+    let export = warehouse.run_at(&scoped_dir, &["--json", "export-git", export_dir.to_str().unwrap()]);
+    assert_eq!(export.status.code(), Some(9));
+    assert_eq!(json(&export)["error"]["code"], "sparse_workspace");
+}
+
+#[test]
+fn a_scoped_bay_refuses_a_spine_path_type_flip() {
+    let warehouse = scoped_fixture("scoped-type-flip");
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    // On main, replace the `src` directory with a *file* named `src` and stack it: the scope's
+    // spine now has a file where it expects a directory.
+    std::fs::remove_dir_all(warehouse.root.join("src")).unwrap();
+    std::fs::write(warehouse.root.join("src"), "src is a file now\n").unwrap();
+    assert_success(&warehouse.run(&["load", "."]));
+    assert_success(&warehouse.run(&["stack", "src becomes a file"]));
+
+    // Shifting the scoped bay onto that revision must refuse — the sparse scope is no longer valid
+    // (a spine path flipped between a directory and a file), not guess.
+    let shifted = warehouse.run_at(&scoped_dir, &["--json", "shift", "main"]);
+    assert_eq!(shifted.status.code(), Some(8), "stderr/out: {}", stdout(&shifted));
+    assert_eq!(json(&shifted)["error"]["code"], "scope_path_type_changed");
+}
+
+// -------------------------------------------------------------------------------------------
+// §7.6 stage 1 — adversarial review follow-ups (B1 blocker, M2/M3 majors, m6 minor).
+// -------------------------------------------------------------------------------------------
+
+#[test]
+fn a_scoped_stack_refuses_when_the_dock_replaces_an_in_scope_directory_with_a_file() {
+    // B1 (blocker): the working tree flips the scoped subtree itself from a directory to a
+    // file. The overlay's dock-side files pass must catch this — without it, the file lands in
+    // no branch of the splice and is silently dropped from the signed (!) tree.
+    let warehouse = scoped_fixture("scoped-dock-flip");
+
+    let full_dir = warehouse.home.join("bay-full-flip");
+    let scoped_dir = warehouse.home.join("bay-scoped-flip");
+    assert_success(&warehouse.run(&["bay", "add", "full", full_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    // Full bay: replacing src/api with a file is an ordinary (non-sparse) edit and must
+    // keep succeeding — the fix must not regress the unscoped case.
+    std::fs::remove_dir_all(full_dir.join("src/api")).unwrap();
+    std::fs::write(full_dir.join("src/api"), "api is a file now\n").unwrap();
+    assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "api becomes a file"]));
+
+    // Scoped bay: the same edit must refuse rather than silently drop the file from the tree.
+    std::fs::remove_dir_all(scoped_dir.join("src/api")).unwrap();
+    std::fs::write(scoped_dir.join("src/api"), "api is a file now\n").unwrap();
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    let stacked = warehouse.run_at(&scoped_dir, &["--json", "stack", "api becomes a file"]);
+    assert_eq!(stacked.status.code(), Some(8), "stdout/err: {}", stdout(&stacked));
+    assert_eq!(json(&stacked)["error"]["code"], "scope_path_type_changed");
+}
+
+#[test]
+fn a_scoped_park_produces_a_byte_identical_tree_and_a_clean_park_refuses() {
+    // M2: park must route through the overlay exactly like stack, and its "nothing to park"
+    // check must compare the spliced root against head (not the truncated sparse partial) or
+    // it never fires in a scoped bay.
+    let warehouse = scoped_fixture("scoped-park");
+
+    let full_dir = warehouse.home.join("bay-full-park");
+    let scoped_dir = warehouse.home.join("bay-scoped-park");
+    assert_success(&warehouse.run(&["bay", "add", "full", full_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    // A clean park (no WIP) must refuse in both bays.
+    assert!(!warehouse.run_at(&full_dir, &["park"]).status.success(), "a clean full-bay park must refuse");
+    let clean_scoped = warehouse.run_at(&scoped_dir, &["park"]);
+    assert!(!clean_scoped.status.success(), "a clean scoped-bay park must refuse: {}", stdout(&clean_scoped));
+
+    // The identical in-scope WIP in both bays.
+    std::fs::write(full_dir.join("src/api/a.txt"), "api a v2 (wip)\n").unwrap();
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2 (wip)\n").unwrap();
+
+    assert_success(&warehouse.run_at(&full_dir, &["park"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["park"]));
+
+    let full_parked = json(&warehouse.run_at(&full_dir, &["--json", "park", "list"]));
+    let scoped_parked = json(&warehouse.run_at(&scoped_dir, &["--json", "park", "list"]));
+    let full_parcel = full_parked["data"]["parked"][0]["parcel"].as_str().unwrap().to_string();
+    let scoped_parcel = scoped_parked["data"]["parked"][0]["parcel"].as_str().unwrap().to_string();
+
+    let full_tree = parcel_tree_hash(&warehouse, &full_parcel);
+    let scoped_tree = parcel_tree_hash(&warehouse, &scoped_parcel);
+
+    assert_eq!(full_tree, scoped_tree,
+        "a scoped park must commit a byte-identical tree to a full-bay park of the same WIP");
+}
+
+#[test]
+fn a_scoped_restore_staged_root_leaves_stocktake_clean_and_the_shards_scope_bounded() {
+    // M3: `restore --staged` must not resurrect out-of-scope shards into a scoped bay's
+    // inventory — those paths were never materialized here.
+    let warehouse = scoped_fixture("scoped-restore-staged");
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    // Stage an in-scope edit, then reset it via `restore --staged .` (the root) — and revert
+    // the working file too, so the working tree, inventory and head all agree again
+    // afterwards (isolating the M3 assertion from `restore --staged`'s ordinary "working
+    // directory untouched" semantics, which would otherwise still show the edited file as
+    // unstaged and drown out the out-of-scope-leakage signal this test checks for).
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["restore", "--staged", "."]));
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v1\n").unwrap();
+
+    // The out-of-scope subtree must never be smuggled into the inventory by the restore walk —
+    // stocktake stays clean (no phantom entries for content that was never materialized here).
+    let status = warehouse.run_at(&scoped_dir, &["--json", "stocktake"]);
+    assert_success(&status);
+    let value = json(&status);
+    assert_eq!(value["data"]["staged_count"], 0, "restore --staged must have unstaged the edit");
+    assert_eq!(value["data"]["unstaged_count"], 0,
+        "the restore walk must not smuggle out-of-scope shards into the inventory: {}", stdout(&status));
+    assert!(!scoped_dir.join("src/web").exists(), "restore --staged must never materialize out-of-scope content");
+
+    // A direct restore of an out-of-scope path refuses too (closing the gap when the target
+    // itself, not just a descendant, is out of scope).
+    let refused = warehouse.run_at(&scoped_dir, &["--json", "restore", "--staged", "src/web"]);
+    assert_eq!(refused.status.code(), Some(7), "stdout/err: {}", stdout(&refused));
+    assert_eq!(json(&refused)["error"]["code"], "out_of_scope");
+}
+
+#[test]
+fn a_multi_path_scoped_stack_produces_a_byte_identical_root_tree() {
+    // m6: pin the multi-path scope case (two independent in-scope subtrees) for the
+    // byte-identical invariant, not just the single-scope-path case.
+    let warehouse = scoped_fixture("scoped-multi-path");
+
+    let full_dir = warehouse.home.join("bay-full-multi");
+    let scoped_dir = warehouse.home.join("bay-scoped-multi");
+    assert_success(&warehouse.run(&["bay", "add", "full", full_dir.to_str().unwrap()]));
+    assert_success(&warehouse.run(&[
+        "bay", "add", "scoped", scoped_dir.to_str().unwrap(),
+        "--scope", "src/api", "--scope", "src/web",
+    ]));
+
+    // Edits under both in-scope subtrees, identical in both bays.
+    std::fs::write(full_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    std::fs::write(full_dir.join("src/web/w.txt"), "web v2\n").unwrap();
+    std::fs::write(scoped_dir.join("src/api/a.txt"), "api a v2\n").unwrap();
+    std::fs::write(scoped_dir.join("src/web/w.txt"), "web v2\n").unwrap();
+
+    assert_success(&warehouse.run_at(&full_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&full_dir, &["stack", "edit both (full)"]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["load", "."]));
+    assert_success(&warehouse.run_at(&scoped_dir, &["stack", "edit both (scoped)"]));
+
+    let full_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "full"));
+    let scoped_tree = parcel_tree_hash(&warehouse, &pallet_head_hash(&warehouse, "scoped"));
+    assert_eq!(full_tree, scoped_tree,
+        "a multi-path scoped stack must produce a byte-identical root tree to a full stack");
+}
+
+#[test]
+fn a_scoped_bay_refuses_import_git() {
+    // import-git bypasses the overlay entirely (it builds parcels straight from the git tree);
+    // a scoped bay is not a sensible import target — refuse before even validating the path.
+    let warehouse = scoped_fixture("scoped-refuse-import-git");
+
+    let scoped_dir = warehouse.home.join("bay-scoped");
+    assert_success(&warehouse.run(&["bay", "add", "scoped", scoped_dir.to_str().unwrap(), "--scope", "src/api"]));
+
+    let import = warehouse.run_at(&scoped_dir, &["--json", "import-git", "."]);
+    assert_eq!(import.status.code(), Some(9), "stdout/err: {}", stdout(&import));
+    assert_eq!(json(&import)["error"]["code"], "sparse_workspace");
+}

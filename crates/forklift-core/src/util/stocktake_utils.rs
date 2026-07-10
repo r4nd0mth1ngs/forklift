@@ -14,6 +14,7 @@ use crate::model::tree_item::TreeItem;
 use crate::parser;
 use crate::traits::task_context::TaskContext;
 use crate::types::task::Task;
+use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{file_utils, inventory_utils, object_utils};
 
 /// The kind of a change reported by a stocktake.
@@ -102,6 +103,12 @@ pub async fn collect_staged_changes(head_tree_hash: Option<&str>) -> Result<Vec<
         None => None,
     };
 
+    // In a scoped bay the head carries out-of-scope subtrees the dock never materialized: those
+    // must be classified as sealed (skipped), not force-loaded and reported as `Removed`. Full
+    // scope (a plain bay or the main tree) classifies everything in scope, so the walk is
+    // unchanged there.
+    let scope = Arc::new(scope_utils::current_scope()?);
+
     let context = Arc::new(ChangeWalkContext::new());
     let executor = TaskExecutor::new(Arc::clone(&context));
 
@@ -110,6 +117,7 @@ pub async fn collect_staged_changes(head_tree_hash: Option<&str>) -> Result<Vec<
         String::new(),
         head_tree,
         Arc::clone(&children),
+        Arc::clone(&scope),
     ));
 
     executor.execute(root_task).await.map_err(|e|
@@ -142,9 +150,16 @@ pub async fn collect_staged_changes(head_tree_hash: Option<&str>) -> Result<Vec<
 fn walk_directory_staged(context: Arc<ChangeWalkContext>,
                          key: String,
                          head_tree: Option<TreeItem>,
-                         children: Arc<BTreeMap<String, Vec<String>>>)
+                         children: Arc<BTreeMap<String, Vec<String>>>,
+                         scope: Arc<MaterializationScope>)
                          -> impl Future<Output = Result<(), String>> + Send {
     async move {
+        // Hoisted once per directory (not per entry): a full (unscoped) scope always
+        // classifies everything in scope, so on the hot, common full-bay path the classify
+        // calls below (and their `join_key` allocations) are pure overhead — short-circuit
+        // them away entirely, the same way `stack_parcel` gates the whole overlay on `is_full()`.
+        let scope_is_full = scope.is_full();
+
         let inventory = load_shard_or_empty(&key)?;
         let mut found: Vec<Change> = Vec::new();
 
@@ -184,9 +199,13 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
         }
 
         // Files in the head that have no inventory entry at all count as staged removals
-        // (they will not be part of the next parcel).
+        // (they will not be part of the next parcel) — but only for in-scope files. An
+        // out-of-scope head file at a spine level was never materialized: it is sealed by
+        // hash, not removed, so it must not be reported as `Removed`.
         for (name, _) in head_files.iter() {
-            if inventory.get_item_by_name(name).is_none() {
+            if inventory.get_item_by_name(name).is_none()
+                && (scope_is_full || scope.classify(&join_key(&key, name)) == ScopeClass::InScope)
+            {
                 found.push(Change::new(ChangeKind::Removed, join_key(&key, name)));
             }
         }
@@ -212,6 +231,7 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
                 child_key.clone(),
                 child_head_tree,
                 Arc::clone(&children),
+                Arc::clone(&scope),
             )))?;
         }
 
@@ -219,6 +239,14 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
 
         for (name, subtree) in head_subtrees.iter() {
             if !child_names.contains(name.as_str()) {
+                // A head subtree with no inventory child is a whole-subtree staged removal —
+                // but only when it is in scope. An out-of-scope head subtree at a spine level
+                // is sealed by hash and was never materialized: skip it entirely (do not load
+                // the object, do not report its files as `Removed`).
+                if !scope_is_full && scope.classify(&join_key(&key, name)) != ScopeClass::InScope {
+                    continue;
+                }
+
                 let subtree_tree = object_utils::load_tree(&subtree.hash)?;
 
                 context.send_task(Box::pin(walk_directory_staged(
@@ -226,6 +254,7 @@ fn walk_directory_staged(context: Arc<ChangeWalkContext>,
                     join_key(&key, name),
                     Some(subtree_tree),
                     Arc::clone(&children),
+                    Arc::clone(&scope),
                 )))?;
             }
         }

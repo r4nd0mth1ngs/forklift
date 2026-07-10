@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::enums::dir_entry_type::DirEntryType;
 use crate::model::inventory::Inventory;
 use crate::model::tree_item::TreeItem;
+use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{file_utils, inventory_utils, object_utils};
 
 /// A single file operation needed to turn one tree into another in the working directory.
@@ -51,7 +52,13 @@ pub fn diff_trees(from: Option<&str>, to: &str) -> Result<(Vec<FileOp>, Vec<Stri
     let mut ops: Vec<FileOp> = Vec::new();
     let mut removed_dirs: Vec<String> = Vec::new();
 
-    diff_directory(from_tree.as_ref(), Some(&to_tree), "", &mut ops, &mut removed_dirs)?;
+    // In a scoped (sparse) bay this restricts materialization to the in-scope subtree(s): the
+    // walk copies nothing out of scope, so no out-of-scope blob is ever written and no absent
+    // object is touched. The scope is full (no restriction) in a plain bay or the main tree, so
+    // this is a no-op there and the behavior is byte-for-byte what it always was.
+    let scope = scope_utils::current_scope()?;
+
+    diff_directory(from_tree.as_ref(), Some(&to_tree), "", &mut ops, &mut removed_dirs, &scope)?;
 
     // Deepest directories first, so empty-directory cleanup can proceed bottom-up.
     removed_dirs.sort_by_key(|dir| std::cmp::Reverse(dir.matches('/').count()));
@@ -75,7 +82,14 @@ fn diff_directory(from: Option<&TreeItem>,
                   to: Option<&TreeItem>,
                   key: &str,
                   ops: &mut Vec<FileOp>,
-                  removed_dirs: &mut Vec<String>) -> Result<(), String> {
+                  removed_dirs: &mut Vec<String>,
+                  scope: &MaterializationScope) -> Result<(), String> {
+    // Hoisted once per directory (not per entry): a full (unscoped) scope always classifies
+    // everything in scope, so on the hot, common full-bay path the scope checks below are
+    // pure overhead — short-circuit them away entirely, the same way `stack_parcel` gates the
+    // whole overlay on `is_full()`.
+    let scope_is_full = scope.is_full();
+
     let from_files: BTreeMap<&String, &TreeItem> = from
         .map(|tree| tree.get_files().collect())
         .unwrap_or_default();
@@ -84,6 +98,20 @@ fn diff_directory(from: Option<&TreeItem>,
         .unwrap_or_default();
 
     for (name, to_item) in &to_files {
+        let child_key = join_key(key, name);
+
+        if !scope_is_full {
+            // A file where the scope expects a directory (a spine ancestor, or the in-scope
+            // prefix itself) is the §3.1 type change — refuse rather than guess. Out-of-scope
+            // files are sealed and never materialized; only genuinely in-scope files are written.
+            if scope.requires_directory(&child_key) {
+                return Err(scope_utils::type_changed_refusal(&child_key));
+            }
+            if scope.classify(&child_key) == ScopeClass::OutOfScope {
+                continue;
+            }
+        }
+
         let from_item = from_files.get(*name);
 
         let is_unchanged = from_item
@@ -92,7 +120,7 @@ fn diff_directory(from: Option<&TreeItem>,
 
         if !is_unchanged {
             ops.push(FileOp::Write {
-                path: join_key(key, name),
+                path: child_key,
                 hash: to_item.hash.clone(),
                 item_type: to_item.item_type,
                 is_new: from_item.is_none(),
@@ -101,8 +129,15 @@ fn diff_directory(from: Option<&TreeItem>,
     }
 
     for (name, _) in &from_files {
+        let child_key = join_key(key, name);
+
+        // Out-of-scope files were never materialized, so there is nothing to remove there.
+        if !scope_is_full && scope.classify(&child_key) == ScopeClass::OutOfScope {
+            continue;
+        }
+
         if !to_files.contains_key(*name) {
-            ops.push(FileOp::Remove { path: join_key(key, name) });
+            ops.push(FileOp::Remove { path: child_key });
         }
     }
 
@@ -114,6 +149,15 @@ fn diff_directory(from: Option<&TreeItem>,
         .unwrap_or_default();
 
     for (name, to_subtree) in &to_subtrees {
+        let child_key = join_key(key, name);
+
+        // An out-of-scope subtree is sealed by hash: never load it, never materialize it. A
+        // shift whose out-of-scope siblings changed simply re-materializes in scope; the new
+        // hashes flow into the next stack through the overlay (§3.2/§3.5).
+        if !scope_is_full && scope.classify(&child_key) == ScopeClass::OutOfScope {
+            continue;
+        }
+
         let from_subtree = from_subtrees.get(*name);
 
         // Identical subtree hashes mean identical content all the way down.
@@ -130,18 +174,24 @@ fn diff_directory(from: Option<&TreeItem>,
         diff_directory(
             from_loaded.as_ref(),
             Some(&to_loaded),
-            &join_key(key, name),
+            &child_key,
             ops,
-            removed_dirs
+            removed_dirs,
+            scope,
         )?;
     }
 
     for (name, from_subtree) in &from_subtrees {
+        let subtree_key = join_key(key, name);
+
+        if !scope_is_full && scope.classify(&subtree_key) == ScopeClass::OutOfScope {
+            continue;
+        }
+
         if !to_subtrees.contains_key(*name) {
             let from_loaded = object_utils::load_tree(&from_subtree.hash)?;
-            let subtree_key = join_key(key, name);
 
-            diff_directory(Some(&from_loaded), None, &subtree_key, ops, removed_dirs)?;
+            diff_directory(Some(&from_loaded), None, &subtree_key, ops, removed_dirs, scope)?;
             removed_dirs.push(subtree_key);
         }
     }
@@ -257,7 +307,12 @@ pub fn build_inventories_for_tree(root_tree_hash: &str) -> Result<BTreeMap<Strin
     let mut shards: BTreeMap<String, Inventory> = BTreeMap::new();
     let root_tree = object_utils::load_tree(root_tree_hash)?;
 
-    build_inventory_for_tree_directory(&root_tree, "", &mut shards)?;
+    // In a scoped bay only the in-scope subtree(s) are inventoried; the spine is descended but
+    // its out-of-scope files and siblings are never loaded or shard-ed. Full scope (a plain bay
+    // or the main tree) inventories the whole tree exactly as before.
+    let scope = scope_utils::current_scope()?;
+
+    build_inventory_for_tree_directory(&root_tree, "", &mut shards, &scope)?;
 
     Ok(shards)
 }
@@ -274,11 +329,25 @@ pub fn build_inventories_for_tree(root_tree_hash: &str) -> Result<BTreeMap<Strin
 /// * `Err(String)` - If a subtree could not be loaded or a file's metadata gathered.
 fn build_inventory_for_tree_directory(tree: &TreeItem,
                                       key: &str,
-                                      shards: &mut BTreeMap<String, Inventory>) -> Result<(), String> {
+                                      shards: &mut BTreeMap<String, Inventory>,
+                                      scope: &MaterializationScope) -> Result<(), String> {
+    // Hoisted once per directory (not per entry): a full (unscoped) scope always classifies
+    // everything in scope, so on the hot, common full-bay path the classify calls below are
+    // pure overhead — short-circuit them away entirely (`diff_directory` does the same).
+    let scope_is_full = scope.is_full();
+
     let mut inventory = Inventory::new();
 
     for (name, item) in tree.get_files() {
-        let file_path = PathBuf::from(join_key(key, name));
+        let file_key = join_key(key, name);
+
+        // A spine directory's own files are out of scope and were never materialized, so they
+        // are not inventoried; only genuinely in-scope files land in a shard.
+        if !scope_is_full && scope.classify(&file_key) != ScopeClass::InScope {
+            continue;
+        }
+
+        let file_path = PathBuf::from(file_key);
 
         inventory.add_item(inventory_utils::build_inventory_item_from_stat(
             &file_path,
@@ -290,8 +359,15 @@ fn build_inventory_for_tree_directory(tree: &TreeItem,
     shards.insert(key.to_string(), inventory);
 
     for (name, subtree) in tree.get_subtrees() {
+        let subtree_key = join_key(key, name);
+
+        // Out-of-scope subtrees are sealed by hash — never loaded, never inventoried.
+        if !scope_is_full && scope.classify(&subtree_key) == ScopeClass::OutOfScope {
+            continue;
+        }
+
         let subtree_loaded = object_utils::load_tree(&subtree.hash)?;
-        build_inventory_for_tree_directory(&subtree_loaded, &join_key(key, name), shards)?;
+        build_inventory_for_tree_directory(&subtree_loaded, &subtree_key, shards, scope)?;
     }
 
     Ok(())

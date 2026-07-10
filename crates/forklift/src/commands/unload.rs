@@ -16,6 +16,11 @@ use crate::output::{self, CommandOutput};
 /// * `Err(String)` - If there was an error while handling the command.
 pub fn handle_command(subject: &str) -> Result<(), String> {
     let path = WarehousePath::from_user_input(subject)?;
+
+    // An out-of-scope path is not materialized in a scoped bay, so there is nothing to stage
+    // for removal — refuse clearly rather than silently no-op (§7.6).
+    crate::commands::scope::ensure_path_in_scope(path.as_key())?;
+
     inventory_utils::stage_removal(&path)?;
 
     output::emit("unload", &Unloaded { path: path.as_key().to_string() });

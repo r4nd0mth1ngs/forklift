@@ -65,6 +65,11 @@ is slowest and largest in — so import **packs the store on the way out** ([`co
 so you never have to remember to). Pass `--no-compact` to skip it and leave the objects
 loose (e.g. to inspect the raw store or benchmark the loose baseline).
 
+Refuses in a scoped (sparse) bay (§7.6, see `bay add --scope` below): importing builds
+every pallet's history straight from the git tree, bypassing the sparse overlay entirely,
+and materializes the whole imported HEAD — not a sensible operation to scope. Run it from
+a full workspace.
+
 ### `export-git` — migrate back to git (§7.8)
 
 ```sh
@@ -546,6 +551,56 @@ all operate on the bay's pallet against the shared object store. The bay's direc
 a `.forklift` *file* (a redirect back to the warehouse), and its local state lives under
 `.forklift/bays/<name>/`.
 
+### `bay add --scope` — a scoped (sparse) bay (§7.6)
+
+```sh
+forklift bay add api ../myrepo.api --scope src/api          # materialize only src/api
+forklift bay add api ../myrepo.api --scope src/api --scope docs   # several subtrees
+forklift scope                                              # show the current scope
+```
+
+A **scoped bay** materializes and operates on only the subtree(s) you name, instead of the
+whole working tree — handy for a large monorepo, or to hand an agent exactly the corner it
+should touch. In this release the object store still holds **everything** (the sparseness is
+materialization-only), so a scoped bay is a local view over a full warehouse; nothing changes
+on the remote and nothing is fetched differently.
+
+Inside a scoped bay:
+
+- `load`, `stack`, `stocktake`, `diff`, `shift`, `park` all work on the in-scope subtree(s).
+  A `stack` rebuilds the root tree as *"the head with your in-scope subtree swapped in"* —
+  every out-of-scope sibling is carried forward by the exact hash the signed head already
+  commits, so the parcel you stack is **byte-identical** to what a full workspace stacking the
+  same change would produce. Out-of-scope content is cryptographically pinned, never guessed.
+- `stocktake`/`diff` report only in-scope changes; an out-of-scope path that only exists in
+  history is *sealed by hash*, not shown as removed.
+- A path argument outside the scope (`load src/web`, `blame src/web/x.rs`, `diff a b src/web`)
+  refuses with the `out_of_scope` code rather than doing something surprising.
+- `export-git`, `import-git` and `consolidate`/`cherry-pick` refuse in a scoped bay
+  (`sparse_workspace`): the first two bypass the sparse overlay and would export/import a
+  truncated or scope-inconsistent view, and scoped-bay merge is a later stage. Run them from
+  a full workspace.
+- `park` produces a parcel that stacks over the head's spine exactly like `stack`, so a parked
+  parcel from a scoped bay is byte-identical to what parking the same work in progress in a
+  full workspace would commit.
+- If a subtree you scoped to has since been replaced by a file (or vice versa) at the revision
+  you move onto, the operation refuses with `scope_path_type_changed` rather than guess — the
+  scope is no longer valid there, so re-scope or resolve in a full workspace.
+
+Scope is a property of **this checkout**, not the project: it is recorded bay-locally and is
+**never tracked**, so it is never pushed to the remote or imposed on collaborators.
+
+### `scope` — show the sparse-workspace scope (§7.6)
+
+```sh
+forklift scope            # this bay's materialization scope + the warehouse fetch scope
+forklift scope --json     # the same, as a machine envelope
+```
+
+Read-only. In a plain bay or the main tree it reports the full tree; in a scoped bay it lists
+the in-scope subtree prefixes. The warehouse fetch scope is reported too (it is *full* in this
+release — the store holds everything).
+
 ---
 
 ## 5. Parking work in progress
@@ -891,6 +946,9 @@ Errors set a deterministic exit code so scripts branch without parsing prose:
 | 4 | Conflict (working state blocks the operation) |
 | 5 | Diverged (a remote ref moved under a lift) |
 | 6 | Warehouse locked (another forklift process holds it) |
+| 7 | Out of scope (a path argument is outside a scoped bay's scope, §7.6) |
+| 8 | Scope path type changed (a scoped bay's spine path flipped dir↔file) |
+| 9 | Sparse workspace (a whole-tree verb is not supported in a scoped bay yet) |
 
 With `--json`, the same classification appears as `error.code` in the output
 envelope. See [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md).

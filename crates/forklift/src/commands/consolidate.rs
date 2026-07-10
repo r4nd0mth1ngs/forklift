@@ -30,6 +30,13 @@ use crate::output::{self, CommandOutput};
 /// * `Ok(())`      - If the consolidation completed (or was cleanly a no-op).
 /// * `Err(String)` - If there was an error while handling the command.
 pub async fn handle_command(target: &str) -> Result<(), String> {
+    // Scoped-bay merge is stage 2 of §7.6; until then a merge would materialize out-of-scope
+    // content into the bay and break the scope invariant, so it refuses cleanly here.
+    crate::commands::scope::refuse_in_scoped_bay(
+        "consolidate",
+        "Consolidate in a full workspace; scoped-bay merge lands in a later stage.",
+    )?;
+
     pallet_utils::validate_pallet_name(target)?;
 
     let current = pallet_utils::get_current_pallet_name()?;

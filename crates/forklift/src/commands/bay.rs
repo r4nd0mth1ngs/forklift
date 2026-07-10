@@ -1,7 +1,11 @@
 use std::path::PathBuf;
 use serde::Serialize;
 use forklift_core::globals;
-use forklift_core::util::{bay_utils, file_utils, object_utils, pallet_utils, shift_utils, warehouse_utils};
+use forklift_core::util::path_utils::WarehousePath;
+use forklift_core::util::scope_utils::MaterializationScope;
+use forklift_core::util::{
+    bay_utils, file_utils, object_utils, pallet_utils, scope_utils, shift_utils, warehouse_utils,
+};
 use crate::cli::BayAction;
 use crate::output::{self, CommandOutput};
 
@@ -15,7 +19,7 @@ use crate::output::{self, CommandOutput};
 /// * `Err(String)` - If a bay could not be created, listed or removed.
 pub fn handle_command(action: Option<BayAction>) -> Result<(), String> {
     match action {
-        Some(BayAction::Add { name, path }) => add(&name, path),
+        Some(BayAction::Add { name, path, scope }) => add(&name, path, scope),
         Some(BayAction::Remove { name }) => remove(&name),
         None => list(),
     }
@@ -24,7 +28,12 @@ pub fn handle_command(action: Option<BayAction>) -> Result<(), String> {
 /// Create a bay: a new pallet `<name>` at the current head, and a working directory bound
 /// to this warehouse — sharing its object store and refs, with its own working tree,
 /// inventory, current pallet and lock.
-fn add(name: &str, path: Option<String>) -> Result<(), String> {
+///
+/// When `scope_paths` are given, the bay is **scoped (sparse, §7.6)**: it materializes and
+/// operates on only those subtrees. The object store still holds everything (stage 1 is
+/// materialization-only sparseness); the scope is recorded bay-locally and drives the
+/// materialize, and every later stack copies the out-of-scope siblings forward by hash.
+fn add(name: &str, path: Option<String>, scope_paths: Vec<String>) -> Result<(), String> {
     pallet_utils::validate_pallet_name(name)?;
 
     // A bay is its own line of work: it checks out a new pallet named after it.
@@ -47,6 +56,13 @@ fn add(name: &str, path: Option<String>) -> Result<(), String> {
     let head = pallet_utils::get_pallet_head(&current)?.ok_or(format!(
         "Pallet \"{}\" has nothing stacked yet; stack something before opening a bay.", current
     ))?;
+
+    let tree = object_utils::load_parcel(&head)?.tree_hash;
+
+    // Normalize and validate the scope prefixes (against the head tree) before anything is
+    // created, so a typo'd or non-directory scope refuses up front rather than yielding a
+    // silently empty bay. Resolved while still at the warehouse root, before the cwd changes.
+    let scope = resolve_scope(&scope_paths, &tree)?;
 
     let bay_dir = resolve_bay_dir(name, path, &warehouse_root)?;
 
@@ -76,7 +92,12 @@ fn add(name: &str, path: Option<String>) -> Result<(), String> {
 
     pallet_utils::set_current_pallet_name(name)?;
 
-    let tree = object_utils::load_parcel(&head)?.tree_hash;
+    // Record the materialization scope before materializing — the materialize (and every
+    // later scope-aware verb in this bay) reads it back through `scope_utils::current_scope`.
+    if !scope.is_full() {
+        scope_utils::set_bay_scope(&scope)?;
+    }
+
     shift_utils::materialize_tree(None, &tree, "Creating the bay")?;
 
     output::emit("bay", &BayCreated {
@@ -84,9 +105,60 @@ fn add(name: &str, path: Option<String>) -> Result<(), String> {
         path: bay_dir.to_string_lossy().into_owned(),
         pallet: name.to_string(),
         head,
+        scope: scope.prefixes().to_vec(),
     });
 
     Ok(())
+}
+
+/// Normalize the `--scope` prefixes into a [`MaterializationScope`] and verify each names a
+/// directory (subtree) in the head tree. An empty list yields the full (unscoped) scope.
+fn resolve_scope(scope_paths: &[String], head_tree_hash: &str) -> Result<MaterializationScope, String> {
+    if scope_paths.is_empty() {
+        return Ok(MaterializationScope::full());
+    }
+
+    let mut keys: Vec<String> = Vec::new();
+
+    for raw in scope_paths {
+        let path = WarehousePath::from_user_input(raw)?;
+
+        if path.is_root() {
+            return Err(
+                "A scope of the warehouse root is the whole tree — open a plain bay (without \
+                --scope) instead.".to_string()
+            );
+        }
+
+        if !is_directory_in_tree(head_tree_hash, path.as_key())? {
+            return Err(format!(
+                "\"{}\" is not a directory in the current head, so it cannot be a bay scope.",
+                raw
+            ));
+        }
+
+        keys.push(path.as_key().to_string());
+    }
+
+    Ok(MaterializationScope::from_prefixes(keys))
+}
+
+/// Whether a warehouse path resolves to a subtree (directory) in the given root tree.
+fn is_directory_in_tree(root_tree_hash: &str, key: &str) -> Result<bool, String> {
+    let mut current = object_utils::load_tree(root_tree_hash)?;
+
+    for component in key.split('/') {
+        let subtree = current.get_subtrees()
+            .find(|(name, _)| name.as_str() == component)
+            .map(|(_, item)| item.hash.clone());
+
+        match subtree {
+            Some(hash) => current = object_utils::load_tree(&hash)?,
+            None => return Ok(false),
+        }
+    }
+
+    Ok(true)
 }
 
 /// Resolve where the bay's working directory should live: the given path (relative to the
@@ -161,6 +233,10 @@ struct BayCreated {
     path: String,
     pallet: String,
     head: String,
+
+    /// The bay's materialization scope prefixes (empty for a full, unscoped bay).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    scope: Vec<String>,
 }
 
 impl CommandOutput for BayCreated {
@@ -169,7 +245,16 @@ impl CommandOutput for BayCreated {
             "Opened bay \"{}\" at \"{}\" on pallet \"{}\" (head {}).",
             self.name, self.path, self.pallet, self.head
         );
-        println!("cd into it to work there — it shares this warehouse's objects and refs.");
+
+        if self.scope.is_empty() {
+            println!("cd into it to work there — it shares this warehouse's objects and refs.");
+        } else {
+            println!(
+                "Scoped (sparse) to: {}. cd into it to work there — it materializes only those \
+                subtrees and shares this warehouse's objects and refs.",
+                self.scope.join(", ")
+            );
+        }
     }
 }
 
