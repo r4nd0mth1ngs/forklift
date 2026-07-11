@@ -49,6 +49,15 @@ frozen forever.
 
 ## v1 hard limits
 Hashes are ASCII-hex (consistent with every other object format), so a recipe object at the
-64 MiB object ceiling lists roughly 987,000 chunks — about a 964 GiB file at the 1 MiB average
-chunk size. A single file beyond that is not representable by one `V1` recipe (hierarchical
-recipes are deferred).
+whole-object ceiling (`object_utils::MAX_OBJECT_BYTES`, 64 MiB) lists roughly 987,000 chunks —
+about a 964 GiB file at the 1 MiB average chunk size. A single file beyond that is not
+representable by one `V1` recipe (hierarchical recipes are deferred).
+
+That ceiling is enforced on the way *in*: a locally authored recipe that would exceed it is
+refused on write, and one handed over in a bundle or a lift is refused on import. It gates
+writes and imports only — a pre-existing over-ceiling object authored before this policy stays
+readable and checkout-able locally, forever, so an old store never bricks — but it can never be
+sent to a remote or into a bundle again: `docs/format/BUNDLE_FORMAT.md`'s "Grandfathered giants"
+section explains why no migration exists (identity is pinned by the signed tree entry that
+points at it) and how transport refuses it honestly, at the source, with the stable
+`oversized_transport_unsupported` code.

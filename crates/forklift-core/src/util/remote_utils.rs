@@ -1301,6 +1301,17 @@ fn join_path(prefix: &str, name: &str) -> String {
     }
 }
 
+/// Refuse to put an object above the whole-object ceiling on the wire — the client-side half of
+/// the maintainer's chosen posture for a grandfathered giant (see `bundle_utils`'s writer-side
+/// refusal for the full reasoning: such an object stays readable locally forever, but no
+/// migration preserves its signed identity, so nothing accepts it in transport). Checked here,
+/// where the upload path already holds the object's bytes for the imminent network call, so
+/// refusing costs nothing extra and the bytes never reach the wire — an honest client-side
+/// failure instead of the server's own import refusal surfacing as an opaque mid-lift error.
+fn refuse_if_over_ceiling_for_upload(hash: &str, bytes: &[u8]) -> Result<(), String> {
+    scope_utils::refuse_if_over_object_ceiling(&format!("object {}", hash), bytes.len())
+}
+
 /// Upload (concurrently) the objects of the given hashes.
 async fn upload_objects(client: &RemoteClient, hashes: &[String]) -> Result<(), String> {
     if hashes.is_empty() {
@@ -1320,6 +1331,7 @@ async fn upload_objects(client: &RemoteClient, hashes: &[String]) -> Result<(), 
                 .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
 
             let bytes = file_utils::retrieve_object_by_hash(&hash)?;
+            refuse_if_over_ceiling_for_upload(&hash, &bytes)?;
 
             client.upload_object(&hash, bytes).await
         });
@@ -1397,6 +1409,7 @@ async fn upload_to_targets(client: &RemoteClient,
                 .map_err(|_| "The transfer pool was closed unexpectedly.".to_string())?;
 
             let bytes = file_utils::retrieve_object_by_hash(&hash)?;
+            refuse_if_over_ceiling_for_upload(&hash, &bytes)?;
 
             client.put_presigned(&url, bytes).await
         });
@@ -2196,5 +2209,69 @@ mod tests {
 
         assert_eq!(code, scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED);
         assert!(message.contains("src/big.bin"), "the refusal names the full path: {}", message);
+    }
+
+    /// Plant a blob above the whole-object ceiling directly, bypassing `LooseObject::store`'s
+    /// write-side ceiling with a raw, non-durable write. The only way such an object can exist
+    /// locally is if it predates the ceiling — mirrors the grandfathered-giant fixture
+    /// `bundle_utils`'s own writer-side-refusal tests use (there, imported via an old-version
+    /// bundle; here, planted directly, since this module has no bundle-import dependency).
+    fn store_giant_blob_bypassing_ceiling() -> String {
+        use crate::model::blob::Blob;
+
+        let mut object = LooseObjectBuilder::build_blob(&Blob {
+            content: vec![0u8; object_utils::MAX_OBJECT_BYTES + 1],
+        });
+        let compressed = object.compress().unwrap();
+        let (path, file_name) = file_utils::get_path_for_object(&object.hash).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(std::path::Path::new(&path).join(&file_name), compressed).unwrap();
+        object.hash
+    }
+
+    /// `upload_objects` (the direct-PUT / legacy-remote upload path) refuses an over-ceiling
+    /// object before ever touching the network: the size check runs immediately after the bytes
+    /// are loaded, before the client call — so pointing the client at an address nothing listens
+    /// on still produces the honest size refusal rather than a connection error, proving the
+    /// bytes never left. This is the client-side half of the maintainer's chosen posture: a
+    /// grandfathered giant refuses honestly at the source instead of surfacing as an opaque
+    /// mid-lift error from the server's own import refusal.
+    #[test]
+    fn upload_objects_refuses_an_over_ceiling_object_before_the_wire() {
+        let _scratch = Scratch::new("upload-objects-ceiling");
+        let hash = store_giant_blob_bypassing_ceiling();
+
+        // Nothing listens here: if the wire were ever touched, this would surface as a
+        // connection error, not the ceiling refusal.
+        let client = RemoteClient::new("http://127.0.0.1:1", None).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let error = runtime.block_on(upload_objects(&client, &[hash.clone()])).unwrap_err();
+        let (code, message, next_step) = scope_utils::decode_refusal(&error)
+            .expect("the refusal must decode via the shared sentinel framing");
+
+        assert_eq!(code, scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED);
+        assert!(message.contains(&hash), "the refusal names the object: {}", message);
+        assert!(next_step.contains("signed identity"), "states no migration exists: {}", next_step);
+    }
+
+    /// The same refusal on `upload_to_targets` (the presigned-PUT staging path) — the other of
+    /// the two upload flows `negotiate_and_upload` dispatches between.
+    #[test]
+    fn upload_to_targets_refuses_an_over_ceiling_object_before_the_wire() {
+        let _scratch = Scratch::new("upload-to-targets-ceiling");
+        let hash = store_giant_blob_bypassing_ceiling();
+
+        let client = RemoteClient::new("http://127.0.0.1:1", None).unwrap();
+        let mut targets = BTreeMap::new();
+        targets.insert(hash.clone(), "http://127.0.0.1:1/presigned".to_string());
+
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let error = runtime.block_on(upload_to_targets(&client, &targets)).unwrap_err();
+        let (code, message, _) = scope_utils::decode_refusal(&error)
+            .expect("the refusal must decode via the shared sentinel framing");
+
+        assert_eq!(code, scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED);
+        assert!(message.contains(&hash), "the refusal names the object: {}", message);
     }
 }

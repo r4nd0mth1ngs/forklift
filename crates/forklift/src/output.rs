@@ -196,6 +196,13 @@ pub enum ErrorCode {
     /// not shipped yet, so it refuses client-side rather than ship a recipe whose chunks can
     /// never arrive. Removed once chunk transport ships (§9.4b).
     ChunkedTransportUnsupported,
+
+    /// A bundle or lift was asked to send an object above the whole-object ceiling: a
+    /// grandfathered giant (authored, or imported via an old-version bundle, before the ceiling
+    /// existed) stays readable and checkout-able locally forever, but no migration preserves its
+    /// signed identity, so nothing accepts it in transport. Refuses client-side (or at the
+    /// bundle-building source) rather than ship something no reader could finish importing.
+    OversizedTransportUnsupported,
 }
 
 impl ErrorCode {
@@ -215,6 +222,7 @@ impl ErrorCode {
             ErrorCode::NarrowUnclean        => scope_utils::CODE_NARROW_UNCLEAN,
             ErrorCode::ScopePruneBlocked    => scope_utils::CODE_SCOPE_PRUNE_BLOCKED,
             ErrorCode::ChunkedTransportUnsupported => scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED,
+            ErrorCode::OversizedTransportUnsupported => scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED,
         }
     }
 
@@ -235,6 +243,7 @@ impl ErrorCode {
             ErrorCode::NarrowUnclean        => 12,
             ErrorCode::ScopePruneBlocked    => 13,
             ErrorCode::ChunkedTransportUnsupported => 14,
+            ErrorCode::OversizedTransportUnsupported => 15,
         }
     }
 
@@ -249,6 +258,7 @@ impl ErrorCode {
             _ if code == scope_utils::CODE_NARROW_UNCLEAN         => Some(ErrorCode::NarrowUnclean),
             _ if code == scope_utils::CODE_SCOPE_PRUNE_BLOCKED    => Some(ErrorCode::ScopePruneBlocked),
             _ if code == scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED => Some(ErrorCode::ChunkedTransportUnsupported),
+            _ if code == scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED => Some(ErrorCode::OversizedTransportUnsupported),
             _ => None,
         }
     }

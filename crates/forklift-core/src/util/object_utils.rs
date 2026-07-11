@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use crate::builder::object::loose_object_builder::LooseObjectBuilder;
 use crate::enums::dir_entry_type::DirEntryType;
@@ -12,6 +12,34 @@ use crate::model::recipe::{Recipe, RecipeChunk};
 use crate::model::tree_item::TreeItem;
 use crate::parser;
 use crate::util::{byte_utils, chunk_utils, fanout_utils, file_utils};
+
+/// The largest *whole* object any store or bundle will accept on the way in — the write/import
+/// ceiling that closes the max-object-size policy (DESIGN.html §9.4b, §5.0 row D item 7). After
+/// chunking, the only object that can legitimately approach it is a big **tree** (a very large
+/// single directory) or a big **recipe** (a very large chunked file's index): a blob is always
+/// below the chunk threshold and a chunk is always at or below `MAX_CHUNK_BYTES`, so neither can
+/// reach it.
+///
+/// It gates the way *in* only — [`store_object_bytes`] (import) and `LooseObject::store` (local
+/// authorship) refuse an over-ceiling object, but no read path calls either, so a pre-existing
+/// over-ceiling object authored before this policy stays fully readable and an old store never
+/// bricks. An old-version bundle may still carry such a grandfathered giant; it is imported through
+/// [`store_object_stream`], which deliberately does not enforce this ceiling.
+pub const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+
+/// The largest object [`import_bundle_reader`](crate::util::bundle_utils) buffers whole before it
+/// switches to the streaming store path. At or below it a bundle record is read into memory and
+/// stored via [`store_object_bytes`] (memory bounded by this size); above it,
+/// [`store_object_stream`] hashes and compresses it to a temp file without ever holding it whole.
+/// It is `MAX_CHUNK_BYTES` so a legitimate `Chunk` object (never larger than that payload) is
+/// small enough to take the buffered path in the common case, while the streaming path still
+/// enforces the same per-chunk ceiling on anything that reaches it.
+pub const STREAM_STORE_THRESHOLD_BYTES: usize = chunk_utils::MAX_CHUNK_BYTES;
+
+// The ceiling must exceed every object a healthy store authors below it — a blob (< threshold), a
+// chunk (<= max chunk), and the chunk threshold itself — so the ordering is a compile-time freeze.
+const _: () = assert!(MAX_OBJECT_BYTES > chunk_utils::CHUNK_THRESHOLD_BYTES);
+const _: () = assert!(MAX_OBJECT_BYTES > chunk_utils::MAX_CHUNK_BYTES);
 
 /// Push a new line character to the content.
 ///
@@ -371,6 +399,11 @@ pub fn store_object_bytes(claimed_hash: &str, bytes: &[u8]) -> Result<bool, Stri
         ));
     }
 
+    // Whole-object ceiling: an over-`MAX_OBJECT_BYTES` object is refused on the way in (import and
+    // local write share this policy). Reads never reach here, so a grandfathered giant stays
+    // readable; only new authorship or a fresh import is gated.
+    enforce_object_ceiling(bytes)?;
+
     // Per-type ceiling (review W2): a `Chunk`-typed object above `MAX_CHUNK_BYTES` is refused on
     // store as well as on read, even though a larger object would otherwise be a legal object.
     // Without this a malicious recipe could reference an over-size chunk and the streaming-
@@ -452,6 +485,244 @@ fn enforce_chunk_ceiling(claimed_hash: &str, bytes: &[u8]) -> Result<(), String>
     }
 
     Ok(())
+}
+
+/// The honest refusal for an object that exceeds the whole-object ceiling: it names the limit and,
+/// for the one object kind that can legitimately approach it, the practical bound the ceiling
+/// implies (a very large single directory, or an un-representably large chunked file) — so a
+/// maintainer who hits it learns *why*, not just *that*, they hit it.
+fn object_ceiling_error(object_type: Option<&ObjectType>, len: usize) -> String {
+    let implication = match object_type {
+        // ~88 bytes/entry ⇒ ~762,000 entries in one directory at the ceiling.
+        Some(ObjectType::Tree) => ": a single directory of roughly 762,000 entries. Split it \
+            across subdirectories",
+        // ~68 bytes/entry ⇒ ~987,000 chunks ⇒ ~964 GiB at the average chunk size.
+        Some(ObjectType::Recipe) => ": a chunked file of roughly 964 GiB at the average chunk \
+            size. A single file beyond that is not representable by one recipe",
+        _ => "",
+    };
+
+    format!(
+        "Object is {} bytes, above the {}-byte whole-object ceiling{}; refusing to store it.",
+        len, MAX_OBJECT_BYTES, implication
+    )
+}
+
+/// Refuse an object whose byte length exceeds the whole-object ceiling — the write-side check, for
+/// a locally authored object whose type is already known (a tree or recipe `stack` is about to
+/// author). The import-side counterpart is the peek-and-check inside [`store_object_bytes`].
+///
+/// # Arguments
+/// * `object_type` - The object's type (only tailors the message).
+/// * `len`         - The object's full (uncompressed) byte length.
+///
+/// # Returns
+/// * `Ok(())`      - If the object is within the ceiling.
+/// * `Err(String)` - If it exceeds `MAX_OBJECT_BYTES`.
+pub fn check_object_ceiling(object_type: &ObjectType, len: usize) -> Result<(), String> {
+    if len <= MAX_OBJECT_BYTES {
+        return Ok(());
+    }
+
+    Err(object_ceiling_error(Some(object_type), len))
+}
+
+/// Enforce the whole-object ceiling on the way *into* the store from an untrusted source (a bundle
+/// or a remote). The check is on the true byte length, so a lying header cannot slip an over-ceiling
+/// object through; the peeked type only tailors the message (and a header that cannot be peeked
+/// still fails on length alone).
+fn enforce_object_ceiling(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() <= MAX_OBJECT_BYTES {
+        return Ok(());
+    }
+
+    let object_type = peek_object_header(bytes).ok().map(|(object_type, _)| object_type);
+    Err(object_ceiling_error(object_type.as_ref(), bytes.len()))
+}
+
+/// What a streamed store attempt observed about the bytes it consumed.
+struct StreamOutcome {
+    /// The total raw bytes actually read (for the exact-length/truncation check).
+    read_total: u64,
+
+    /// The Blake3 hex hash of those bytes (to verify against the claimed hash).
+    hash: String,
+}
+
+/// Store an object streamed from `reader`, bounding memory to a small constant regardless of the
+/// object's size or a lying declared length — the unconditional defense behind the bundle-import
+/// bomb ceiling (DESIGN.html §9.4b, §5.0 row D item 7). Exactly `expected_len` bytes are read (a
+/// shorter stream is reported as truncation), hashed through an incremental Blake3, and
+/// zstd-encoded incrementally to a temp file in the object's own shard folder; the temp file is
+/// promoted with an atomic rename **only** if the finished hash matches `claimed_hash`. A mismatch
+/// (a bomb, a corrupt or a truncated record) discards the temp file — so nothing unverified ever
+/// lands and a failed import cleans up after itself.
+///
+/// The whole-object ceiling (`MAX_OBJECT_BYTES`) is deliberately *not* enforced here: this path
+/// must still import a grandfathered over-ceiling object from an old-version bundle. The per-type
+/// chunk ceiling *is* enforced — a `Chunk`-typed object whose payload exceeds `MAX_CHUNK_BYTES` is
+/// refused mid-stream, exactly as [`store_object_bytes`] refuses it whole.
+///
+/// # Arguments
+/// * `claimed_hash` - The hash the streamed bytes must have.
+/// * `reader`       - The source of the raw (uncompressed) object bytes.
+/// * `expected_len` - The exact number of bytes the record declares (for the truncation check).
+///
+/// # Returns
+/// * `Ok(true)`    - The object was verified and stored.
+/// * `Ok(false)`   - The object was already present (temp discarded, nothing written).
+/// * `Err(String)` - On a short/truncated stream, a hash mismatch, an over-ceiling chunk, or I/O.
+pub fn store_object_stream(claimed_hash: &str,
+                           reader: &mut impl Read,
+                           expected_len: u64) -> Result<bool, String> {
+    let (folder, file_name) = file_utils::get_path_for_object(claimed_hash)?;
+    let folder_path = std::path::Path::new(&folder);
+    file_utils::create_folder_if_not_exists(folder_path)?;
+
+    // A temp file in the object's own shard folder, unique per write. `write_file_atomically`
+    // (`file_utils.rs`) names its own temp files unique-per-write the same way (a process-wide
+    // atomic counter plus the pid), off its own independent `TEMP_FILE_COUNTER` — two
+    // independent counters can coincidentally reach the same numeric value, so if this path used
+    // the identical `"{name}.tmp{pid}-{id}"` infix, a write here and a concurrent
+    // `write_file_atomically` write for the *same* hash (e.g. one thread streaming a large
+    // duplicate-hash bundle record while another fetches the same hash loose) could collide on
+    // one temp path — precisely the hazard `write_file_atomically`'s own per-write-uniqueness
+    // comment exists to prevent. A distinct infix (`.stream.tmp` here, `.tmp` there) rules the
+    // collision out structurally: the two paths can never match regardless of either counter's
+    // value, which is stronger than relying on the counters staying apart.
+    static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let write_id = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp_path = folder_path.join(format!(
+        "{}.stream.tmp{}-{}", file_name, std::process::id(), write_id
+    ));
+
+    // Stream to the temp file, hashing and (chunk-)ceiling-checking as we go. Wrapped so any error
+    // path removes the temp file below — a failed import must not leave a partial file behind.
+    let outcome = match stream_to_temp(claimed_hash, reader, expected_len, &temp_path) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(e);
+        }
+    };
+
+    // Exactly `expected_len`, not fewer: a short stream is a truncated record, reported the same
+    // way the buffered import path reports it.
+    if outcome.read_total != expected_len {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!(
+            "The bundle is truncated: a record declared {} bytes but only {} remained.",
+            expected_len, outcome.read_total
+        ));
+    }
+
+    // Content-addressing: nothing unverified may land.
+    if outcome.hash != claimed_hash {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(format!(
+            "Object content does not match its claimed hash {} (actual: {}); refusing to store it.",
+            claimed_hash, outcome.hash
+        ));
+    }
+
+    // Already present (an idempotent re-import): drop the temp and report the skip.
+    if file_utils::does_object_exist(claimed_hash)? {
+        let _ = std::fs::remove_file(&temp_path);
+        return Ok(false);
+    }
+
+    // Promote atomically. The temp file's bytes were already fsynced in `stream_to_temp`, so the
+    // rename can never publish a name whose contents never reached disk; fsync the directory so the
+    // rename itself survives power loss (mirrors `file_utils::write_file_atomically`).
+    let final_path = folder_path.join(&file_name);
+    std::fs::rename(&temp_path, &final_path)
+        .map_err(|e| format!("Error while moving a streamed object into place: {}", e))?;
+    file_utils::sync_dir(folder_path)?;
+
+    Ok(true)
+}
+
+/// The streaming core of [`store_object_stream`]: read exactly up to `expected_len` bytes from
+/// `reader`, hash them, zstd-encode them to `temp_path`, and enforce the per-chunk ceiling on a
+/// `Chunk`-typed object mid-stream. Returns what it observed; the caller verifies length + hash and
+/// promotes or discards the temp file. Peak memory is one read block plus zstd's own window —
+/// never the whole object.
+fn stream_to_temp(claimed_hash: &str,
+                  reader: &mut impl Read,
+                  expected_len: u64,
+                  temp_path: &Path) -> Result<StreamOutcome, String> {
+    let temp_file = std::fs::File::create(temp_path)
+        .map_err(|e| format!("Error while creating a streamed object temp file: {}", e))?;
+    let mut encoder = zstd::stream::Encoder::new(std::io::BufWriter::new(temp_file), 0)
+        .map_err(|e| format!("Error while starting a streamed object: {}", e))?;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut read_total: u64 = 0;
+    // The object header (version, type, length, null) so a `Chunk`-typed object's payload can be
+    // ceiling-checked mid-stream. `header_len` becomes `Some` once the header parses.
+    let mut object_type: Option<ObjectType> = None;
+    let mut header_len: usize = 0;
+    let mut prefix: Vec<u8> = Vec::new();
+    let mut block = vec![0u8; 64 * 1024];
+
+    let mut bounded = reader.take(expected_len);
+
+    loop {
+        let read = bounded.read(&mut block)
+            .map_err(|e| format!("Error while reading a streamed object: {}", e))?;
+        if read == 0 {
+            break;
+        }
+
+        let data = &block[..read];
+        hasher.update(data);
+        encoder.write_all(data)
+            .map_err(|e| format!("Error while writing a streamed object: {}", e))?;
+        read_total += read as u64;
+
+        // Peek the header once (a real header terminates within a handful of bytes; if it has not
+        // parsed within a small prefix the object is not a recognizable chunk, so stop trying and
+        // let the read-side parser enforce the ceiling on anything read back as a chunk).
+        if object_type.is_none() && header_len == 0 {
+            prefix.extend_from_slice(data);
+            match peek_object_header(&prefix) {
+                Ok((peeked_type, peeked_header_len)) => {
+                    object_type = Some(peeked_type);
+                    header_len = peeked_header_len;
+                }
+                Err(_) if prefix.len() > 4096 => {
+                    // Sentinel: give up peeking, but do not fail — an unrecognized header is not a
+                    // chunk, and the hash check still guards what actually lands.
+                    header_len = usize::MAX;
+                }
+                Err(_) => {}
+            }
+        }
+
+        // A `Chunk`-typed object whose payload exceeds the per-chunk ceiling is refused mid-stream,
+        // before the whole (bounded) payload is even written — the streaming twin of
+        // `enforce_chunk_ceiling`.
+        if object_type == Some(ObjectType::Chunk)
+            && read_total.saturating_sub(header_len as u64) > chunk_utils::MAX_CHUNK_BYTES as u64 {
+            return Err(format!(
+                "Chunk object {} exceeds the {}-byte chunk ceiling; refusing to store it.",
+                claimed_hash, chunk_utils::MAX_CHUNK_BYTES
+            ));
+        }
+    }
+
+    let buf_writer = encoder.finish()
+        .map_err(|e| format!("Error while finishing a streamed object: {}", e))?;
+    let temp_file = buf_writer.into_inner()
+        .map_err(|e| format!("Error while flushing a streamed object: {}", e.into_error()))?;
+    if file_utils::fsync_enabled() {
+        temp_file.sync_all()
+            .map_err(|e| format!("Error while syncing a streamed object: {}", e))?;
+    }
+    // Close the handle before the caller renames it (renaming an open file fails on Windows).
+    drop(temp_file);
+
+    Ok(StreamOutcome { read_total, hash: hasher.finalize().to_hex().to_string() })
 }
 
 /// Whether an ingest should persist the objects it produces (`load`, `park`) or only compute
@@ -876,6 +1147,193 @@ mod tests {
         // Identical content → identical recipe hash → whole-file dedup, and no new chunk objects.
         assert_eq!(first.hash, second.hash, "identical content shares the recipe hash");
         assert_eq!(count_after_first, count_after_second, "no new objects for identical content");
+    }
+
+    /// The whole-object ceiling refuses a locally authored over-size **tree** on the way in, with
+    /// an honest message that names the limit and the practical bound (a huge single directory).
+    /// A pre-existing giant is never re-authored, so this gates only new authorship.
+    #[test]
+    fn store_refuses_an_over_ceiling_tree_on_write() {
+        use crate::model::object::loose_object::LooseObject;
+        let _scratch = Scratch::new("ceiling-write-tree");
+
+        // The ceiling check runs before the object is hashed or written, so the (dummy) hash is
+        // never consulted — a cheap zeroed buffer one byte over the ceiling is enough.
+        let mut giant = LooseObject {
+            content: vec![0u8; MAX_OBJECT_BYTES + 1],
+            object_type: ObjectType::Tree,
+            hash: "0".repeat(64),
+        };
+
+        let err = giant.store().expect_err("an over-ceiling tree must be refused on write");
+        assert!(err.contains("whole-object ceiling"), "names the limit: {}", err);
+        assert!(err.contains("directory"), "names the practical bound for a tree: {}", err);
+    }
+
+    /// The same ceiling refuses a locally authored over-size **recipe**, with the recipe-specific
+    /// bound (an un-representably large chunked file).
+    #[test]
+    fn store_refuses_an_over_ceiling_recipe_on_write() {
+        use crate::model::object::loose_object::LooseObject;
+        let _scratch = Scratch::new("ceiling-write-recipe");
+
+        let mut giant = LooseObject {
+            content: vec![0u8; MAX_OBJECT_BYTES + 1],
+            object_type: ObjectType::Recipe,
+            hash: "0".repeat(64),
+        };
+
+        let err = giant.store().expect_err("an over-ceiling recipe must be refused on write");
+        assert!(err.contains("whole-object ceiling"), "names the limit: {}", err);
+        assert!(err.contains("chunked file"), "names the practical bound for a recipe: {}", err);
+    }
+
+    /// `check_object_ceiling` accepts anything at or below the ceiling — the write-path fast path
+    /// that never allocates a giant to learn it is fine.
+    #[test]
+    fn check_object_ceiling_accepts_up_to_the_limit() {
+        assert!(check_object_ceiling(&ObjectType::Tree, MAX_OBJECT_BYTES).is_ok());
+        assert!(check_object_ceiling(&ObjectType::Recipe, 0).is_ok());
+        assert!(check_object_ceiling(&ObjectType::Tree, MAX_OBJECT_BYTES + 1).is_err());
+    }
+
+    /// A large (streamed) object round-trips: it is hashed and zstd-encoded to a temp file, then
+    /// promoted, and reads back byte-identical — memory bounded, never the whole object at once.
+    #[test]
+    fn store_object_stream_round_trips_a_large_object() {
+        let _scratch = Scratch::new("stream-roundtrip");
+
+        // A real blob object above the streaming threshold (so the stream path is taken and its
+        // header parses as a non-chunk type).
+        let content = vec![0x5Au8; STREAM_STORE_THRESHOLD_BYTES + 500_000];
+        let object = LooseObjectBuilder::build_blob(&Blob { content });
+        let raw = object.content.clone();
+
+        let mut reader = std::io::Cursor::new(raw.clone());
+        let stored = store_object_stream(&object.hash, &mut reader, raw.len() as u64).unwrap();
+        assert!(stored, "the object was newly stored");
+
+        assert_eq!(file_utils::retrieve_object_by_hash(&object.hash).unwrap(), raw);
+
+        // Storing it again is an idempotent skip — nothing new written.
+        let mut reader = std::io::Cursor::new(raw.clone());
+        let stored = store_object_stream(&object.hash, &mut reader, raw.len() as u64).unwrap();
+        assert!(!stored, "an already-present object is skipped");
+    }
+
+    /// A streamed object whose bytes do not match the claimed hash is refused, nothing lands, and
+    /// the temp file is cleaned up — the streaming twin of `store_object_bytes`'s hash check, the
+    /// defense that catches an under-ceiling declared-length lie without ever buffering the object.
+    #[test]
+    fn store_object_stream_refuses_a_hash_mismatch_and_leaves_nothing() {
+        let _scratch = Scratch::new("stream-mismatch");
+
+        let content = vec![0x11u8; STREAM_STORE_THRESHOLD_BYTES + 100_000];
+        let object = LooseObjectBuilder::build_blob(&Blob { content });
+        let raw = object.content.clone();
+        let wrong_hash = hash_object_bytes(b"a different object entirely");
+
+        let mut reader = std::io::Cursor::new(raw.clone());
+        let err = store_object_stream(&wrong_hash, &mut reader, raw.len() as u64)
+            .expect_err("a hash mismatch must be refused");
+        assert!(err.contains("does not match its claimed hash"), "{}", err);
+
+        assert!(!file_utils::does_object_exist(&wrong_hash).unwrap(), "nothing unverified may land");
+        assert!(no_temp_files_left(&_scratch.root), "the temp file must be cleaned up");
+    }
+
+    /// A `Chunk`-typed object that reaches the streaming path with a payload above the per-chunk
+    /// ceiling is refused mid-stream — the streaming enforcement of W2, so a hand-crafted bundle
+    /// cannot slip an over-size chunk past the buffered check by making it large enough to stream.
+    #[test]
+    fn store_object_stream_refuses_an_over_ceiling_chunk() {
+        let _scratch = Scratch::new("stream-chunk-ceiling");
+
+        let over = vec![0x22u8; chunk_utils::MAX_CHUNK_BYTES + 100_000];
+        let object = LooseObjectBuilder::build_chunk(&Chunk { content: over });
+        let raw = object.content.clone();
+
+        let mut reader = std::io::Cursor::new(raw.clone());
+        let err = store_object_stream(&object.hash, &mut reader, raw.len() as u64)
+            .expect_err("an over-ceiling chunk must be refused");
+        assert!(err.contains("chunk ceiling"), "{}", err);
+        assert!(!file_utils::does_object_exist(&object.hash).unwrap(), "nothing unverified may land");
+        assert!(no_temp_files_left(&_scratch.root), "the temp file must be cleaned up");
+    }
+
+    /// A stream shorter than its declared length is reported as truncation, and nothing lands.
+    #[test]
+    fn store_object_stream_reports_truncation() {
+        let _scratch = Scratch::new("stream-truncated");
+
+        let content = vec![0x33u8; 500_000];
+        let object = LooseObjectBuilder::build_blob(&Blob { content });
+        let raw = object.content.clone();
+
+        // Declare far more than the stream actually carries (above the streaming threshold).
+        let mut reader = std::io::Cursor::new(raw.clone());
+        let declared = (STREAM_STORE_THRESHOLD_BYTES + 1_000_000) as u64;
+        let err = store_object_stream(&object.hash, &mut reader, declared)
+            .expect_err("a short stream must be truncation");
+        assert!(err.contains("truncated"), "{}", err);
+        assert!(no_temp_files_left(&_scratch.root), "the temp file must be cleaned up");
+    }
+
+    /// `store_object_stream`'s temp file must never collide with `write_file_atomically`'s (the
+    /// review's W2 finding): both name a temp file `"{name}.tmp{pid}-{id}"`-style off their own
+    /// independent process-wide counter, so two concurrent writes of the *same* hash — one via
+    /// each path — could reach the identical (pid, id) pair by coincidence if the infixes matched.
+    /// Firing several of each concurrently at the same hash proves the fix: every writer converges
+    /// on the same correct bytes with no corruption, regardless of interleaving.
+    #[test]
+    fn store_object_stream_never_collides_with_write_file_atomically_on_the_same_hash() {
+        let scratch = Scratch::new("stream-vs-atomic-no-collision");
+
+        let content = vec![0x99u8; STREAM_STORE_THRESHOLD_BYTES + 50_000];
+        let object = LooseObjectBuilder::build_blob(&Blob { content });
+        let raw = object.content.clone();
+        let hash = object.hash.clone();
+        let root = scratch.root.clone();
+
+        let handles: Vec<_> = (0..8).map(|i| {
+            let raw = raw.clone();
+            let hash = hash.clone();
+            let root = root.clone();
+
+            std::thread::spawn(move || {
+                // `StorageRootScope` is thread-local, so a spawned thread must re-enter it.
+                let _scope = crate::globals::StorageRootScope::enter(&root);
+
+                if i % 2 == 0 {
+                    store_object_bytes(&hash, &raw)
+                } else {
+                    let mut reader = std::io::Cursor::new(raw.clone());
+                    store_object_stream(&hash, &mut reader, raw.len() as u64)
+                }
+            })
+        }).collect();
+
+        for handle in handles {
+            handle.join().expect("no writer thread panics").expect("no writer fails");
+        }
+
+        assert_eq!(file_utils::retrieve_object_by_hash(&hash).unwrap(), raw,
+            "the object lands byte-identical regardless of which writer's temp path won the race");
+    }
+
+    /// Whether any `.tmp*` file is left under the object store (a failed streamed store must clean
+    /// up after itself).
+    fn no_temp_files_left(root: &Path) -> bool {
+        let objects = root.join(crate::globals::FOLDER_NAME_FORKLIFT_ROOT).join("objects");
+        let Ok(folders) = std::fs::read_dir(&objects) else { return true; };
+        for folder in folders.flatten() {
+            if let Ok(files) = std::fs::read_dir(folder.path()) {
+                for file in files.flatten() {
+                    if file.file_name().to_string_lossy().contains(".tmp") { return false; }
+                }
+            }
+        }
+        true
     }
 
     /// Count loose objects under a warehouse root (chunks + recipes + anything else).

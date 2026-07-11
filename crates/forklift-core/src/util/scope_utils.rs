@@ -54,6 +54,16 @@ pub const CODE_SCOPE_PRUNE_BLOCKED: &str = "scope_prune_blocked";
 /// duplicated.
 pub const CODE_CHUNKED_TRANSPORT_UNSUPPORTED: &str = "chunked_transport_unsupported";
 
+/// Not a scope/sparse-workspace code either — same piggy-backing precedent as
+/// `CODE_CHUNKED_TRANSPORT_UNSUPPORTED` above. A **grandfathered** object above the whole-object
+/// ceiling (authored, or imported via an old-version bundle, before the ceiling existed) is
+/// readable and checkout-able locally forever — the ceiling gates writes and imports only — but
+/// nothing accepts it on the wire, and there is no migration that would preserve its signed
+/// identity (a blob's hash is pinned inside a signed tree; re-chunking it would mint a different
+/// hash and so a different, unsigned tree). Refusing client-side, before anything is written into
+/// a bundle or sent over a lift, is the honest failure at the source.
+pub const CODE_OVERSIZED_TRANSPORT_UNSUPPORTED: &str = "oversized_transport_unsupported";
+
 /// The framing that marks a scope refusal string so the CLI can classify it without
 /// parsing prose. `\u{1f}` (ASCII Unit Separator) never appears in a message or a
 /// warehouse path, so the framing is unambiguous; a plain error the CLI does not recognize
@@ -549,6 +559,53 @@ pub fn chunked_transport_refusal(path: &str) -> String {
     )
 }
 
+/// A ready-made `oversized_transport_unsupported` refusal for sending an object above the
+/// whole-object ceiling to a remote or into a bundle — the honest failure the maintainer settled
+/// on for a **grandfathered** giant (an object authored, or imported via an old-version bundle,
+/// before `MAX_OBJECT_BYTES` existed). It stays fully readable and checkout-able locally forever
+/// (the ceiling gates writes and imports, never reads), but no migration exists that preserves its
+/// signed identity, so it can never move to a remote or into a bundle: a version-3 bundle reader
+/// refuses its declared length before reading a byte, and an older reader would only rediscover
+/// the same problem on the far end. Refusing here — before anything is written into a bundle
+/// stream or sent over the wire on a lift — is the honest failure at the source.
+///
+/// # Arguments
+/// * `what` - What is being refused (a path, a hash, or both — whatever the caller has in hand).
+/// * `len`  - The object's actual byte length.
+pub fn oversized_transport_refusal(what: &str, len: u64) -> String {
+    let next_step = "This object predates the whole-object size limit. It stays readable and \
+        checkout-able locally, but no migration exists that would preserve its signed identity, \
+        so it cannot be sent to a remote or into a bundle.".to_string();
+
+    refusal(
+        CODE_OVERSIZED_TRANSPORT_UNSUPPORTED,
+        format!(
+            "{} is {} bytes, above the {}-byte whole-object ceiling. {}",
+            what, len, crate::util::object_utils::MAX_OBJECT_BYTES, next_step
+        ),
+        next_step,
+    )
+}
+
+/// Refuse to transport (bundle or lift) an object above the whole-object ceiling, when the caller
+/// already has its exact byte length in hand (a bundle writer about to emit a record, or a lift
+/// about to put bytes on the wire). A no-op for anything at or under the ceiling.
+///
+/// # Arguments
+/// * `what` - What is being refused, for [`oversized_transport_refusal`] (a path, a hash, or both).
+/// * `len`  - The object's actual byte length.
+///
+/// # Returns
+/// * `Ok(())`      - If `len` is within the ceiling.
+/// * `Err(String)` - The `oversized_transport_unsupported` refusal, otherwise.
+pub fn refuse_if_over_object_ceiling(what: &str, len: usize) -> Result<(), String> {
+    if len <= crate::util::object_utils::MAX_OBJECT_BYTES {
+        return Ok(());
+    }
+
+    Err(oversized_transport_refusal(what, len as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +739,35 @@ mod tests {
         assert!(message.contains("big.bin"), "the path is named: {}", message);
         assert!(message.contains("chunks"), "the message explains why: {}", message);
         assert!(!next_step.is_empty());
+    }
+
+    #[test]
+    fn an_oversized_transport_refusal_carries_the_stable_code_and_names_the_ceiling() {
+        let refusal = oversized_transport_refusal(
+            "\"big.bin\" (object aaaa)", crate::util::object_utils::MAX_OBJECT_BYTES as u64 + 1
+        );
+        let (code, message, next_step) = decode_refusal(&refusal).unwrap();
+
+        assert_eq!(code, CODE_OVERSIZED_TRANSPORT_UNSUPPORTED);
+        assert!(message.contains("big.bin"), "what is named: {}", message);
+        assert!(message.contains("ceiling"), "the message explains why: {}", message);
+        assert!(next_step.contains("signed identity"), "the recovery states no migration exists: {}", next_step);
+    }
+
+    #[test]
+    fn refuse_if_over_object_ceiling_is_a_no_op_at_or_under_the_ceiling() {
+        assert!(refuse_if_over_object_ceiling("object x", crate::util::object_utils::MAX_OBJECT_BYTES).is_ok());
+        assert!(refuse_if_over_object_ceiling("object x", 0).is_ok());
+    }
+
+    #[test]
+    fn refuse_if_over_object_ceiling_refuses_one_byte_over() {
+        let error = refuse_if_over_object_ceiling(
+            "object x", crate::util::object_utils::MAX_OBJECT_BYTES + 1
+        ).expect_err("one byte over the ceiling must refuse");
+
+        let (code, _, _) = decode_refusal(&error).unwrap();
+        assert_eq!(code, CODE_OVERSIZED_TRANSPORT_UNSUPPORTED);
     }
 
     #[test]
