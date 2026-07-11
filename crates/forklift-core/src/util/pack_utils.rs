@@ -1355,10 +1355,12 @@ fn walk_tree_for_bases(tree_hash: &str,
     // fetched into this warehouse. There is no path base to compute for content we do not hold,
     // and by the store invariant nothing beneath an absent subtree is present here either, so
     // stopping loses no base for any object that will actually be packed (every pack target is a
-    // present object). For a full store `does_object_exist` is always true, so this guard never
-    // fires and the pack bytes are byte-for-byte what they were before — the determinism contract
-    // the repack suite pins. For a store missing some paths the output is deterministic given the
-    // same present set: the same objects are present, so the same bases are computed.
+    // present object). This guard does not fire on a full store in the only flow that reaches it:
+    // `compact` holds the store lock for its entire run, so no external repack can move an object
+    // mid-walk, and `compact` runs only inside a short-lived, single-shot CLI process, so the pack
+    // registry this walk reads was populated fresh by this same run, never carried over stale from
+    // an earlier one. For a store missing some paths the output is deterministic given the same
+    // present set: the same objects are present, so the same bases are computed.
     if !file_utils::does_object_exist(tree_hash)? {
         return Ok(());
     }
