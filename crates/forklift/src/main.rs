@@ -9,10 +9,44 @@ pub mod output;
 pub mod pager;
 pub mod passphrase;
 
-/// The main entry point for forklift.
-/// This is a wrapper for the main forklift function, and it is the top-level error handler.
-#[tokio::main]
-async fn main() {
+/// Windows gives a process's main thread a 1MB stack by default (a linker setting); Linux and
+/// macOS give it 8MB. clap's derive-generated `Cli::command()` — the whole tree of every
+/// subcommand's args and help text, built as one large function in a debug build — is
+/// expensive enough on its own to sit close to a 1MB budget once it is called from inside the
+/// tokio dispatch machinery rather than at the very top of `main`; `help` calls it a *second*
+/// time, from deeper in that same async call chain (to walk down to one subcommand's help),
+/// and was measured to tip a 1MB stack over into a genuine overflow. Rather than chase every
+/// future frame that might grow this further (more subcommands, longer help text), the real
+/// work runs on a dedicated thread with an explicit, generous stack size — the standard fix
+/// for this class of problem — so the platform difference in the OS-assigned main-thread
+/// stack never matters.
+const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// The process entry point: hands off to a worker thread with an explicit stack size (see
+/// [`WORKER_STACK_SIZE`]) and waits for it. `main` itself does no work that could need a large
+/// stack, so its own (platform-default) stack size is irrelevant.
+fn main() {
+    std::thread::Builder::new()
+        .name("forklift-main".to_string())
+        .stack_size(WORKER_STACK_SIZE)
+        .spawn(run)
+        .expect("failed to spawn the forklift worker thread")
+        .join()
+        .expect("the forklift worker thread panicked");
+}
+
+/// Build the async runtime and run [`async_main`] on it, on the worker thread `main` spawns.
+fn run() {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to start the async runtime")
+        .block_on(async_main());
+}
+
+/// The real entry point: parses arguments, wires up the pager and passphrase provider, and is
+/// the top-level error handler for the [`forklift`] function it wraps.
+async fn async_main() {
     // Clap owns the argument errors (usage, suggestions, exit code 2); everything past
     // parsing reports through the Err path below with a deterministic exit code (§7.8).
     let cli = Cli::parse();
