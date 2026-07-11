@@ -53,7 +53,7 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
     // still-needed spine ancestor of a live prefix classifies InScope/Spine, not OutOfScope, so
     // it is refused rather than silently reinterpreted as either case.
     let mut keep: Vec<String> = fetch.prefixes().to_vec();
-    let mut pruned: Vec<String> = Vec::new();
+    let mut freshly_pruned: Vec<String> = Vec::new();
     let mut resumed: Vec<String> = Vec::new();
 
     for raw in &paths {
@@ -62,7 +62,7 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
         match keep.iter().position(|prefix| *prefix == key) {
             Some(pos) => {
                 keep.remove(pos);
-                pruned.push(key);
+                freshly_pruned.push(key);
             }
             None if fetch.classify(&key) == ScopeClass::OutOfScope => resumed.push(key),
             None => return Err(format!(
@@ -73,6 +73,11 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
         }
     }
 
+    // Whether every requested path was already outside the fetch scope (a pure resume of an
+    // earlier, interrupted prune) rather than newly dropped here — the human report needs this
+    // to tell "already pruned" apart from a fresh prune that simply found nothing loose to free.
+    let all_resumed = freshly_pruned.is_empty() && !resumed.is_empty();
+
     if keep.is_empty() {
         return Err(
             "Pruning every fetched path would leave the warehouse with no content at all; keep \
@@ -81,7 +86,7 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
     }
 
     let post_prune = MaterializationScope::from_prefixes(keep);
-    let to_reclaim: Vec<String> = pruned.iter().chain(resumed.iter()).cloned().collect();
+    let to_reclaim: Vec<String> = freshly_pruned.iter().chain(resumed.iter()).cloned().collect();
 
     // Multi-bay hazard, checked for every requested path, resumed ones included: a resumed path
     // can never actually be in a checkout's scope today (a bay can only ever be scoped inside
@@ -100,6 +105,8 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
             freed: 0,
             would_free: plan.to_free.len(),
             still_packed: plan.still_packed,
+            retained_shared: plan.retained_shared,
+            all_resumed,
         });
 
         return Ok(());
@@ -122,6 +129,8 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
         freed: stats.freed,
         would_free: plan.to_free.len(),
         still_packed: plan.still_packed,
+        retained_shared: plan.retained_shared,
+        all_resumed,
     });
 
     Ok(())
@@ -174,6 +183,16 @@ struct PruneReport {
     /// reachability repack keeps them (they are still reachable history), so a scope-aware
     /// repack is future work. Reported so the count is never silently lost.
     still_packed: usize,
+
+    /// Candidates kept because they are shared (by content hash) with a scope that is still
+    /// fetched, or with a meta pallet. Distinct from `still_packed`: this content stays by
+    /// design, not pending a future repack.
+    retained_shared: usize,
+
+    /// Whether every requested path was already outside the fetch scope before this call — a
+    /// pure resume of an earlier, interrupted prune, rather than a path pruned for the first
+    /// time here.
+    all_resumed: bool,
 }
 
 impl CommandOutput for PruneReport {
@@ -183,12 +202,36 @@ impl CommandOutput for PruneReport {
                 "Dry run: pruning {} would free {} loose object(s) and leave the fetch scope at {}.",
                 self.pruned.join(", "), self.would_free, self.scope.join(", ")
             );
-        } else if self.freed == 0 {
-            // Either a fresh prune whose whole target was shared with content that stays, or a
-            // resumed prune whose earlier run already finished the job — both are an honest
-            // no-op, not an error.
+        } else if self.freed == 0 && self.still_packed > 0 {
+            // Nothing loose to reclaim, but the pruned content still exists — packed, not
+            // freeable by a loose delete. Saying "already pruned" here would be wrong: this can
+            // happen on a fresh prune whose whole target was packed from the start. The footer
+            // below names the count and explains the repack is future work.
+            println!(
+                "{} pruned; nothing was loose to free — its content is packed, awaiting a repack. \
+                Fetch scope now: {}.",
+                self.pruned.join(", "), self.scope.join(", ")
+            );
+        } else if self.freed == 0 && self.retained_shared > 0 {
+            // Nothing freed because the pruned content is shared (by hash) with a scope that is
+            // still fetched, or with a meta pallet — retained by design, not pending anything.
+            println!(
+                "{} pruned, but nothing was freed: its content is still retained by other scopes. \
+                Fetch scope now: {}.",
+                self.pruned.join(", "), self.scope.join(", ")
+            );
+        } else if self.freed == 0 && self.all_resumed {
+            // Every requested path was already outside the fetch scope: an earlier, interrupted
+            // prune already finished the job, and this call found nothing left to do.
             println!(
                 "{} already pruned; nothing left to free. Fetch scope now: {}.",
+                self.pruned.join(", "), self.scope.join(", ")
+            );
+        } else if self.freed == 0 {
+            // A fresh prune of a path with no reclaimable, packed, or shared content at all
+            // (e.g. it was always empty) — an honest no-op, not an error.
+            println!(
+                "{} pruned; nothing to free. Fetch scope now: {}.",
                 self.pruned.join(", "), self.scope.join(", ")
             );
         } else {

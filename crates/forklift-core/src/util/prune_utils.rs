@@ -47,6 +47,12 @@ pub struct PrunePlan {
     /// Candidates present only inside a pack. A loose delete cannot reclaim a packed object
     /// (that is a repack concern), so they are counted and reported, never silently dropped.
     pub still_packed: usize,
+
+    /// Candidates kept because they are shared (by content hash) with a still-retained scope
+    /// or a meta pallet. Distinct from `still_packed`: this is content that stays *by design*,
+    /// not content a repack could someday reclaim — so a caller reporting "nothing was freed"
+    /// can tell the two apart instead of leaving the reason unstated.
+    pub retained_shared: usize,
 }
 
 /// What an executed prune deleted.
@@ -78,10 +84,12 @@ pub fn plan_prune(
 
     let mut to_free: Vec<String> = Vec::new();
     let mut still_packed = 0usize;
+    let mut retained_shared = 0usize;
 
     for hash in &targets {
         // Shared with a retained path by content-addressing (or with a meta pallet): must stay.
         if retained.contains(hash) {
+            retained_shared += 1;
             continue;
         }
 
@@ -99,7 +107,7 @@ pub fn plan_prune(
         }
     }
 
-    Ok(PrunePlan { to_free, still_packed })
+    Ok(PrunePlan { to_free, still_packed, retained_shared })
 }
 
 /// Delete the planned loose objects, reclaiming their disk. Content objects (trees, blobs)
@@ -501,6 +509,7 @@ mod tests {
         // The shared blob stays (retained via src/api); only web's unique tree object is freed.
         assert!(!plan.to_free.contains(&shared_blob), "a blob shared with a retained path must not be freed");
         assert!(plan.to_free.contains(&web_tree), "the pruned subtree's unique object is freed");
+        assert_eq!(plan.retained_shared, 1, "the shared blob is counted as retained-shared, not silently dropped");
     }
 
     #[test]

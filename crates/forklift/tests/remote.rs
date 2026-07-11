@@ -2970,6 +2970,55 @@ fn scope_prune_resumes_after_an_interrupted_free_and_completes() {
 }
 
 #[test]
+fn scope_prune_reports_zero_freed_as_retained_not_already_pruned() {
+    // A FRESH prune can free zero loose objects for a reason that has nothing to do with an
+    // earlier, interrupted run: the pruned path's entire content is byte-identical to (and thus
+    // content-addressed to the same hash as) content a still-fetched path keeps. Saying "already
+    // pruned" here would be a lie — nothing was ever pruned before this call — so the report must
+    // say the content is retained by other scopes instead.
+    let area = TestArea::new("scope-prune-shared");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    // src/web has the exact same entry name and content as src/api, so their tree objects are
+    // content-addressed to the SAME hash too — not just the blob. That makes the pruned
+    // subtree's whole closure (tree and blob alike) shared with the retained src/api, so a fresh
+    // prune of src/web frees nothing at all.
+    area.write_file("dev/src/api/same.txt", "identical bytes\n");
+    area.write_file("dev/src/web/same.txt", "identical bytes\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let web_tree = path_object_hash(&area, "dev", &head, "src/web");
+    let api_tree = path_object_hash(&area, "dev", &head, "src/api");
+    let web_blob = path_object_hash(&area, "dev", &head, "src/web/same.txt");
+    assert_eq!(web_tree, api_tree, "the fixture's subtrees must collide by content-addressing");
+
+    assert_success(&area.forklift(".",
+        &["franchise", &server.url, "sparse", "--only", "src/api", "--only", "src/web"]));
+    assert_success(&area.forklift("sparse", &["narrow", "src/web"]));
+
+    // A fresh prune (src/web was a live fetch-scope prefix until this call) that frees nothing:
+    // both the tree and the blob under src/web are retained via src/api.
+    let pruned = area.forklift("sparse", &["scope-prune", "src/web"]);
+    assert_success(&pruned);
+    let report = stdout(&pruned);
+    assert!(report.contains("retained by other scopes"),
+        "a fresh zero-freed prune must explain the content is retained, not call it already pruned: {}",
+        report);
+    assert!(!report.contains("already pruned"),
+        "a fresh prune must never claim to be a resume: {}", report);
+
+    // The shared content really did survive, proving the message is not just optimistic wording.
+    assert!(object_present(&area, "sparse", &web_tree),
+        "the tree shared with src/api must survive the prune of src/web");
+    assert!(object_present(&area, "sparse", &web_blob),
+        "the blob shared with src/api must survive the prune of src/web");
+}
+
+#[test]
 fn scope_prune_retains_a_user_blob_that_collides_with_an_office_blob() {
     // The mechanism the multi-bay/meta-carve-out retention depends on, pinned directly: prune's
     // retained set is a hash SET spanning meta (full closure) and in-scope user content, so a
@@ -3085,6 +3134,48 @@ fn the_path_addressed_subtree_endpoint_serves_a_subtree_and_signals_fallback_on_
         .block_on(client.fetch_subtree(&head, "does/not/exist"))
         .expect("a 404 is not an error");
     assert!(missing.is_none(), "an unresolved path signals the client to fall back");
+}
+
+#[test]
+fn the_path_addressed_subtree_endpoint_round_trips_a_path_with_reserved_characters() {
+    // The URL is built by splicing the warehouse path into it; a segment holding a character
+    // reserved in the URL grammar (space, `#`, `%`) must be percent-encoded on the way out and
+    // decoded back to the exact original name on the way in — otherwise the request is invalid
+    // or misrouted, and a directory containing one of these characters could never be fetched by
+    // path. Drive the real server, not a mock, so both halves of the round trip are exercised.
+    let area = TestArea::new("subtree-endpoint-reserved-chars");
+    let server = Server::start(&area, None);
+
+    prepare_warehouse(&area, "dev", &server.url);
+    area.write_file("dev/src/api/a.txt", "api v1\n");
+    area.write_file("dev/src/a dir#1/100%/w.txt", "reserved-char dir v1\n");
+    assert_success(&area.forklift("dev", &["load", "."]));
+    assert_success(&area.forklift("dev", &["stack", "base"]));
+    assert_success(&area.forklift("dev", &["lift"]));
+
+    let head = pallet_head(&area, "dev", "main");
+    let weird_tree = path_object_hash(&area, "dev", &head, "src/a dir#1/100%");
+    let weird_blob = path_object_hash(&area, "dev", &head, "src/a dir#1/100%/w.txt");
+
+    // A sparse franchise scoped away from the reserved-character path: its objects are sealed,
+    // never fetched, until the path-addressed endpoint is asked for them directly.
+    assert_success(&area.forklift(".", &["franchise", &server.url, "sparse", "--only", "src/api"]));
+    assert!(!object_present(&area, "sparse", &weird_tree), "the path starts sealed, not fetched");
+
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let _scope = forklift_core::globals::StorageRootScope::enter(&area.path("sparse"));
+    let client = forklift_core::util::remote_utils::RemoteClient::new(&server.url, None).unwrap();
+
+    let bundle = runtime
+        .block_on(client.fetch_subtree(&head, "src/a dir#1/100%"))
+        .expect("the subtree fetch must not error")
+        .expect("the server must resolve the reserved-character path, not 404 on a mangled URL");
+    forklift_core::util::bundle_utils::import_bundle_bytes(&bundle).expect("the served subtree imports");
+
+    assert!(object_present(&area, "sparse", &weird_tree),
+        "the endpoint delivered the reserved-character subtree object");
+    assert!(object_present(&area, "sparse", &weird_blob),
+        "the endpoint delivered the reserved-character subtree's blob");
 }
 
 /// Build a subtree of `count` uniquely-named, uniquely-hashed blobs directly under one
