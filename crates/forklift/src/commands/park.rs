@@ -55,13 +55,17 @@ pub async fn park_changes() -> Result<(), String> {
     // onto the head's spine exactly like `stack` does (§3.2), so the parked parcel commits the
     // same root a full bay would — `park` is documented to inherit the overlay, and a truncated
     // parked tree would silently break that. The "nothing to park" check below must compare the
-    // *spliced* root against head, or it never fires in a scoped bay (M2).
+    // *spliced* root against head, or it never fires in a scoped bay.
     let scope = scope_utils::current_scope()?;
 
     let root_tree = if scope.is_full() {
         partial_root
     } else {
-        tree_utils::build_scoped_root_tree(Some(&head_tree_hash), &partial_root, &scope)?
+        // A park is a WIP snapshot, never a merge completion, so it has no out-of-scope skeleton:
+        // every out-of-scope sibling is copied verbatim from the head.
+        let overrides = std::collections::BTreeMap::new();
+
+        tree_utils::build_scoped_root_tree(Some(&head_tree_hash), &partial_root, &scope, &overrides)?
     };
 
     if root_tree.hash == head_tree_hash {

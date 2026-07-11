@@ -545,7 +545,7 @@ impl RemoteClient {
 /// construction: a ref only moves once its objects are all present (a `stack` writes them
 /// first; a `lower` or `franchise` fetches the whole closure before the fast-forward). So a
 /// lower that brings one new parcel walks one parcel, not the whole history — the
-/// transfer-economics half of R5.
+/// transfer-economics half of the bounded-negotiation guarantee.
 ///
 /// It still heals an interrupted earlier sync. An interruption leaves the ref where it was,
 /// so the objects it half-fetched sit *above* the bound and are re-walked exactly as before.
@@ -866,25 +866,30 @@ async fn lift_pallet_inner(client: &RemoteClient,
     }
 
     // Candidate objects for the negotiation: each new parcel's tree, walked against
-    // its first parent's tree — an unchanged subtree (identical hash at the same path)
-    // is skipped whole, the same skip the merge walk and the pallet diff use. A
-    // one-line change on a 100k-file warehouse thus negotiates the changed path, not
-    // the full closure (DESIGN.html §4.5, data-plane item 1).
+    // its parents' trees — a subtree identical to *any* parent's at the same path is
+    // skipped whole, the same skip the merge walk and the pallet diff use. A one-line
+    // change on a 100k-file warehouse thus negotiates the changed path, not the full
+    // closure.
     let mut candidates: Vec<String> = new_parcels.clone();
     let mut seen_trees: HashSet<String> = HashSet::new();
     let mut seen_blobs: HashSet<String> = HashSet::new();
 
-    // Oldest first: a parcel's first parent is remote-known or already processed, so
-    // everything the base "explains" is on the remote or in the candidates already.
+    // Oldest first: a parcel's parents are remote-known or already processed, so
+    // everything a base "explains" is on the remote or in the candidates already.
     for parcel_hash in new_parcels.iter().rev() {
         let parcel = object_utils::load_parcel(parcel_hash)?;
 
-        let base_tree = match parcel.parents.first() {
-            Some(parent) => Some(object_utils::load_parcel(parent)?.tree_hash),
-            None => None,
-        };
+        // Every parent's tree, not just the first. A merge parcel that
+        // adopted an out-of-scope sibling by hash from its *second* parent is explained by that
+        // parent — which the remote already has, or which is uploaded in this same session — so
+        // treating a subtree as base-explained when it matches ANY parent stops the walk from
+        // trying to load an object a sparse workspace never fetched. An ordinary single-parent
+        // parcel is the N=1 case: identical behavior, and a strictly-not-larger candidate set.
+        let base_trees: Vec<String> = parcel.parents.iter()
+            .map(|parent| object_utils::load_parcel(parent).map(|p| p.tree_hash))
+            .collect::<Result<_, _>>()?;
 
-        collect_changed_closure(&parcel.tree_hash, base_tree.as_deref(),
+        collect_changed_closure(&parcel.tree_hash, &base_trees,
                                 &mut seen_trees, &mut seen_blobs, &mut candidates)?;
     }
 
@@ -921,16 +926,34 @@ async fn lift_pallet_inner(client: &RemoteClient,
     }))
 }
 
-/// Collect the objects of a tree that its base — the tree at the same path in the
-/// parent parcel — does not explain: an identical subtree or file is skipped whole,
-/// a changed subtree is descended with the base's matching child as its base. `None`
-/// collects the full closure (a root parcel has no base).
+/// Collect the objects of a tree that its bases — the trees at the same path in the parcel's
+/// parents — do not explain: a subtree or file identical to **any** parent's is skipped whole, a
+/// changed subtree is descended with each parent's matching child as a base. An empty base set
+/// collects the full closure (a root parcel has no parents).
+///
+/// The multi-parent base set is a straight generalization of the
+/// single-parent walk: a merge parcel's subtree adopted by hash from its second parent matches
+/// that parent here and is pruned, so the walk never loads an object a sparse workspace holds
+/// only by seal. It is scope-agnostic and correct in full stores too — an object pruned against a
+/// parent is provably on the remote (that parent is already there or is uploaded in this session),
+/// exactly the guarantee the first-parent-only walk gave for linear history.
 fn collect_changed_closure(tree_hash: &str,
-                           base_tree_hash: Option<&str>,
+                           base_tree_hashes: &[String],
                            seen_trees: &mut HashSet<String>,
                            seen_blobs: &mut HashSet<String>,
                            candidates: &mut Vec<String>) -> Result<(), String> {
-    if base_tree_hash == Some(tree_hash) || !seen_trees.insert(tree_hash.to_string()) {
+    // Record the visit before checking base-explained, not after: content-addressing means the
+    // same subtree hash can recur at another path in the same walk (e.g. a merge adopting one
+    // side's out-of-scope subtree under two names), and that recurrence must be recognized even
+    // when the FIRST visit returned early because a parent explained it. Skipping it there is
+    // still complete — same hash means same content, and a base-explained tree's own closure is
+    // already covered (its parent is remote-known or was walked earlier in this same session) —
+    // the identical induction this function's ancestry guarantee already relies on.
+    let first_visit = seen_trees.insert(tree_hash.to_string());
+
+    // Explained by some parent at this path (or already walked): the remote has it, so it needs
+    // neither upload nor descent — and, critically, its object is never loaded.
+    if base_tree_hashes.iter().any(|hash| hash == tree_hash) || !first_visit {
         return Ok(());
     }
 
@@ -938,21 +961,30 @@ fn collect_changed_closure(tree_hash: &str,
 
     let tree = object_utils::load_tree(tree_hash)?;
 
-    let base = match base_tree_hash {
-        Some(hash) => Some(object_utils::load_tree(hash)?),
-        None => None,
-    };
+    let bases = base_tree_hashes.iter()
+        .map(|hash| object_utils::load_tree(hash))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let base_files: HashMap<&String, &String> = base.as_ref()
-        .map(|base| base.get_files().map(|(name, file)| (name, &file.hash)).collect())
-        .unwrap_or_default();
+    // The union across every parent tree: a file is base-explained when ANY parent maps that name
+    // to that exact hash; a subtree's per-parent child hashes are threaded into the recursion, so
+    // a deeper subtree is pruned against whichever parent explains it.
+    let mut base_file_hashes: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut base_subtree_hashes: HashMap<&str, Vec<&str>> = HashMap::new();
 
-    let base_subtrees: HashMap<&String, &String> = base.as_ref()
-        .map(|base| base.get_subtrees().map(|(name, tree)| (name, &tree.hash)).collect())
-        .unwrap_or_default();
+    for base in &bases {
+        for (name, file) in base.get_files() {
+            base_file_hashes.entry(name.as_str()).or_default().push(file.hash.as_str());
+        }
+        for (name, subtree) in base.get_subtrees() {
+            base_subtree_hashes.entry(name.as_str()).or_default().push(subtree.hash.as_str());
+        }
+    }
 
     for (name, file) in tree.get_files() {
-        if base_files.get(name) == Some(&&file.hash) {
+        let explained = base_file_hashes.get(name.as_str())
+            .is_some_and(|hashes| hashes.contains(&file.hash.as_str()));
+
+        if explained {
             continue;
         }
 
@@ -962,13 +994,11 @@ fn collect_changed_closure(tree_hash: &str,
     }
 
     for (name, subtree) in tree.get_subtrees() {
-        collect_changed_closure(
-            &subtree.hash,
-            base_subtrees.get(name).map(|hash| hash.as_str()),
-            seen_trees,
-            seen_blobs,
-            candidates
-        )?;
+        let child_bases: Vec<String> = base_subtree_hashes.get(name.as_str())
+            .map(|hashes| hashes.iter().map(|hash| hash.to_string()).collect())
+            .unwrap_or_default();
+
+        collect_changed_closure(&subtree.hash, &child_bases, seen_trees, seen_blobs, candidates)?;
     }
 
     Ok(())
@@ -1693,5 +1723,128 @@ mod tests {
             one.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
             "a session id must be a safe path component: {}", one
         );
+    }
+
+    fn store_blob(content: &str) -> String {
+        let mut object = LooseObjectBuilder::build_blob(&crate::model::blob::Blob {
+            content: content.as_bytes().to_vec(),
+        });
+        object.store().unwrap();
+        object.hash
+    }
+
+    fn store_tree(entries: &[(&str, &str, crate::enums::dir_entry_type::DirEntryType)]) -> String {
+        use crate::model::tree_item::TreeItem;
+
+        let mut tree = TreeItem::new(
+            String::new(), String::new(), crate::enums::dir_entry_type::DirEntryType::Tree
+        );
+        for (name, hash, item_type) in entries {
+            tree.add_child(TreeItem::new(name.to_string(), hash.to_string(), *item_type));
+        }
+
+        let mut object = LooseObjectBuilder::build_tree(&tree);
+        object.store().unwrap();
+        object.hash
+    }
+
+    /// The lift closure walk prunes a subtree against **every** parent, not just the
+    /// first — so a merge parcel that adopted an out-of-scope sibling by hash from its *second*
+    /// parent treats that subtree as base-explained and never loads it. This is what makes a
+    /// sparse-workspace merge liftable; it is also a strictly-not-larger candidate set in a full
+    /// store. Modeled on the exact review construction.
+    #[test]
+    fn the_closure_walk_prunes_a_subtree_adopted_from_the_second_parent() {
+        use crate::enums::dir_entry_type::DirEntryType::{Normal, Tree};
+
+        let _scratch = Scratch::new("closure-multi-parent");
+
+        // An in-scope file edited on ours, an out-of-scope file edited on theirs.
+        let api_v1 = store_blob("api v1");
+        let api_v2 = store_blob("api v2");
+        let web_v0 = store_blob("web v0");
+        let web_v1 = store_blob("web v1");
+
+        let api_base = store_tree(&[("a.txt", &api_v1, Normal)]);
+        let api_ours = store_tree(&[("a.txt", &api_v2, Normal)]);
+        let web_base = store_tree(&[("w.txt", &web_v0, Normal)]);
+        let web_theirs = store_tree(&[("w.txt", &web_v1, Normal)]);
+
+        // ours changed api (web unchanged); theirs changed web (api unchanged); the merge combines
+        // ours' api with theirs' web.
+        let src_ours = store_tree(&[("api", &api_ours, Tree), ("web", &web_base, Tree)]);
+        let src_theirs = store_tree(&[("api", &api_base, Tree), ("web", &web_theirs, Tree)]);
+        let src_merge = store_tree(&[("api", &api_ours, Tree), ("web", &web_theirs, Tree)]);
+
+        let root_ours = store_tree(&[("src", &src_ours, Tree)]);
+        let root_theirs = store_tree(&[("src", &src_theirs, Tree)]);
+        let root_merge = store_tree(&[("src", &src_merge, Tree)]);
+
+        let walk = |bases: &[String]| -> Vec<String> {
+            let mut seen_trees = HashSet::new();
+            let mut seen_blobs = HashSet::new();
+            let mut candidates = Vec::new();
+            collect_changed_closure(&root_merge, bases, &mut seen_trees, &mut seen_blobs, &mut candidates)
+                .expect("the closure walk must not load a pruned object");
+            candidates
+        };
+
+        let multi = walk(&[root_ours.clone(), root_theirs.clone()]);
+        let single = walk(std::slice::from_ref(&root_ours)); // the old first-parent-only base
+
+        // Multi-parent: the merge only combines the two parents' subtrees, so nothing below the
+        // merge spine needs uploading. The second parent's out-of-scope subtree (and its blob) is
+        // pruned — never collected, never loaded — and so is the first parent's.
+        assert!(multi.contains(&root_merge) && multi.contains(&src_merge), "the merge spine is new");
+        assert!(!multi.contains(&web_theirs), "the second parent's subtree must be pruned");
+        assert!(!multi.contains(&web_v1), "the second parent's blob must be pruned");
+        assert!(!multi.contains(&api_ours), "the first parent's subtree must be pruned");
+
+        // First-parent-only (the old walk): the second parent's subtree is NOT explained by the
+        // first parent, so it is collected — and in a sparse store its load would fail.
+        assert!(single.contains(&web_theirs) && single.contains(&web_v1),
+            "the first-parent-only walk collects the absent second-parent subtree");
+
+        assert!(multi.len() < single.len(),
+            "the multi-parent base prunes strictly more here: {} vs {}", multi.len(), single.len());
+    }
+
+    /// A base-explained tree must be recorded as seen even though it returns early — otherwise
+    /// the identical (content-deduplicated) hash reappearing at a second path, where no base
+    /// explains it there, gets redundantly loaded and walked. Two paths reference the SAME
+    /// subtree hash; the first is base-explained (skipped), the second is not. Deleting the
+    /// object from the store before the walk proves it is never loaded at the second path either
+    /// — the walk must recognize the hash as already seen, not attempt to load and descend it.
+    #[test]
+    fn a_base_explained_tree_is_marked_seen_so_a_second_path_does_not_reload_it() {
+        use crate::enums::dir_entry_type::DirEntryType::{Normal, Tree};
+
+        let _scratch = Scratch::new("closure-dedup-seen");
+
+        let shared_file = store_blob("shared content");
+        let shared = store_tree(&[("f.txt", &shared_file, Normal)]);
+
+        // The base has `shared` at "one" only. The new tree references the SAME `shared` hash at
+        // both "one" (base-explained there) and "two" (no base entry there at all).
+        let base_root = store_tree(&[("one", &shared, Tree)]);
+        let new_root = store_tree(&[("one", &shared, Tree), ("two", &shared, Tree)]);
+
+        // Prove the object is never loaded on the "two" path: delete it from the store up front
+        // and confirm the walk still succeeds and never collects it — a load on the "two" path
+        // would fail (and the walk would error) because the object is gone.
+        let (folder, file_name) = crate::util::file_utils::get_path_for_object(&shared).unwrap();
+        std::fs::remove_file(PathBuf::from(folder).join(file_name))
+            .expect("the shared tree object must exist to delete");
+
+        let mut seen_trees = HashSet::new();
+        let mut seen_blobs = HashSet::new();
+        let mut candidates = Vec::new();
+        collect_changed_closure(&new_root, &[base_root], &mut seen_trees, &mut seen_blobs, &mut candidates)
+            .expect("the second path must be recognized as already-seen, not re-loaded");
+
+        assert!(!candidates.contains(&shared),
+            "the base-explained subtree must not be re-collected at the second path");
+        assert!(seen_trees.contains(&shared),
+            "the base-explained subtree must be marked seen so a second path skips it too");
     }
 }
