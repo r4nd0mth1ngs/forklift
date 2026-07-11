@@ -237,10 +237,11 @@ pub fn collect_untracked_collisions(ops: &[FileOp]) -> Result<Vec<String>, Strin
 }
 
 /// Apply a diff's file operations to the working directory: every removal first (so a
-/// directory a new file is about to replace is emptied — and, via `apply_file_op`'s
-/// parent-chain cleanup, itself removed — before the write lands), then the removed
-/// directories a removal did not already clear, then every write. Writing before a same-path
-/// removal would otherwise fail (`EISDIR`/`EEXIST`) for a type flip in either direction.
+/// directory a new file is about to replace is emptied), then `remove_empty_directories`
+/// clears the now-empty source-only directories (deepest first) — the removals themselves
+/// only unlink files and never touch a directory — then every write lands. Writing before a
+/// same-path removal would otherwise fail (`EISDIR`/`EEXIST`) for a type flip in either
+/// direction.
 ///
 /// # Arguments
 /// * `ops`          - The file operations to apply.

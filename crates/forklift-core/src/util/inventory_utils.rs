@@ -478,15 +478,21 @@ pub fn directory_is_safe_to_replace(path: &str) -> Result<bool, String> {
         return Ok(false);
     }
 
-    directory_has_no_untracked_content(path)
+    let ignored_paths = Arc::new(file_utils::get_ignored_paths()?);
+
+    directory_has_no_untracked_content(path, ignored_paths)
 }
 
 /// Recursively check a tracked directory for untracked content (the body of
 /// `directory_is_safe_to_replace`). Ignored entries are skipped, matching the rest of the
 /// inventory machinery (`walk_directory_unstaged` in `stocktake_utils`): they are invisible
 /// to tracking, not a collision.
-fn directory_has_no_untracked_content(key: &str) -> Result<bool, String> {
-    let ignored_paths = file_utils::get_ignored_paths()?;
+///
+/// # Arguments
+/// * `key`           - The warehouse path key of the directory.
+/// * `ignored_paths` - The ignore patterns, computed once by the caller and threaded through
+///                     the recursion instead of being reloaded and recompiled at every level.
+fn directory_has_no_untracked_content(key: &str, ignored_paths: Arc<Vec<Regex>>) -> Result<bool, String> {
     let fs_path = if key.is_empty() { std::path::PathBuf::from(".") } else { std::path::PathBuf::from(key) };
 
     let (_, bytes_opt) = file_utils::retrieve_inventory_or_none_by_key(key)?;
@@ -515,7 +521,7 @@ fn directory_has_no_untracked_content(key: &str) -> Result<bool, String> {
             )
         } else {
             file_utils::get_inventory_data_path_for_key(&entry_key).exists()
-                && directory_has_no_untracked_content(&entry_key)?
+                && directory_has_no_untracked_content(&entry_key, Arc::clone(&ignored_paths))?
         };
 
         if !is_tracked {
