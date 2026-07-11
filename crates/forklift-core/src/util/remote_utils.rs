@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use crate::model::remote::{
@@ -24,6 +25,29 @@ use crate::util::{
 
 /// How many object transfers run concurrently.
 pub const CONCURRENT_TRANSFERS: usize = 24;
+
+/// The characters a warehouse path SEGMENT must be percent-encoded against before it is spliced
+/// into a URL. Everything but RFC 3986 unreserved characters (ASCII alphanumerics, `-`, `_`,
+/// `.`, `~`) is encoded — so a segment holding a space, `#`, `?`, `%`, or any other character
+/// that is reserved or unsafe in the URL grammar round-trips instead of producing an invalid or
+/// misrouted request. Non-ASCII UTF-8 bytes are always percent-encoded by `utf8_percent_encode`
+/// regardless of this set, since an `AsciiSet` only classifies the ASCII range.
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
+
+/// Percent-encode a warehouse path's SEGMENTS for use in a URL, preserving the `/` separators
+/// between them (so a multi-segment path still round-trips as multiple segments on the wire,
+/// never one opaque `%2F`-joined blob). Each segment — including an empty one, e.g. from a
+/// leading, trailing, or doubled `/` — is encoded independently against [`PATH_SEGMENT`].
+fn encode_path_segments(path: &str) -> String {
+    path.split('/')
+        .map(|segment| utf8_percent_encode(segment, PATH_SEGMENT).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
 
 /// How many objects one batch-fetch request asks for: bounds the response the server
 /// builds in memory while still amortizing the round trip over many objects.
@@ -286,6 +310,41 @@ impl RemoteClient {
             .await
             .map(|bytes| Some(bytes.to_vec()))
             .map_err(|e| format!("Error while reading the batch response: {}", e))
+    }
+
+    /// Fetch the object closure of a subtree at a path of a parcel, as a bundle-format stream
+    /// (`GET /v1/parcels/{parcel}/subtree/{path}`). This is the **path-addressed** fetch: the
+    /// remote resolves the path to a subtree itself, so it can authorize the request by path —
+    /// the wire surface file-level path enforcement (FORK-10) is designed to gate, which a
+    /// hash-addressed `GET /v1/objects/{hash}` cannot, being path-blind. `Ok(None)` when the
+    /// remote predates the endpoint (a `404`/`405`) or refused because the resolved subtree
+    /// exceeds the remote's per-response object cap (`422`, the same cap `objects/batch`
+    /// enforces) — both cases share one fallback: the caller walks the shipped hash-addressed
+    /// scoped fetch instead, which has no such single-response limit. That fallback is why
+    /// shipping this endpoint needs no protocol bump.
+    ///
+    /// # Arguments
+    /// * `parcel` - The parcel whose tree the path is resolved in.
+    /// * `path`   - The warehouse path key of the subtree (`/`-separated, e.g. `src/api`).
+    pub async fn fetch_subtree(&self, parcel: &str, path: &str) -> Result<Option<Vec<u8>>, String> {
+        let response = self.request(reqwest::Method::GET, &format!(
+            "/v1/parcels/{}/subtree/{}", parcel, encode_path_segments(path)
+        )).send()
+            .await
+            .map_err(|e| format!("Error while fetching subtree \"{}\" from the remote: {}", path, e))?;
+
+        if endpoint_absent(response.status()) || response.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            return Err(Self::error_of(response, &format!("the subtree fetch for \"{}\"", path)).await);
+        }
+
+        response.bytes()
+            .await
+            .map(|bytes| Some(bytes.to_vec()))
+            .map_err(|e| format!("Error while reading the subtree response: {}", e))
     }
 
     /// Fetch one object's raw bytes.
@@ -1769,6 +1828,24 @@ mod tests {
         let mut object = LooseObjectBuilder::build_parcel(&parcel);
         object.store().unwrap();
         object.hash
+    }
+
+    #[test]
+    fn encode_path_segments_encodes_the_reserved_set_but_preserves_separators() {
+        // The reserved/unsafe characters Copilot flagged (space, #, ?, %) each round-trip when
+        // percent-decoded, and `/` stays a literal separator — never itself encoded to `%2F` —
+        // so a multi-segment path still arrives as multiple segments on the wire.
+        assert_eq!(encode_path_segments("a b"), "a%20b");
+        assert_eq!(encode_path_segments("a#b"), "a%23b");
+        assert_eq!(encode_path_segments("a?b"), "a%3Fb");
+        assert_eq!(encode_path_segments("a%b"), "a%25b");
+        assert_eq!(encode_path_segments("src/a b/c#d"), "src/a%20b/c%23d");
+
+        // Unreserved characters (alphanumerics, `-`, `_`, `.`, `~`) are left untouched.
+        assert_eq!(encode_path_segments("src/api-v2_final.txt~bak"), "src/api-v2_final.txt~bak");
+
+        // An empty segment (leading/trailing/doubled `/`) is preserved as empty, not collapsed.
+        assert_eq!(encode_path_segments("/a//b/"), "/a//b/");
     }
 
     #[test]

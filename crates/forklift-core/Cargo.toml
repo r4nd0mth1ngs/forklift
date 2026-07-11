@@ -21,6 +21,7 @@ ed25519-dalek = { workspace = true }
 file-id = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
+percent-encoding = { workspace = true }
 regex = { workspace = true }
 toml_edit = { workspace = true }
 argon2 = { workspace = true }
