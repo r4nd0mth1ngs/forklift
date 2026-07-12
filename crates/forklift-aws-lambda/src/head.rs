@@ -148,18 +148,22 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     }
 
     /// `POST /v1/objects/missing` — which of these hashes does the store lack?
+    ///
+    /// One bulk probe (`ObjectStore::objects_missing`) rather than one `exists` per hash: on
+    /// the AWS head this is the bounded-concurrency S3 `HeadObject` batch, not up to
+    /// [`MAX_MISSING_BATCH`] (10,000) serial round trips behind API Gateway's 29 s ceiling —
+    /// the same fix the ref-update chunk descent needed. The bulk probe's answer may come
+    /// back in any order (a parallel backend finishes out of order) and may not preserve
+    /// duplicates, so the result is a membership test: the response is built by walking the
+    /// *input* `hashes` in order and keeping every one the probe reported absent — identical
+    /// to what the old per-hash loop returned (order and duplicate hashes both preserved).
     pub fn missing(&self, hashes: &[String]) -> HeadResult<Vec<String>> {
         self.reject_oversized_batch(hashes.len())?;
 
-        let mut missing = Vec::new();
+        let absent: HashSet<String> =
+            self.objects.objects_missing(hashes).map_err(HeadError::internal)?.into_iter().collect();
 
-        for hash in hashes {
-            if !self.objects.exists(hash).map_err(HeadError::internal)? {
-                missing.push(hash.clone());
-            }
-        }
-
-        Ok(missing)
+        Ok(hashes.iter().filter(|hash| absent.contains(hash.as_str())).cloned().collect())
     }
 
     /// `POST /v1/objects/upload-targets` — the body-less upload negotiation (additive).
@@ -186,14 +190,25 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             direct: Vec::new(),
         };
 
+        // Dedupe, keeping first-occurrence order — the order `present`/`direct` are built in
+        // below, unchanged from the old per-hash loop.
         let mut seen: HashSet<&str> = HashSet::new();
+        let unique: Vec<String> =
+            hashes.iter().filter(|hash| seen.insert(hash.as_str())).cloned().collect();
 
-        for hash in hashes {
-            if !seen.insert(hash.as_str()) {
-                continue;
-            }
+        // One bulk probe instead of one `exists` per unique hash: on the AWS head this is the
+        // bounded-concurrency S3 `HeadObject` batch, not up to a thousand serial round trips for
+        // a large negotiation. `put_target` (a local presign, no network round trip) still runs
+        // once per missing hash, exactly as before — only the presence check is batched.
+        let absent: HashSet<String> = self
+            .objects
+            .objects_missing(&unique)
+            .map_err(HeadError::internal)?
+            .into_iter()
+            .collect();
 
-            if self.objects.exists(hash).map_err(HeadError::internal)? {
+        for hash in &unique {
+            if !absent.contains(hash.as_str()) {
                 response.present.push(hash.clone());
                 continue;
             }
@@ -403,12 +418,18 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             materialize(&self.objects, &request.new_head, is_meta, known_complete, &mut mirror)
                 .map_err(HeadError::internal)?;
 
-            // 1. Closure presence. Working blobs and a chunked file's chunks are checked via the
-            // object store; a chunked file's recipe is read from the object store too (it is a
-            // file-entry object, so `materialize` above never mirrored it into the scratch) and
-            // its chunks are presence-checked non-tolerantly — a ref must never advance over a
-            // chunked file whose chunks never reached storage (§9.4b W4).
+            // 1. Closure presence. A working blob and a chunked file's recipe are presence-checked
+            // one hash at a time via `blob_exists`; a chunked file's recipe is read from the object
+            // store too (it is a file-entry object, so `materialize` above never mirrored it into
+            // the scratch), and its chunks are presence-checked non-tolerantly — a ref must never
+            // advance over a chunked file whose chunks never reached storage (§9.4b W4).
             let blob_exists = |hash: &str| self.objects.exists(hash);
+            // The chunk-presence seam (§9.4b W4): a changed chunked file's *whole* chunk list is
+            // probed in one bulk call, which the S3 store answers with a bounded-concurrency batch
+            // of HeadObjects. Walked serially (one HEAD per chunk), a 1–2 GiB file's ~1–2k chunks
+            // already crowd API Gateway's 29 s integration ceiling; in parallel they clear in a
+            // second or two. Still non-tolerant: any missing chunk refuses the ref.
+            let chunks_missing = |chunks: &[String]| self.objects.objects_missing(chunks);
             let load_recipe_chunks = |hash: &str| -> Result<Vec<String>, String> {
                 let bytes = self
                     .objects
@@ -438,6 +459,7 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
                 &request.new_head,
                 request.old_head.as_deref(),
                 &blob_exists,
+                &chunks_missing,
                 &load_recipe_chunks,
                 &load_base_tree,
             )
@@ -622,17 +644,24 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
             }
         }
 
-        for hash in blobs {
-            if !self.objects.exists(hash).map_err(HeadError::internal)? {
-                // The one *transient* commit failure: the staging verifier has not promoted this
-                // blob to its canonical key yet. The message embeds `LIFT_SESSION_BLOB_NOT_READY`
-                // so the client can tell this retriable case apart from a terminal one (a
-                // control-plane object never uploaded, or a corrupt staged object) and back off.
-                return Err(HeadError::unprocessable(format!(
-                    "Blob {} is {}; the lift session is not ready to commit.",
-                    hash, LIFT_SESSION_BLOB_NOT_READY
-                )));
-            }
+        // One bulk probe instead of one `exists` per blob: a large chunked commit batch can name
+        // thousands of blobs, and a serial walk of them is exactly the pattern that blows API
+        // Gateway's 29 s ceiling. Still reports only the *first* not-yet-promoted blob in `blobs`
+        // order, with the identical message — a bulk probe means every blob is checked (not just
+        // the ones before the first miss), but the response is unchanged: the same one hash named,
+        // in the same case.
+        let not_ready: HashSet<String> =
+            self.objects.objects_missing(blobs).map_err(HeadError::internal)?.into_iter().collect();
+
+        if let Some(hash) = blobs.iter().find(|hash| not_ready.contains(hash.as_str())) {
+            // The one *transient* commit failure: the staging verifier has not promoted this
+            // blob to its canonical key yet. The message embeds `LIFT_SESSION_BLOB_NOT_READY`
+            // so the client can tell this retriable case apart from a terminal one (a
+            // control-plane object never uploaded, or a corrupt staged object) and back off.
+            return Err(HeadError::unprocessable(format!(
+                "Blob {} is {}; the lift session is not ready to commit.",
+                hash, LIFT_SESSION_BLOB_NOT_READY
+            )));
         }
 
         // Sweep the session's staging prefix only when this is the final batch. An intermediate

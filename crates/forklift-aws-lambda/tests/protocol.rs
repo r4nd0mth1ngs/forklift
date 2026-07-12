@@ -1034,6 +1034,140 @@ fn upload_targets_negotiates_without_sending_bodies() {
     assert!(answer.targets.is_empty());
 }
 
+/// Content-addressed (hash, bytes) pairs for a synthetic batch — cheap to generate in the
+/// hundreds, unlike real (up to 4 MiB) chunks, and exactly what the bulk presence seam only ever
+/// sees on the hash side: the bytes are kept alongside only so a test can seed `put_verified`
+/// with content that actually hashes to the claimed key.
+fn synthetic_objects(count: usize, seed: &str) -> Vec<(String, Vec<u8>)> {
+    (0..count)
+        .map(|i| {
+            let bytes = format!("{seed}-{i}").into_bytes();
+            (object_utils::hash_object_bytes(&bytes), bytes)
+        })
+        .collect()
+}
+
+/// `Head::missing` now answers via one bulk `ObjectStore::objects_missing` probe instead of a
+/// serial `exists` loop (the fix for the same 29 s-ceiling pattern the ref-update chunk descent
+/// had). Over a batch of hundreds of hashes with a scattered few absent — including a duplicate
+/// of one of them — the response must be byte-for-byte what the old per-hash loop produced:
+/// exactly the absent hashes, in input order, with duplicates preserved (no dedup — `missing`
+/// never deduped, unlike `upload_targets`).
+#[test]
+fn missing_reports_every_absent_hash_in_a_large_batch_preserving_input_order() {
+    let store = MemoryObjectStore::new();
+    let objects = synthetic_objects(300, "missing-batch");
+    let mut all: Vec<String> = objects.iter().map(|(hash, _)| hash.clone()).collect();
+
+    // Store all but a scattered few; remember which by index.
+    let absent_indices = [0usize, 47, 148, 299];
+    for (i, (hash, bytes)) in objects.iter().enumerate() {
+        if !absent_indices.contains(&i) {
+            store.put_verified(hash, bytes).expect("seed");
+        }
+    }
+
+    // A duplicate of an absent hash, appended at the end — the old loop would report it twice.
+    let duplicate = all[absent_indices[1]].clone();
+    all.push(duplicate.clone());
+
+    let head = Head::new(store, MemoryRefStore::new());
+    let missing = head.missing(&all).expect("missing");
+
+    let expected: Vec<String> = absent_indices.iter().map(|&i| all[i].clone()).chain([duplicate]).collect();
+    assert_eq!(missing, expected, "exactly the absent hashes, in input order, duplicates intact");
+}
+
+/// `Head::upload_targets` now resolves presence via the same bulk probe instead of one `exists`
+/// per unique hash. Over a batch of hundreds with a scattered few absent (plus duplicates), the
+/// `present`/`direct` (or `targets`, on a staging head) split must be unchanged: `present` holds
+/// exactly the stored hashes (deduped, first-occurrence order — unlike `missing`, this endpoint
+/// already deduped before this change) and every absent hash gets a target.
+#[test]
+fn upload_targets_negotiates_a_large_batch_matching_current_semantics() {
+    let absent_indices = [3usize, 91, 250];
+    let objects = synthetic_objects(400, "upload-targets-batch");
+    let mut hashes: Vec<String> = objects.iter().map(|(hash, _)| hash.clone()).collect();
+
+    // A direct head: every absent hash goes to `direct`.
+    let direct_store = MemoryObjectStore::new();
+    for (i, (hash, bytes)) in objects.iter().enumerate() {
+        if !absent_indices.contains(&i) {
+            direct_store.put_verified(hash, bytes).expect("seed");
+        }
+    }
+    // Duplicate one present and one absent hash — both must collapse in the response.
+    hashes.push(hashes[10].clone());
+    hashes.push(hashes[absent_indices[0]].clone());
+
+    let direct = Head::new(direct_store, MemoryRefStore::new());
+    let answer = direct.upload_targets("lift-1", &hashes).expect("negotiate");
+
+    let expected_present: Vec<String> = (0..400)
+        .filter(|i| !absent_indices.contains(i))
+        .map(|i| hashes[i].clone())
+        .collect();
+    let expected_direct: Vec<String> = absent_indices.iter().map(|&i| hashes[i].clone()).collect();
+
+    assert_eq!(answer.present, expected_present, "present is deduped, first-occurrence order");
+    assert_eq!(answer.direct, expected_direct, "every absent hash is named exactly once");
+    assert!(answer.targets.is_empty(), "a direct head hands out no staging targets");
+
+    // A staging head: the same absent hashes get presigned staging targets instead of `direct`.
+    let staging_store = MemoryObjectStore::with_redirect("https://s3.example/bucket");
+    for (i, (hash, bytes)) in objects.iter().enumerate() {
+        if !absent_indices.contains(&i) {
+            staging_store.put_verified(hash, bytes).expect("seed");
+        }
+    }
+    let staging = Head::new(staging_store, MemoryRefStore::new());
+    let answer = staging.upload_targets("lift-1", &hashes).expect("negotiate");
+
+    assert_eq!(answer.present, expected_present);
+    assert!(answer.direct.is_empty(), "a staging head never answers `direct`");
+    for hash in &expected_direct {
+        assert!(answer.targets.contains_key(hash), "{} should have a staging target", hash);
+    }
+    assert_eq!(answer.targets.len(), expected_direct.len());
+}
+
+/// `Head::commit_lift`'s blob-presence loop now resolves via the same bulk probe instead of one
+/// `exists` per blob. Over a batch of hundreds with a scattered few not yet promoted, the error
+/// must be byte-for-byte what the old per-hash loop produced: refused, naming exactly the
+/// *first* not-ready blob in `blobs` order (the loop's early-exit behavior, not "every missing
+/// blob" — unlike the chunk-closure audit, this endpoint's contract is unchanged).
+#[test]
+fn commit_lift_blobs_presence_check_matches_current_semantics_over_a_large_batch() {
+    let store = MemoryObjectStore::new();
+    let objects = synthetic_objects(500, "commit-lift-batch");
+    let blobs: Vec<String> = objects.iter().map(|(hash, _)| hash.clone()).collect();
+
+    // Promote all but a scattered few (store them directly at their canonical key — `commit_lift`
+    // checks presence there, exactly as `verify_and_promote` would leave them).
+    let absent_indices = [12usize, 200, 480];
+    for (i, (hash, bytes)) in objects.iter().enumerate() {
+        if !absent_indices.contains(&i) {
+            store.put_verified(hash, bytes).expect("seed");
+        }
+    }
+
+    let head = Head::new(store, MemoryRefStore::new());
+
+    let err = head
+        .commit_lift("lift-1", &[], &blobs, false)
+        .expect_err("not every blob is promoted yet");
+    assert_eq!(err.status, Status::Unprocessable);
+    // The *first* absent blob in `blobs` order — index 12, not 200 or 480.
+    assert!(err.message.contains(&blobs[absent_indices[0]]), "{}", err.message);
+    assert!(!err.message.contains(&blobs[absent_indices[1]]), "{}", err.message);
+
+    // The control: promote everything and the identical batch commits clean.
+    for &i in &absent_indices {
+        head.objects.put_verified(&objects[i].0, &objects[i].1).expect("promote");
+    }
+    head.commit_lift("lift-1", &[], &blobs, false).expect("every blob is now present");
+}
+
 // ---------------------------------------------------------------------------------------
 // The sync/async seam: stores whose every operation is a future — the AWS SDK's shape —
 // implementing the synchronous traits through `AsyncBridge`.
