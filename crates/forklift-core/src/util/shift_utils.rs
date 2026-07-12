@@ -105,7 +105,7 @@ fn diff_directory(from: Option<&TreeItem>,
             // prefix itself) is the §3.1 type change — refuse rather than guess. Out-of-scope
             // files are sealed and never materialized; only genuinely in-scope files are written.
             if scope.requires_directory(&child_key) {
-                return Err(scope_utils::type_changed_refusal(&child_key));
+                return Err(scope_utils::type_changed_refusal(&child_key).into());
             }
             if scope.classify(&child_key) == ScopeClass::OutOfScope {
                 continue;

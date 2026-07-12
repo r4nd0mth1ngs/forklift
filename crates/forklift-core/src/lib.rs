@@ -6,6 +6,7 @@
 
 pub mod builder;
 pub mod enums;
+pub mod error;
 pub mod globals;
 pub mod model;
 pub mod parser;

@@ -1,4 +1,5 @@
 use serde::Serialize;
+use forklift_core::error::CoreError;
 use forklift_core::globals;
 use forklift_core::util::scope_utils::{self, ScopeClass};
 use crate::cli::ScopeAction;
@@ -9,7 +10,7 @@ use crate::output::{self, CommandOutput};
 ///
 /// # Arguments
 /// * `key` - The warehouse path key of the argument.
-pub fn ensure_path_in_scope(key: &str) -> Result<(), String> {
+pub fn ensure_path_in_scope(key: &str) -> Result<(), CoreError> {
     if scope_utils::current_scope()?.classify(key) == ScopeClass::OutOfScope {
         return Err(scope_utils::out_of_scope_refusal(key));
     }
@@ -24,7 +25,7 @@ pub fn ensure_path_in_scope(key: &str) -> Result<(), String> {
 /// # Arguments
 /// * `verb`      - The command name, for the message.
 /// * `next_step` - The machine-actionable recovery step.
-pub fn refuse_in_scoped_bay(verb: &str, next_step: &str) -> Result<(), String> {
+pub fn refuse_in_scoped_bay(verb: &str, next_step: &str) -> Result<(), CoreError> {
     if scope_utils::is_scoped()? {
         return Err(scope_utils::sparse_workspace_refusal(verb, next_step));
     }

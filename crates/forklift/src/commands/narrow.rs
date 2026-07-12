@@ -1,4 +1,5 @@
 use serde::Serialize;
+use forklift_core::error::CoreError;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::{MaterializationScope, ScopeClass};
 use forklift_core::util::stocktake_utils::ChangeKind;
@@ -99,7 +100,7 @@ pub async fn handle_command(paths: Vec<String>) -> Result<(), String> {
 /// changes to tracked files, or untracked files anywhere under it. Matches the codebase's own
 /// precedent (`shift` refuses rather than overwrite untracked content) — narrow's delete is
 /// unconditional once it decides to act, so the decision itself must be conservative.
-async fn ensure_narrow_target_is_clean(prefix: &str) -> Result<(), String> {
+async fn ensure_narrow_target_is_clean(prefix: &str) -> Result<(), CoreError> {
     // Reuses the classifier to test "at or under `prefix`": a scope of exactly this one prefix
     // classifies a path at or under it as `InScope` — the only case this check acts on. An
     // ancestor of `prefix` (e.g. "src" for "src/api") classifies `Spine`, not `InScope`, exactly

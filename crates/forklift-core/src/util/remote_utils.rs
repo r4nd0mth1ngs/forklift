@@ -16,6 +16,7 @@ use crate::model::remote::{
     UploadTargetsResponse, WarehouseInfo, LIFT_SESSION_BLOB_NOT_READY, MAX_MISSING_BATCH,
     MAX_UPLOAD_TARGETS_BATCH, PROTOCOL_VERSION,
 };
+use crate::error::{CoreError, RefusalCode};
 use crate::util::office_utils::OFFICE_PALLET_NAME;
 use crate::util::scope_utils::{self, MaterializationScope, ScopeClass};
 use crate::util::{
@@ -141,6 +142,29 @@ pub struct RemoteClient {
     token: Option<String>,
 }
 
+/// Compose the client-facing error for a non-success response, threading a server-side refusal
+/// code (§7.4) through the taxonomy. When the body tagged the failure with a stable refusal `code`
+/// this build recognizes, the error is re-framed (via the [`crate::error`] bridge shim) so a
+/// server-side refusal classifies with the *same* code and exit code as a local one; an
+/// unrecognized code (a newer peer) or none at all (an older head, or a plain error) degrades to
+/// the wrapped message — but when the wire still carried a `next_step` (the newer-peer case), it
+/// is folded into that message rather than dropped, so recovery guidance survives even when the
+/// code itself does not. Either way the message is wrapped with the action and status for context.
+///
+/// A free function (not a method) so the round-trip can be unit-tested without a live socket.
+fn classify_remote_error(status: u16, action: &str, message: String,
+                         code: Option<String>, next_step: Option<String>) -> String {
+    let wrapped = format!("The remote refused {} ({}): {}", action, status, message);
+
+    match code.as_deref().and_then(RefusalCode::from_code) {
+        Some(code) => String::from(CoreError::refusal(code, wrapped, next_step.unwrap_or_default())),
+        None => match next_step {
+            Some(next_step) if !next_step.is_empty() => format!("{} {}", wrapped, next_step),
+            _ => wrapped,
+        },
+    }
+}
+
 impl RemoteClient {
     /// Create a client for a remote.
     ///
@@ -215,16 +239,17 @@ impl RemoteClient {
         builder
     }
 
-    /// Turn a non-success response into the server's error message.
+    /// Turn a non-success response into the client-facing error, threading the server's refusal
+    /// code (§7.4) through the taxonomy when the body carries one.
     async fn error_of(response: reqwest::Response, action: &str) -> String {
         let status = response.status();
 
-        let message = match response.json::<ErrorResponse>().await {
-            Ok(body) => body.error,
-            Err(_) => status.canonical_reason().unwrap_or("unknown error").to_string(),
+        let (message, code, next_step) = match response.json::<ErrorResponse>().await {
+            Ok(body) => (body.error, body.code, body.next_step),
+            Err(_) => (status.canonical_reason().unwrap_or("unknown error").to_string(), None, None),
         };
 
-        format!("The remote refused {} ({}): {}", action, status.as_u16(), message)
+        classify_remote_error(status.as_u16(), action, message, code, next_step)
     }
 
     /// Fetch the warehouse handshake and check the protocol version.
@@ -1429,7 +1454,7 @@ fn collect_changed_closure(tree_hash: &str,
             //    entry this walk visits (explained or not), so it also catches one that is
             //    unchanged-but-newly-reachable in this lift.
             if !chunking_supported {
-                return Err(scope_utils::chunked_remote_refusal(&join_path(path_prefix, name)));
+                return Err(scope_utils::chunked_remote_refusal(&join_path(path_prefix, name)).into());
             }
 
             // 2. An identical recipe on a parent at this name ⟹ the remote already has that
@@ -1496,7 +1521,7 @@ fn join_path(prefix: &str, name: &str) -> String {
 /// where the upload path already holds the object's bytes for the imminent network call, so
 /// refusing costs nothing extra and the bytes never reach the wire — an honest client-side
 /// failure instead of the server's own import refusal surfacing as an opaque mid-lift error.
-fn refuse_if_over_ceiling_for_upload(hash: &str, bytes: &[u8]) -> Result<(), String> {
+fn refuse_if_over_ceiling_for_upload(hash: &str, bytes: &[u8]) -> Result<(), CoreError> {
     scope_utils::refuse_if_over_object_ceiling(&format!("object {}", hash), bytes.len())
 }
 
@@ -1538,10 +1563,10 @@ async fn upload_objects(client: &RemoteClient, hashes: &[String]) -> Result<(), 
 /// * `chunking_supported` - Whether the remote's handshake advertised chunking support.
 ///
 /// # Returns
-/// * `Ok(())`      - One batch suffices, or the remote understands pagination either way.
-/// * `Err(String)` - The `commit_pagination_unsupported` refusal.
+/// * `Ok(())`         - One batch suffices, or the remote understands pagination either way.
+/// * `Err(CoreError)` - The `commit_pagination_unsupported` refusal.
 fn refuse_if_commit_pagination_unsupported(staged_count: usize,
-                                           chunking_supported: bool) -> Result<(), String> {
+                                           chunking_supported: bool) -> Result<(), CoreError> {
     if staged_count <= MAX_MISSING_BATCH || chunking_supported {
         return Ok(());
     }
@@ -2126,6 +2151,71 @@ mod tests {
     use std::sync::Mutex;
     use crate::builder::object::loose_object_builder::LooseObjectBuilder;
     use crate::globals::StorageRootScope;
+    use crate::model::remote::ErrorResponse;
+
+    /// The server-to-client wire round trip (§7.4): a server-side refusal carries its stable code
+    /// in the additive `ErrorResponse.code` field; after that body crosses the wire (here through
+    /// real serde), the client's `classify_remote_error` re-frames it so it classifies as the *same*
+    /// typed refusal — the same code a local refusal would. The exit-code half of the contract is
+    /// asserted in `forklift`'s `output` tests; here we prove the code survives the wire.
+    #[test]
+    fn a_server_refusal_code_crosses_the_wire_and_classifies_the_same() {
+        // The server tagged a 422 with a stable refusal code + next step (as `error_body` does).
+        let server_body = ErrorResponse {
+            error: "\"big.bin\" is a large file stored in chunks, ...".to_string(),
+            code: Some(scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED.to_string()),
+            next_step: Some("Upgrade the remote ...".to_string()),
+        };
+
+        // Cross the wire byte-for-byte.
+        let json = serde_json::to_string(&server_body).unwrap();
+        let parsed: ErrorResponse = serde_json::from_str(&json).unwrap();
+
+        let classified = classify_remote_error(
+            422, "the negotiation", parsed.error, parsed.code, parsed.next_step,
+        );
+
+        // The client re-lifts it into a typed refusal with the same code — never a leaked frame.
+        match CoreError::from(classified) {
+            CoreError::Refusal { code, message, next_step } => {
+                assert_eq!(code, RefusalCode::ChunkedTransportUnsupported);
+                assert!(message.contains("The remote refused the negotiation (422)"),
+                    "the client wraps the server message with context: {}", message);
+                assert!(!message.contains('\u{1f}'), "no frame leaks: {:?}", message);
+                assert_eq!(next_step, "Upgrade the remote ...");
+            }
+            other => panic!("expected a typed refusal, got {:?}", other),
+        }
+    }
+
+    /// An **old** server (no `code` field) or a **plain** error keeps working: the client shows the
+    /// wrapped message and classifies generically — never a spurious refusal code.
+    #[test]
+    fn an_uncoded_wire_error_stays_generic() {
+        let classified = classify_remote_error(
+            500, "the negotiation", "boom".to_string(), None, None,
+        );
+        assert_eq!(CoreError::from(classified.clone()), CoreError::Other(classified));
+    }
+
+    /// A code a newer server sends that this client does not know degrades to a generic error
+    /// (with the wrapped message), rather than being invented into a taxonomy exit code — but the
+    /// wire's next_step still survives, folded into the message, so recovery guidance is not lost
+    /// just because the code was unrecognized.
+    #[test]
+    fn an_unknown_wire_code_degrades_generically() {
+        let classified = classify_remote_error(
+            422, "the negotiation", "future refusal".to_string(),
+            Some("some_future_code".to_string()), Some("do this".to_string()),
+        );
+        match CoreError::from(classified) {
+            CoreError::Other(message) => {
+                assert!(message.contains("future refusal"));
+                assert!(message.contains("do this"), "next_step guidance survives: {}", message);
+            }
+            other => panic!("expected Other, got {:?}", other),
+        }
+    }
 
     /// A fresh warehouse root for one test, entered as the active storage-root scope for
     /// its lifetime — `is_known_complete` reads the object store and the commit-graph
@@ -2365,10 +2455,11 @@ mod tests {
 
         let error = refuse_if_commit_pagination_unsupported(MAX_MISSING_BATCH + 1, false)
             .expect_err("over the cap, against a non-chunking remote, must refuse");
-        let (code, message, next_step) = scope_utils::decode_refusal(&error)
-            .expect("the refusal must decode via the shared sentinel framing");
+        let CoreError::Refusal { code, message, next_step } = error else {
+            panic!("expected a typed refusal, got {:?}", error);
+        };
 
-        assert_eq!(code, scope_utils::CODE_COMMIT_PAGINATION_UNSUPPORTED);
+        assert_eq!(code, RefusalCode::CommitPaginationUnsupported);
         assert!(
             message.contains(&(MAX_MISSING_BATCH + 1).to_string()),
             "the refusal names the staged count: {}", message

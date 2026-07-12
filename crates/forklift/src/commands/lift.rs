@@ -1,4 +1,5 @@
 use serde::Serialize;
+use forklift_core::error::CoreError;
 use forklift_core::enums::config_scope::ConfigScope;
 use forklift_core::util::remote_utils::{LiftResult, RemoteClient};
 use forklift_core::util::{
@@ -100,7 +101,7 @@ pub async fn handle_command() -> Result<(), String> {
 /// fail late and confusingly. Refusing up front, with the origin named, is the clearer failure.
 /// A no-op for a full (non-sparse) warehouse, which holds the whole closure and can lift
 /// anywhere, and for a sparse warehouse still pointed at its origin.
-fn ensure_origin_remote() -> Result<(), String> {
+fn ensure_origin_remote() -> Result<(), CoreError> {
     if !scope_utils::is_warehouse_sparse()? {
         return Ok(());
     }

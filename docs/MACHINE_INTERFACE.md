@@ -67,7 +67,14 @@ is reserved for argument/usage errors (clap); `0` is success.
 | `oversized_transport_unsupported` | 15 | An object predates the size limit and can't be sent to a remote or bundle |
 | `commit_pagination_unsupported` | 16 | A lift needs a paginated commit (many objects) and the remote doesn't support it yet |
 
-The codes and exit numbers are a contract: they get added to, never repurposed.
+The codes and exit numbers are a contract: they get added to, never repurposed. A single
+`match` in the head (over `forklift-core`'s `RefusalCode`) maps a refusal to its exit code, so a
+new code cannot ship without an exit code wired to it.
+
+A refusal a **remote** raises carries the same code: the server tags its JSON error body with the
+stable `code` (see `format/REMOTE_PROTOCOL.md`), and the client classifies it with the same code
+and exit code as a local one — so a script branches identically whether the refusal was local or
+server-side.
 
 ## Structured conflicts
 

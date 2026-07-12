@@ -632,7 +632,7 @@ fn empty(status: StatusCode) -> Response<Vec<u8>> {
 
 /// A failed request as the protocol's JSON error body, at the status the head chose.
 ///
-/// A `500`'s message is the one the client never sees as written. `Head`'s internal errors wrap
+/// A raw `500`'s message is the one the client never sees as written. `Head`'s internal errors wrap
 /// raw storage failures (an SDK `DisplayErrorContext` can carry a request id, a bucket or table
 /// name), and this router sits behind the hosted service's public edge. `forklift-server`
 /// forwards its `500` messages verbatim, and that is fine there — a self-host head only ever
@@ -640,21 +640,14 @@ fn empty(status: StatusCode) -> Response<Vec<u8>> {
 /// name to whoever happens to be asking. The detail is logged instead (Lambda ships stderr to
 /// CloudWatch) and the client gets a generic message. Every other status is the protocol's own
 /// diagnostic (a bad hash, a stale ref, a malformed body) and stays as-is — it is meant to be
-/// read.
+/// read. A classified refusal (§7.4) is decoded regardless of status — see [`error_body`].
 fn error_response(error: HeadError) -> Response<Vec<u8>> {
     // The head's [`Status`] numeric values *are* the protocol's HTTP status codes, so this is
     // the single point its taxonomy meets `http`.
     let status = StatusCode::from_u16(error.status.as_u16())
         .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
-    let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
-        eprintln!("forklift-aws-lambda: internal error: {}", error.message);
-        "An internal error occurred.".to_string()
-    } else {
-        error.message
-    };
-
-    let body = serde_json::to_vec(&ErrorResponse { error: message })
+    let body = serde_json::to_vec(&error_body(status, error.message))
         .unwrap_or_else(|_| b"{\"error\":\"internal error\"}".to_vec());
 
     let mut builder =
@@ -669,9 +662,86 @@ fn error_response(error: HeadError) -> Response<Vec<u8>> {
     builder.body(body).expect("a valid error response")
 }
 
+/// Compose the JSON error body from the chosen status and message.
+///
+/// A **classified refusal** (§7.4) reaches this head as a sentinel-framed message a core operation
+/// produced; it is decoded *regardless of status* so the body carries the stable `code` and
+/// `next_step` machine-readably (additive fields) with the de-framed human text in `error` — the
+/// raw `\u{1f}` frame never leaks, and the refusal message is a controlled taxonomy diagnostic that
+/// carries no infrastructure detail, so exposing it is safe even at `500`. A **raw** `500` (not a
+/// framed refusal) is the case that may wrap infra detail: it is logged and replaced with a generic
+/// message and no code. Any other plain message passes through with no code.
+///
+/// Trust-boundary note: `deframe` decodes *any* message that happens to start with the sentinel
+/// prefix, at any status, regardless of where the `String` originated. Deciding that is safe even
+/// at `500` (unlike the rest of that message, which is hidden) rests on every framed message being
+/// refusal text this codebase's own sanitized constructors produced, sent back only to the
+/// requester whose action triggered it — never third-party or attacker-supplied content. Keep it
+/// that way: a future error path that let outside-influenced text reach byte zero of a handler's
+/// message could spoof a `code`/`next_step` pair here.
+fn error_body(status: StatusCode, message: String) -> ErrorResponse {
+    if let Some((code, human, next_step)) = forklift_core::error::deframe(&message) {
+        return ErrorResponse {
+            error: human.to_string(),
+            code: Some(code.to_string()),
+            next_step: Some(next_step.to_string()),
+        };
+    }
+
+    if status == StatusCode::INTERNAL_SERVER_ERROR {
+        eprintln!("forklift-aws-lambda: internal error: {}", message);
+        return ErrorResponse {
+            error: "An internal error occurred.".to_string(),
+            code: None,
+            next_step: None,
+        };
+    }
+
+    ErrorResponse { error: message, code: None, next_step: None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forklift_core::util::scope_utils;
+
+    /// A classified refusal (§7.4) is decoded onto the wire regardless of status — its human message
+    /// is a controlled taxonomy diagnostic, safe to expose even at `500`, so both heads carry the
+    /// code consistently. The raw frame never leaks.
+    #[test]
+    fn error_body_threads_a_refusal_code_at_any_status() {
+        for status in [StatusCode::UNPROCESSABLE_ENTITY, StatusCode::INTERNAL_SERVER_ERROR] {
+            let framed: String = scope_utils::chunked_transport_refusal("big.bin").into();
+            let body = error_body(status, framed);
+
+            assert_eq!(body.code.as_deref(), Some(scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED),
+                "code carried at {}", status);
+            assert!(body.next_step.is_some());
+            assert!(body.error.contains("big.bin"), "{}", body.error);
+            assert!(!body.error.contains('\u{1f}'), "no frame leaks: {:?}", body.error);
+        }
+    }
+
+    /// A **raw** `500` (not a framed refusal) still hides its message — an SDK error can carry a
+    /// bucket/request-id, which must never reach a stranger — and carries no code.
+    #[test]
+    fn error_body_hides_a_raw_internal_error() {
+        let body = error_body(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DynamoDB error in table forklift-prod-abc123: ...".to_string(),
+        );
+        assert_eq!(body.error, "An internal error occurred.");
+        assert!(body.code.is_none());
+        assert!(!body.error.contains("forklift-prod-abc123"), "infra detail hidden: {}", body.error);
+    }
+
+    /// A plain non-500 error passes through with no code (an older client ignores the absent field).
+    #[test]
+    fn error_body_passes_a_plain_error_through() {
+        let body = error_body(StatusCode::UNPROCESSABLE_ENTITY, "a bad hash".to_string());
+        assert_eq!(body.error, "a bad hash");
+        assert!(body.code.is_none());
+    }
 
     /// `query_param` treats a missing, empty, or whitespace-only value as absent — the fix for
     /// the review finding that `?session=` presigned a `staging//{hash}` key nothing could ever

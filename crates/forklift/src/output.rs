@@ -15,6 +15,7 @@
 
 use std::sync::OnceLock;
 use serde::Serialize;
+use forklift_core::error::{CoreError, RefusalCode};
 use forklift_core::util::scope_utils;
 
 /// The output schema version, carried on every JSON envelope as `forklift_json`.
@@ -259,20 +260,24 @@ impl ErrorCode {
         }
     }
 
-    /// Map a scope-refusal code (a `scope_utils::CODE_*` string) to its `ErrorCode`.
-    fn from_scope_code(code: &str) -> Option<ErrorCode> {
+    /// Map a core [`RefusalCode`] to its CLI `ErrorCode`. This is the single, **exhaustive** point
+    /// where the core taxonomy meets the head's exit-code table (§7.4/§7.8): the `match` is total
+    /// over `RefusalCode`, so adding a refusal code in `forklift-core` without wiring its exit code
+    /// here is a *compile error* — which is the entire point of the type. The two enums are kept
+    /// distinct because `ErrorCode` also classifies head-only conditions core can never raise
+    /// (`NotAWarehouse`, `WarehouseLocked`, …).
+    fn from_refusal(code: RefusalCode) -> ErrorCode {
         match code {
-            _ if code == scope_utils::CODE_OUT_OF_SCOPE           => Some(ErrorCode::OutOfScope),
-            _ if code == scope_utils::CODE_OUT_OF_SCOPE_CONFLICT  => Some(ErrorCode::OutOfScopeConflict),
-            _ if code == scope_utils::CODE_SCOPE_PATH_TYPE_CHANGED => Some(ErrorCode::ScopePathTypeChanged),
-            _ if code == scope_utils::CODE_SPARSE_WORKSPACE       => Some(ErrorCode::SparseWorkspace),
-            _ if code == scope_utils::CODE_NON_ORIGIN_LIFT        => Some(ErrorCode::NonOriginLift),
-            _ if code == scope_utils::CODE_NARROW_UNCLEAN         => Some(ErrorCode::NarrowUnclean),
-            _ if code == scope_utils::CODE_SCOPE_PRUNE_BLOCKED    => Some(ErrorCode::ScopePruneBlocked),
-            _ if code == scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED => Some(ErrorCode::ChunkedTransportUnsupported),
-            _ if code == scope_utils::CODE_OVERSIZED_TRANSPORT_UNSUPPORTED => Some(ErrorCode::OversizedTransportUnsupported),
-            _ if code == scope_utils::CODE_COMMIT_PAGINATION_UNSUPPORTED => Some(ErrorCode::CommitPaginationUnsupported),
-            _ => None,
+            RefusalCode::OutOfScope => ErrorCode::OutOfScope,
+            RefusalCode::OutOfScopeConflict => ErrorCode::OutOfScopeConflict,
+            RefusalCode::ScopePathTypeChanged => ErrorCode::ScopePathTypeChanged,
+            RefusalCode::SparseWorkspace => ErrorCode::SparseWorkspace,
+            RefusalCode::NonOriginLift => ErrorCode::NonOriginLift,
+            RefusalCode::NarrowUnclean => ErrorCode::NarrowUnclean,
+            RefusalCode::ScopePruneBlocked => ErrorCode::ScopePruneBlocked,
+            RefusalCode::ChunkedTransportUnsupported => ErrorCode::ChunkedTransportUnsupported,
+            RefusalCode::OversizedTransportUnsupported => ErrorCode::OversizedTransportUnsupported,
+            RefusalCode::CommitPaginationUnsupported => ErrorCode::CommitPaginationUnsupported,
         }
     }
 }
@@ -297,32 +302,35 @@ impl ForkliftError {
     }
 }
 
-/// A bare `Err(String)` from a handler is a generic failure with no next step — the
-/// `?`-friendly default. Scope refusals (§7.6) are the exception: `forklift-core` cannot
-/// build a `ForkliftError` (it never prints, and the type is CLI-local), so it frames the
-/// refusal as a sentinel-tagged string that this conversion decodes into a classified error
-/// with the matching stable code, exit code and next step.
-///
-/// A frame whose `code` this build does not recognize (e.g. a newer `forklift-core` added a
-/// scope code this CLI predates) still decodes — the frame itself is well-formed — so it
-/// still uses the decoded human message and next step rather than falling through to the
-/// raw framed string, which would leak the `\u{1f}` field separators into human/JSON output.
-/// It just classifies as `Generic` instead of the (unknown) specific code. Only a string that
-/// is not a scope refusal at all — `decode_refusal` returns `None` — is treated as a plain
-/// generic error verbatim.
+/// Classify a [`CoreError`] into a `ForkliftError` — the head's error boundary. A
+/// [`CoreError::Refusal`] carries a typed [`RefusalCode`] that [`ErrorCode::from_refusal`] maps
+/// (exhaustively) to the matching stable code, exit code and next step; a [`CoreError::Other`] is a
+/// generic failure with no next step. The classification is by the *type*, not by parsing a string.
+impl From<CoreError> for ForkliftError {
+    fn from(error: CoreError) -> ForkliftError {
+        match error {
+            CoreError::Refusal { code, message, next_step } => ForkliftError {
+                code: ErrorCode::from_refusal(code),
+                message,
+                next_step: Some(next_step),
+            },
+            CoreError::Other(message) => {
+                ForkliftError { code: ErrorCode::Generic, message, next_step: None }
+            }
+        }
+    }
+}
+
+/// A bare `Err(String)` from a handler is the `?`-friendly default. Most of `forklift-core` still
+/// returns `Result<_, String>`, and a refusal that crossed such a still-String segment arrives here
+/// as a sentinel-framed string (the [`forklift_core::error`] bridge shim). Lifting it through
+/// [`CoreError`] re-types it — a framed refusal becomes its typed [`CoreError::Refusal`] and
+/// classifies exactly as one that stayed typed throughout; a plain string becomes a generic error.
+/// A frame whose code this build does not recognize (a newer `forklift-core`) degrades to a generic
+/// error with the human message — the raw `\u{1f}` frame never leaks into human/JSON output.
 impl From<String> for ForkliftError {
     fn from(message: String) -> ForkliftError {
-        if let Some((code, human, next_step)) = scope_utils::decode_refusal(&message) {
-            let code = ErrorCode::from_scope_code(code).unwrap_or(ErrorCode::Generic);
-
-            return ForkliftError {
-                code,
-                message: human.to_string(),
-                next_step: Some(next_step.to_string()),
-            };
-        }
-
-        ForkliftError { code: ErrorCode::Generic, message, next_step: None }
+        ForkliftError::from(CoreError::from(message))
     }
 }
 
@@ -342,26 +350,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_known_scope_code_classifies_and_keeps_the_next_step() {
-        let refusal = scope_utils::out_of_scope_refusal("src/web");
-        let error: ForkliftError = refusal.into();
+    fn a_typed_refusal_classifies_and_keeps_the_next_step() {
+        // A refusal produced typed (a newly-typed command path) classifies straight from the type.
+        let error: ForkliftError = scope_utils::out_of_scope_refusal("src/web").into();
 
         assert_eq!(error.code.as_str(), scope_utils::CODE_OUT_OF_SCOPE);
+        assert_eq!(error.code.exit_code(), 7);
         assert!(!error.message.contains('\u{1f}'));
         assert!(error.next_step.is_some());
     }
 
     #[test]
-    fn an_unrecognized_scope_code_still_decodes_instead_of_leaking_the_raw_frame() {
-        // A well-formed frame whose code this build has never heard of — as if a newer
-        // `forklift-core` introduced a scope code this CLI predates.
-        let frame = scope_utils::refusal("some_future_code", "a human explanation", "do this");
+    fn a_refusal_that_crossed_a_string_segment_classifies_identically() {
+        // The bridge shim: a refusal reframed to a String (as a still-String core walker returns
+        // it) must classify the same as one that stayed typed — same code, exit and next step, and
+        // the raw `\u{1f}` frame never leaks.
+        let framed: String = scope_utils::out_of_scope_refusal("src/web").into();
+        assert!(framed.contains('\u{1f}'), "the shim string is a sentinel frame");
+
+        let error: ForkliftError = framed.into();
+        assert_eq!(error.code.as_str(), scope_utils::CODE_OUT_OF_SCOPE);
+        assert_eq!(error.code.exit_code(), 7);
+        assert_eq!(error.next_step.as_deref(), Some(
+            "Widen the bay's scope to include the path, or run the command in a full workspace."
+        ));
+        assert!(!error.message.contains('\u{1f}'), "the raw frame must never leak into the message");
+    }
+
+    #[test]
+    fn an_unrecognized_framed_code_degrades_generically_without_leaking_the_frame() {
+        // A frame whose code this build has never heard of — as if a newer `forklift-core`
+        // introduced a code this CLI predates. It must not leak the raw frame; it degrades to a
+        // generic error carrying the human message and, folded in, the recovery step (no invented
+        // code, but no lost guidance either — this is exactly the forward-compat case).
+        let frame = format!(
+            "{}some_future_code{}a human explanation{}do this",
+            forklift_core::error::REFUSAL_PREFIX,
+            forklift_core::error::REFUSAL_FIELD_SEPARATOR,
+            forklift_core::error::REFUSAL_FIELD_SEPARATOR,
+        );
 
         let error: ForkliftError = frame.into();
 
         assert_eq!(error.code.as_str(), "error"); // ErrorCode::Generic
-        assert_eq!(error.message, "a human explanation");
-        assert_eq!(error.next_step.as_deref(), Some("do this"));
+        assert_eq!(error.message, "a human explanation do this");
         assert!(!error.message.contains('\u{1f}'), "the raw frame must never leak into the message");
     }
 
@@ -372,5 +404,62 @@ mod tests {
         assert_eq!(error.code.as_str(), "error");
         assert_eq!(error.message, "something ordinary went wrong");
         assert!(error.next_step.is_none());
+    }
+
+    /// The sentinel frame byte (`\u{1f}`) must never reach a user — not in the human message and
+    /// not in the next step — for any refusal code, even when the interpolated text (a path off
+    /// disk) carries the byte itself. Rendered through the full boundary (`CoreError` → the framed
+    /// String shim → `ForkliftError`), the message and next step stay clean.
+    #[test]
+    fn no_refusal_ever_renders_the_sentinel_frame_byte() {
+        for code in [
+            RefusalCode::OutOfScope,
+            RefusalCode::OutOfScopeConflict,
+            RefusalCode::ScopePathTypeChanged,
+            RefusalCode::SparseWorkspace,
+            RefusalCode::NonOriginLift,
+            RefusalCode::NarrowUnclean,
+            RefusalCode::ScopePruneBlocked,
+            RefusalCode::ChunkedTransportUnsupported,
+            RefusalCode::OversizedTransportUnsupported,
+            RefusalCode::CommitPaginationUnsupported,
+        ] {
+            // Hostile interpolated text, carried across a String segment (the shim), then classified.
+            let framed: String = CoreError::refusal(code, "a\u{1f}path", "a\u{1f}step").into();
+            let error: ForkliftError = framed.into();
+
+            assert!(!error.message.contains('\u{1f}'), "message leaks the frame for {:?}", code);
+            assert!(
+                !error.next_step.as_deref().unwrap_or_default().contains('\u{1f}'),
+                "next_step leaks the frame for {:?}", code,
+            );
+        }
+    }
+
+    /// Every refusal code maps to the exit code the machine-interface contract (§7.8,
+    /// `docs/MACHINE_INTERFACE.md`) pins — the table, asserted. This is the compatibility proof for
+    /// the taxonomy: a mis-wired `from_refusal` arm or a changed exit number fails here.
+    #[test]
+    fn every_refusal_code_maps_to_its_contract_exit_code() {
+        let table = [
+            (RefusalCode::OutOfScope, "out_of_scope", 7),
+            (RefusalCode::ScopePathTypeChanged, "scope_path_type_changed", 8),
+            (RefusalCode::SparseWorkspace, "sparse_workspace", 9),
+            (RefusalCode::OutOfScopeConflict, "out_of_scope_conflict", 10),
+            (RefusalCode::NonOriginLift, "non_origin_lift", 11),
+            (RefusalCode::NarrowUnclean, "narrow_unclean", 12),
+            (RefusalCode::ScopePruneBlocked, "scope_prune_blocked", 13),
+            (RefusalCode::ChunkedTransportUnsupported, "chunked_transport_unsupported", 14),
+            (RefusalCode::OversizedTransportUnsupported, "oversized_transport_unsupported", 15),
+            (RefusalCode::CommitPaginationUnsupported, "commit_pagination_unsupported", 16),
+        ];
+
+        for (code, code_str, exit) in table {
+            let mapped = ErrorCode::from_refusal(code);
+            assert_eq!(mapped.as_str(), code_str, "code string for {:?}", code);
+            assert_eq!(mapped.exit_code(), exit, "exit code for {:?}", code);
+            // The core code string and the head's code string are the same contract.
+            assert_eq!(code.as_str(), code_str, "core/head code strings agree for {:?}", code);
+        }
     }
 }
