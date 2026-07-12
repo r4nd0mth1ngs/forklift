@@ -2263,7 +2263,12 @@ mod tests {
     /// The commit-pagination gate (§9.4b W3, the pure boundary): a staged count at or under the
     /// per-batch cap is fine regardless of remote support (one batch either way); over the cap,
     /// only a chunking-capable remote (which understands the additive `more` field) may proceed —
-    /// a non-chunking remote is refused, naming the exact staged count.
+    /// a non-chunking remote is refused, naming the exact staged count. The over-cap+chunking→Ok
+    /// arm is asserted here in isolation; the wire-level positive case (driving a real
+    /// `negotiate_and_upload` past the gate) is intentionally not duplicated, since it would need
+    /// a >10k-candidate upload spawn — the refusal-side wire test
+    /// (`a_large_lift_to_a_non_chunking_remote_refuses_before_any_upload`) already proves
+    /// `negotiate_and_upload` threads the capability into this same gate.
     #[test]
     fn commit_pagination_gate_refuses_only_when_over_cap_and_unsupported() {
         assert!(
@@ -2840,34 +2845,6 @@ mod tests {
         assert_eq!(
             remote.upload_or_commit_hits(), 0,
             "nothing was uploaded or committed: the whole upload was never wasted"
-        );
-    }
-
-    /// The same oversized negotiation against a remote that DOES advertise chunking never triggers
-    /// the pagination gate — proven by the *kind* of failure, not by completing a real 10,000+
-    /// object upload (too slow for a unit test; the pure boundary test above already nails the
-    /// exact cap arithmetic with zero cost). The candidates are placeholder hashes naming no real
-    /// object, so `upload_to_targets`'s per-object read fails downstream — but that failure is an
-    /// ordinary read error, not a scope refusal at all, which is exactly the proof: had the gate
-    /// fired, the error would decode as `CODE_COMMIT_PAGINATION_UNSUPPORTED` before a single object
-    /// read was even attempted (as the sibling refusal test demonstrates). Its absence here means
-    /// execution passed the gate and reached the real upload attempt.
-    #[test]
-    fn a_large_lift_to_a_chunking_remote_does_not_trigger_the_pagination_gate() {
-        let remote = FakeStagingRemote::start(true);
-        let client = RemoteClient::new(&remote.url, None).unwrap();
-        let candidates = oversized_candidate_set();
-        let control_plane: HashSet<String> = HashSet::new();
-
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let error = runtime.block_on(negotiate_and_upload(
-            &client, "session-2", &candidates, &control_plane, true,
-        )).expect_err("the placeholder hashes name no real object, so the upload attempt fails");
-
-        assert!(
-            scope_utils::decode_refusal(&error).is_none(),
-            "a chunking-capable remote must never see the pagination refusal, only the (expected, \
-            unrelated) downstream read failure: {}", error
         );
     }
 

@@ -164,9 +164,9 @@ pub struct RefUpdateRequest {
 /// inline and never needs this call.
 #[derive(Serialize, Deserialize)]
 pub struct CommitLiftRequest {
-    /// Small objects — parcels, trees, recipes, signature sidecars — the head verifies and
-    /// promotes synchronously: it reads the staged bytes, checks `Blake3(bytes) == hash`, and
-    /// only then copies them to the canonical hash key. A corrupt one refuses the commit.
+    /// Small objects — parcels, trees, recipes — the head verifies and promotes synchronously:
+    /// it reads the staged bytes, checks `Blake3(bytes) == hash`, and only then copies them to
+    /// the canonical hash key. A corrupt one refuses the commit.
     pub control_plane: Vec<String>,
 
     /// Large working blobs and a chunked file's chunks, checked for presence at their canonical
