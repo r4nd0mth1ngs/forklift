@@ -147,7 +147,9 @@ pub struct RemoteClient {
 /// this build recognizes, the error is re-framed (via the [`crate::error`] bridge shim) so a
 /// server-side refusal classifies with the *same* code and exit code as a local one; an
 /// unrecognized code (a newer peer) or none at all (an older head, or a plain error) degrades to
-/// the wrapped message. Either way the message is wrapped with the action and status for context.
+/// the wrapped message — but when the wire still carried a `next_step` (the newer-peer case), it
+/// is folded into that message rather than dropped, so recovery guidance survives even when the
+/// code itself does not. Either way the message is wrapped with the action and status for context.
 ///
 /// A free function (not a method) so the round-trip can be unit-tested without a live socket.
 fn classify_remote_error(status: u16, action: &str, message: String,
@@ -156,7 +158,10 @@ fn classify_remote_error(status: u16, action: &str, message: String,
 
     match code.as_deref().and_then(RefusalCode::from_code) {
         Some(code) => String::from(CoreError::refusal(code, wrapped, next_step.unwrap_or_default())),
-        None => wrapped,
+        None => match next_step {
+            Some(next_step) if !next_step.is_empty() => format!("{} {}", wrapped, next_step),
+            _ => wrapped,
+        },
     }
 }
 
@@ -2194,7 +2199,9 @@ mod tests {
     }
 
     /// A code a newer server sends that this client does not know degrades to a generic error
-    /// (with the wrapped message), rather than being invented into a taxonomy exit code.
+    /// (with the wrapped message), rather than being invented into a taxonomy exit code — but the
+    /// wire's next_step still survives, folded into the message, so recovery guidance is not lost
+    /// just because the code was unrecognized.
     #[test]
     fn an_unknown_wire_code_degrades_generically() {
         let classified = classify_remote_error(
@@ -2202,7 +2209,10 @@ mod tests {
             Some("some_future_code".to_string()), Some("do this".to_string()),
         );
         match CoreError::from(classified) {
-            CoreError::Other(message) => assert!(message.contains("future refusal")),
+            CoreError::Other(message) => {
+                assert!(message.contains("future refusal"));
+                assert!(message.contains("do this"), "next_step guidance survives: {}", message);
+            }
             other => panic!("expected Other, got {:?}", other),
         }
     }

@@ -381,7 +381,8 @@ mod tests {
     fn an_unrecognized_framed_code_degrades_generically_without_leaking_the_frame() {
         // A frame whose code this build has never heard of — as if a newer `forklift-core`
         // introduced a code this CLI predates. It must not leak the raw frame; it degrades to a
-        // generic error carrying the human message (no invented code).
+        // generic error carrying the human message and, folded in, the recovery step (no invented
+        // code, but no lost guidance either — this is exactly the forward-compat case).
         let frame = format!(
             "{}some_future_code{}a human explanation{}do this",
             forklift_core::error::REFUSAL_PREFIX,
@@ -392,7 +393,7 @@ mod tests {
         let error: ForkliftError = frame.into();
 
         assert_eq!(error.code.as_str(), "error"); // ErrorCode::Generic
-        assert_eq!(error.message, "a human explanation");
+        assert_eq!(error.message, "a human explanation do this");
         assert!(!error.message.contains('\u{1f}'), "the raw frame must never leak into the message");
     }
 

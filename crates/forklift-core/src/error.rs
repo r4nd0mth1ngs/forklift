@@ -41,10 +41,15 @@
 use std::fmt;
 
 /// The framing that marks a refusal string so a String-typed segment can carry it losslessly and
-/// the boundary can classify it without parsing prose. `\u{1f}` (ASCII Unit Separator) never
-/// appears in a message or a warehouse path, so the framing is unambiguous; a plain error simply
-/// degrades to [`CoreError::Other`]. This is the bridge-shim encoding described in the module docs
-/// — not a wire format and not something a head renders.
+/// the boundary can classify it without parsing prose. `\u{1f}` (ASCII Unit Separator) is not
+/// inherently absent from a message or a warehouse path — it is kept out: [`CoreError::refusal`]
+/// strips control characters (including `\u{1f}`) from the message and next step at construction,
+/// and `WarehousePath::from_user_input` rejects control characters in a user-supplied path at
+/// input validation. That sanitization is what keeps the framing unambiguous; a plain error that
+/// still happens to contain a stray `\u{1f}` (built by hand, bypassing those guards) simply fails
+/// to `strip_prefix` and degrades to [`CoreError::Other`] rather than misparsing. This is the
+/// bridge-shim encoding described in the module docs — not a wire format and not something a head
+/// renders.
 pub const REFUSAL_PREFIX: &str = "\u{1f}scope\u{1f}";
 
 /// The field separator inside a [`REFUSAL_PREFIX`] frame (also `\u{1f}`).
@@ -214,8 +219,11 @@ impl std::error::Error for CoreError {}
 /// A plain string is an unclassified error — unless it is a sentinel-framed refusal that a
 /// still-String segment carried across the migration frontier, in which case it is decoded back
 /// into the typed `Refusal` it was framed from (see the module docs). A frame whose code this
-/// build does not recognize (a newer peer's code) keeps its human message but loses the code —
-/// degrading to `Other` rather than leaking the raw `\u{1f}` frame or inventing a variant.
+/// build does not recognize (a newer peer's code) keeps its human message and recovery step but
+/// loses the machine code — degrading to `Other` rather than leaking the raw `\u{1f}` frame or
+/// inventing a variant. The next step is folded into the message (rather than dropped) because
+/// this is exactly the forward-compat case — a newer peer's refusal — where recovery guidance
+/// matters most and there is no typed field left to carry it in.
 impl From<String> for CoreError {
     fn from(message: String) -> CoreError {
         if let Some((code, human, next_step)) = deframe(&message) {
@@ -225,7 +233,7 @@ impl From<String> for CoreError {
                     message: human.to_string(),
                     next_step: next_step.to_string(),
                 },
-                None => CoreError::Other(human.to_string()),
+                None => CoreError::Other(with_next_step(human, next_step)),
             };
         }
 
@@ -251,6 +259,18 @@ impl From<CoreError> for String {
             }
             CoreError::Other(message) => message,
         }
+    }
+}
+
+/// Fold a would-be-dropped next step into the human message, for the degrade-to-`Other` paths
+/// that have no typed field left to carry it in. Next steps in this codebase read as complete
+/// sentences (e.g. "Move them out of the way (or load and stack them) first."), so a space is
+/// enough to join them naturally; an empty next step folds to no-op.
+fn with_next_step(human: &str, next_step: &str) -> String {
+    if next_step.is_empty() {
+        human.to_string()
+    } else {
+        format!("{} {}", human, next_step)
     }
 }
 
@@ -332,13 +352,14 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_framed_code_keeps_its_message_but_drops_the_code() {
+    fn an_unknown_framed_code_keeps_its_message_and_next_step_but_drops_the_code() {
         // A frame whose code this build does not know (a newer peer). It must not leak the raw
-        // frame; it degrades to Other with the human message (no invented variant, no code).
+        // frame; it degrades to Other, but the recovery guidance (next_step) survives folded into
+        // the message rather than being silently dropped (no invented variant, no code).
         let framed = frame("some_future_code", "a human explanation", "do this");
         let error: CoreError = framed.into();
 
-        assert_eq!(error, CoreError::Other("a human explanation".to_string()));
+        assert_eq!(error, CoreError::Other("a human explanation do this".to_string()));
         assert!(!error.to_string().contains('\u{1f}'));
     }
 
