@@ -1134,12 +1134,14 @@ pub fn verify_one_signature(parcel_hash: &str,
 /// * `Err(String)` - If a parcel, tree or blob is missing (or unreadable).
 pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result<(), String> {
     // The default checks read straight from the local object store; the serverless head passes an
-    // S3 HEAD for blob/chunk presence, a store-backed recipe read for the chunk descent, and a
-    // store-backed tree read for the base-tree prune (see `verify_parcel_closure_with`).
+    // S3 HEAD for blob presence, a bounded-concurrency batch of S3 HEADs for the chunk-presence
+    // seam, a store-backed recipe read for the chunk descent, and a store-backed tree read for the
+    // base-tree prune (see `verify_parcel_closure_with`).
     verify_parcel_closure_with(
         head,
         known_complete,
         &|hash| file_utils::does_object_exist(hash),
+        &local_chunks_missing,
         &|hash| object_utils::recipe_chunk_hashes(hash),
         &|hash| object_utils::load_tree(hash),
     )
@@ -1158,15 +1160,25 @@ pub fn verify_parcel_closure(head: &str, known_complete: Option<&str>) -> Result
 /// * `head`               - The head parcel whose closure is verified.
 /// * `known_complete`     - A head whose history is already known complete (`None` verifies
 ///                          all the way down).
-/// * `blob_exists`        - Returns whether a file-content blob (or a chunk) is present at a hash.
-/// * `load_recipe_chunks` - Returns the ordered chunk hashes of a recipe. The commit-gate descent
-///                          (§9.4b W4): a `*Chunked` file entry names a recipe whose chunks are
-///                          reachable only *through* it, so the closure walk loads the recipe and
-///                          presence-checks every chunk **non-tolerantly** — a ref must never
-///                          advance over a chunked file whose chunks never reached the store. The
-///                          local path reads the recipe from the object store; the AWS head reads
-///                          it from object storage (its recipes are not mirrored into the audit
-///                          scratch), which is why the read is a parameter, not a hard-coded load.
+/// * `blob_exists`        - Returns whether a file-content blob — or a recipe object, a chunked
+///                          file's tree-entry — is present at a hash. The plain, per-hash presence
+///                          seam, left untouched; the many-per-recipe chunk presence goes through
+///                          `chunks_missing` instead.
+/// * `chunks_missing`     - The bulk chunk-presence seam (§9.4b W4): given a recipe's full
+///                          chunk-hash list, returns the subset the store lacks. A `*Chunked` file
+///                          entry names a recipe whose chunks are reachable only *through* it, so
+///                          the closure walk hands the whole list here in one call and fails
+///                          **non-tolerantly** if any come back missing — a ref must never advance
+///                          over a chunked file whose chunks never reached the store. A local head
+///                          answers it with a serial filesystem scan; the AWS head answers it with a
+///                          bounded-concurrency batch of S3 `HEAD`s, so a changed multi-gigabyte
+///                          file's thousands of chunks verify in a second or two rather than one
+///                          slow round trip apiece under API Gateway's hard timeout.
+/// * `load_recipe_chunks` - Returns the ordered chunk hashes of a recipe (the list `chunks_missing`
+///                          probes). The local path reads the recipe from the object store; the AWS
+///                          head reads it from object storage (its recipes are not mirrored into the
+///                          audit scratch), which is why the read is a parameter, not a hard-coded
+///                          load.
 /// * `load_base_tree`     - Reads a tree object of the **prior head** (`known_complete`) for the
 ///                          subtree prune (§9.4b W1): a new parcel's subtree unchanged from the
 ///                          prior head is skipped whole. The prior head's subtrees are already-
@@ -1178,6 +1190,7 @@ pub fn verify_parcel_closure_with(
     head: &str,
     known_complete: Option<&str>,
     blob_exists: &dyn Fn(&str) -> Result<bool, String>,
+    chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
     load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
 ) -> Result<(), String> {
@@ -1209,7 +1222,7 @@ pub fn verify_parcel_closure_with(
 
         verify_tree_closure(
             &parcel.tree_hash, base_root.as_deref(), &mut visited_trees,
-            blob_exists, load_recipe_chunks, load_base_tree,
+            blob_exists, chunks_missing, load_recipe_chunks, load_base_tree,
             // The commit gate presence-checks; content re-verification is `audit --full` only.
             false,
         )?;
@@ -1258,10 +1271,13 @@ pub fn verify_parcel_closure_scoped(
         .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
     let blob_exists = |hash: &str| file_utils::does_object_exist(hash);
+    // The bulk chunk-presence seam: a local audit probes the same local store as everything else,
+    // serially (a presence check is a microsecond filesystem lookup); the AWS head overrides the
+    // *shape* with parallel S3 HEADs. An out-of-scope recipe is sealed, never loaded, so its chunks
+    // are never even named — the store invariant "recipe absent ⟹ chunks absent" holds.
+    let chunks_missing = |chunks: &[String]| local_chunks_missing(chunks);
     // A local audit reads its recipes from the same local store as everything else; the chunk
-    // descent presence-checks an in-scope chunked file's chunks (an out-of-scope recipe is sealed,
-    // never loaded, so its chunks are never even named — the store invariant "recipe absent ⟹
-    // chunks absent" holds).
+    // descent presence-checks an in-scope chunked file's chunks.
     let load_recipe_chunks = |hash: &str| object_utils::recipe_chunk_hashes(hash);
     // The base-tree prune (§9.4b W1) is a `known_complete`-only optimization; a sparse audit always
     // runs full (`known_complete: None`, no base), so this loader is threaded but never invoked.
@@ -1279,7 +1295,7 @@ pub fn verify_parcel_closure_scoped(
             .map_err(|e| format!("The history behind {} is incomplete: {}", head, e))?;
 
         verify_tree_closure_scoped(
-            &parcel.tree_hash, "", &mut verified, &mut spine_seen, &blob_exists,
+            &parcel.tree_hash, "", &mut verified, &mut spine_seen, &blob_exists, &chunks_missing,
             &load_recipe_chunks, &load_base_tree, scope, reverify,
         )?;
     }
@@ -1314,6 +1330,7 @@ fn verify_tree_closure_scoped(tree_hash: &str,
                               verified: &mut HashSet<String>,
                               spine_seen: &mut HashSet<String>,
                               blob_exists: &dyn Fn(&str) -> Result<bool, String>,
+                              chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
                               load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
                               load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
                               scope: &MaterializationScope,
@@ -1323,7 +1340,8 @@ fn verify_tree_closure_scoped(tree_hash: &str,
             // A sparse audit always runs full (no `known_complete`), so there is no base to prune
             // against — pass `None`, and the full closure of this in-scope subtree is walked.
             return verify_tree_closure(
-                tree_hash, None, verified, blob_exists, load_recipe_chunks, load_base_tree, reverify,
+                tree_hash, None, verified, blob_exists, chunks_missing, load_recipe_chunks,
+                load_base_tree, reverify,
             )
         }
         ScopeClass::OutOfScope => return Ok(()),
@@ -1356,7 +1374,7 @@ fn verify_tree_closure_scoped(tree_hash: &str,
         // descend it and verify its chunks at the audit's content level, exactly as the
         // fully-in-scope walk does.
         if file.item_type.is_chunked() {
-            verify_chunked_file(&file.hash, reverify, load_recipe_chunks, blob_exists)?;
+            verify_chunked_file(&file.hash, reverify, load_recipe_chunks, chunks_missing)?;
         }
     }
 
@@ -1366,8 +1384,8 @@ fn verify_tree_closure_scoped(tree_hash: &str,
             continue; // sealed by hash, never descended
         }
         verify_tree_closure_scoped(
-            &subtree.hash, &path, verified, spine_seen, blob_exists, load_recipe_chunks,
-            load_base_tree, scope, reverify,
+            &subtree.hash, &path, verified, spine_seen, blob_exists, chunks_missing,
+            load_recipe_chunks, load_base_tree, scope, reverify,
         )?;
     }
 
@@ -1436,6 +1454,7 @@ fn verify_tree_closure(tree_hash: &str,
                        base_tree_hash: Option<&str>,
                        visited_trees: &mut HashSet<String>,
                        blob_exists: &dyn Fn(&str) -> Result<bool, String>,
+                       chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
                        load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
                        load_base_tree: &dyn Fn(&str) -> Result<TreeItem, String>,
                        reverify: bool)
@@ -1497,14 +1516,14 @@ fn verify_tree_closure(tree_hash: &str,
         // ref move is a durability promise a fetch is not.) The prune above only reaches this for
         // a file the prior head does not already vouch for, so W4 is never weakened.
         if file.item_type.is_chunked() {
-            verify_chunked_file(&file.hash, reverify, load_recipe_chunks, blob_exists)?;
+            verify_chunked_file(&file.hash, reverify, load_recipe_chunks, chunks_missing)?;
         }
     }
 
     for (name, subtree) in tree.get_subtrees() {
         verify_tree_closure(
             &subtree.hash, base_subtrees.get(name).map(String::as_str), visited_trees,
-            blob_exists, load_recipe_chunks, load_base_tree, reverify,
+            blob_exists, chunks_missing, load_recipe_chunks, load_base_tree, reverify,
         )?;
     }
 
@@ -1528,51 +1547,103 @@ fn verify_tree_closure(tree_hash: &str,
 /// * `recipe_hash`        - The chunked file's tree-entry hash (a recipe).
 /// * `reverify`           - `true` re-reads and re-assembles; `false` presence-checks.
 /// * `load_recipe_chunks` - Reads the recipe's chunk hashes (used only by the presence path).
-/// * `blob_exists`        - Presence check for one chunk hash (used only by the presence path).
+/// * `chunks_missing`     - Bulk chunk-presence probe (used only by the presence path): given the
+///                          recipe's chunk-hash list, returns the subset the store lacks.
 fn verify_chunked_file(
     recipe_hash: &str,
     reverify: bool,
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
-    blob_exists: &dyn Fn(&str) -> Result<bool, String>,
+    chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
 ) -> Result<(), String> {
     if reverify {
         object_utils::assemble_chunked_file(recipe_hash, &mut std::io::sink())?;
         Ok(())
     } else {
-        verify_recipe_chunks_present(recipe_hash, load_recipe_chunks, blob_exists)
+        verify_recipe_chunks_present(recipe_hash, load_recipe_chunks, chunks_missing)
     }
 }
 
-/// Presence-check every chunk of a recipe non-tolerantly: load the recipe's chunk list (via the
-/// caller's store-appropriate reader) and fail if any chunk is absent. The recipe's own presence
-/// is the caller's responsibility (it is checked as an ordinary file-entry object before this).
+/// How many absent chunk hashes a closure-check failure names before summarizing the rest as
+/// "(and N more)". A maximal 64 MiB recipe lists ~987k chunks, so an all-missing failure must not
+/// build a megabyte-long message; a handful of names is enough for an operator to act on, and the
+/// count is always reported exactly regardless.
+const MAX_NAMED_MISSING_CHUNKS: usize = 32;
+
+/// The serial chunk-presence probe every non-AWS head uses. A chunk is present iff its object is on
+/// disk (or in a pack) — a microsecond lookup, so there is nothing to parallelize; it returns the
+/// absent subset, in the given order. The AWS serverless head overrides this *shape* with a
+/// bounded-concurrency batch of S3 `HEAD`s ([`crate`]-external: `ObjectStore::objects_missing`),
+/// where a probe is a network round trip and a large recipe lists thousands of chunks — the whole
+/// reason the seam is a bulk `&[hash] -> missing` call rather than a per-hash existence check.
+fn local_chunks_missing(chunks: &[String]) -> Result<Vec<String>, String> {
+    let mut missing = Vec::new();
+
+    for chunk in chunks {
+        if !file_utils::does_object_exist(chunk)? {
+            missing.push(chunk.clone());
+        }
+    }
+
+    Ok(missing)
+}
+
+/// Presence-check a recipe's chunks non-tolerantly, in **one bulk probe**: load the recipe's chunk
+/// list (via the caller's store-appropriate reader) and hand the whole list to `chunks_missing`,
+/// which returns the subset the store lacks. Any missing chunk fails the walk, naming the absent
+/// ones. The recipe's own presence is the caller's responsibility (it is checked as an ordinary
+/// file-entry object before this).
+///
+/// The bulk shape is the one seam each head fills differently, and the reason this is not a
+/// per-chunk existence loop. A local/self-host head answers it with a serial filesystem/pack scan
+/// (see [`local_chunks_missing`]); the AWS serverless head answers it with a bounded-concurrency
+/// batch of S3 `HEAD`s, so a changed large file's thousands of chunks are verified in a second or
+/// two rather than one slow round trip apiece behind API Gateway's hard timeout. The walk itself
+/// stays store-agnostic: it only ever hands over the full chunk list and asks which are absent.
 ///
 /// Called from every walk that reaches this recipe's tree entry, whether or not the recipe changed
-/// in the parcel being verified — see [`verify_tree_closure`]'s doc comment (W1) for the resulting
-/// per-push cost this implies for a large chunked file, and the pruning fix deliberately deferred.
+/// in the parcel being verified — the W1 subtree prune (see [`verify_tree_closure`]) is what keeps
+/// an *unchanged* large file from being probed at all; this bulk form is what keeps a *changed* one
+/// affordable.
 ///
 /// # Arguments
 /// * `recipe_hash`        - The recipe (a chunked file's tree-entry hash) whose chunks are checked.
 /// * `load_recipe_chunks` - Reads the recipe's ordered chunk hashes (local store, or object store).
-/// * `blob_exists`        - Presence check for one chunk hash.
+/// * `chunks_missing`     - Given a recipe's full chunk-hash list, returns the subset the store
+///                          lacks (in any order). Non-tolerant: a non-empty result fails the walk.
 fn verify_recipe_chunks_present(
     recipe_hash: &str,
     load_recipe_chunks: &dyn Fn(&str) -> Result<Vec<String>, String>,
-    blob_exists: &dyn Fn(&str) -> Result<bool, String>,
+    chunks_missing: &dyn Fn(&[String]) -> Result<Vec<String>, String>,
 ) -> Result<(), String> {
     let chunks = load_recipe_chunks(recipe_hash)
         .map_err(|e| format!("Recipe {} is missing or unreadable: {}", recipe_hash, e))?;
 
-    for chunk in &chunks {
-        if !blob_exists(chunk)? {
-            return Err(format!(
-                "Chunk {} of recipe {} is missing; the chunked file cannot be materialized.",
-                chunk, recipe_hash
-            ));
-        }
+    let mut missing = chunks_missing(&chunks)?;
+
+    if missing.is_empty() {
+        return Ok(());
     }
 
-    Ok(())
+    // Deterministic, bounded reporting. The bulk probe may return the absent chunks in any order
+    // (the AWS head's parallel `HEAD`s finish out of order), so sort and de-duplicate for a stable
+    // message, and name at most `MAX_NAMED_MISSING_CHUNKS` of them: an all-missing maximal recipe
+    // would otherwise build a message of ~987k hashes. The reported *count* is always exact.
+    missing.sort_unstable();
+    missing.dedup();
+
+    let shown: Vec<&str> =
+        missing.iter().take(MAX_NAMED_MISSING_CHUNKS).map(String::as_str).collect();
+    let overflow = missing.len() - shown.len();
+    let and_more = if overflow > 0 { format!(" (and {} more)", overflow) } else { String::new() };
+
+    Err(format!(
+        "Recipe {} is missing {} of its {} chunk(s): {}{}. The chunked file cannot be materialized.",
+        recipe_hash,
+        missing.len(),
+        chunks.len(),
+        shown.join(", "),
+        and_more,
+    ))
 }
 
 #[cfg(test)]
@@ -1961,5 +2032,65 @@ mod tests {
         for i in 2..MAX_MEMOIZED_OFFICE_CHAINS {
             assert!(memo.get(&format!("key-{i}")).is_some(), "key-{i} should not have been evicted");
         }
+    }
+
+    /// The bulk chunk-presence seam (§9.4b W4): passes when the store lacks nothing, and fails
+    /// **non-tolerantly** naming *every* absent chunk when it does — the semantics the AWS head's
+    /// parallel S3 probe and the local serial one must both honour. Driven through synthetic
+    /// closures with hundreds of chunks — far more than a content-driven test can afford to
+    /// materialize (a chunk is up to 4 MiB) — which is exactly the seam each head fills for real.
+    #[test]
+    fn the_bulk_chunk_check_names_every_missing_chunk_and_passes_when_all_present() {
+        let recipe = "f".repeat(64);
+        let chunks: Vec<String> = (0..500u32).map(|i| format!("{:064x}", i)).collect();
+
+        let load_recipe_chunks = |_: &str| -> Result<Vec<String>, String> { Ok(chunks.clone()) };
+
+        // Nothing missing: the bulk probe returns an empty set and the walk passes.
+        let none_missing = |_: &[String]| -> Result<Vec<String>, String> { Ok(Vec::new()) };
+        verify_recipe_chunks_present(&recipe, &load_recipe_chunks, &none_missing)
+            .expect("with no chunk missing the presence check passes");
+
+        // A handful missing, scattered through the list (including the last, which a walk that
+        // stopped at the first absent chunk would never report).
+        let victims = vec![chunks[3].clone(), chunks[128].clone(), chunks[499].clone()];
+        let probed = victims.clone();
+        let some_missing = move |asked: &[String]| -> Result<Vec<String>, String> {
+            // A store only ever names hashes it was actually asked about.
+            Ok(asked.iter().filter(|h| probed.contains(h)).cloned().collect())
+        };
+
+        let err = verify_recipe_chunks_present(&recipe, &load_recipe_chunks, &some_missing)
+            .expect_err("a missing chunk fails the closure check non-tolerantly");
+
+        assert!(err.contains("missing"), "{}", err);
+        for victim in &victims {
+            assert!(err.contains(victim), "every missing chunk is named: {}", err);
+        }
+        assert!(err.contains("missing 3 of its 500"), "the exact count is reported: {}", err);
+    }
+
+    /// A failure that would name more than [`MAX_NAMED_MISSING_CHUNKS`] chunks caps the named list
+    /// and summarizes the rest, so a pathological recipe (a maximal one lists ~987k chunks) cannot
+    /// balloon the error message — while the reported count stays exact.
+    #[test]
+    fn the_bulk_chunk_check_caps_the_named_list_but_reports_the_exact_count() {
+        let recipe = "e".repeat(64);
+        let total = 1000usize;
+        let chunks: Vec<String> = (0..total as u32).map(|i| format!("{:064x}", i)).collect();
+
+        let load_recipe_chunks = |_: &str| -> Result<Vec<String>, String> { Ok(chunks.clone()) };
+        let all_missing = |asked: &[String]| -> Result<Vec<String>, String> { Ok(asked.to_vec()) };
+
+        let err = verify_recipe_chunks_present(&recipe, &load_recipe_chunks, &all_missing)
+            .expect_err("every chunk missing must fail");
+
+        assert!(err.contains(&format!("missing {} of its {} chunk(s)", total, total)), "{}", err);
+        // Exactly `MAX_NAMED_MISSING_CHUNKS` are named, and the remainder is summarized.
+        assert!(
+            err.contains(&format!("(and {} more)", total - MAX_NAMED_MISSING_CHUNKS)),
+            "the overflow is summarized rather than dumped: {}",
+            err
+        );
     }
 }

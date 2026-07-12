@@ -314,3 +314,50 @@ impl RefStore for MemoryRefStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bulk presence probe (`objects_missing`, the default serial impl the fake inherits and the
+    /// commit-gate chunk descent leans on) must return exactly the absent subset of a hash list — the
+    /// same semantics the S3 backend's bounded-concurrency `HEAD` batch must match. Exercised with
+    /// hundreds of hashes and a scattered handful withheld, the scale a changed large file's chunk
+    /// list actually reaches (which no content-driven test can afford to materialize).
+    #[test]
+    fn objects_missing_returns_exactly_the_absent_subset_of_a_large_batch() {
+        let store = MemoryObjectStore::new();
+
+        // Hundreds of content-addressed objects; store all but a scattered few.
+        let mut all: Vec<String> = Vec::new();
+        let mut withheld: Vec<String> = Vec::new();
+
+        for i in 0..400u32 {
+            let bytes = format!("chunk-{i}").into_bytes();
+            let hash = object_utils::hash_object_bytes(&bytes);
+            all.push(hash.clone());
+
+            if i % 97 == 0 {
+                withheld.push(hash); // 0, 97, 194, 291, 388 — five absent
+            } else {
+                store.put_verified(&hash, &bytes).expect("store the object");
+            }
+        }
+
+        let mut missing = store.objects_missing(&all).expect("bulk probe");
+        missing.sort();
+        let mut expected = withheld.clone();
+        expected.sort();
+        assert_eq!(missing, expected, "objects_missing names exactly the withheld objects");
+
+        // A fully-present slice yields nothing missing.
+        let present: Vec<String> = all.iter().filter(|h| !withheld.contains(h)).cloned().collect();
+        assert!(
+            store.objects_missing(&present).expect("bulk probe").is_empty(),
+            "a fully-present list has no missing objects"
+        );
+
+        // An empty batch is trivially complete.
+        assert!(store.objects_missing(&[]).expect("bulk probe").is_empty());
+    }
+}

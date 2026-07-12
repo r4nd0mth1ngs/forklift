@@ -135,6 +135,28 @@ pub trait ObjectStore {
     /// the closure walk uses for the (large, many) working blobs it never reads.
     fn exists(&self, hash: &str) -> Result<bool, String>;
 
+    /// Which of `hashes` the store lacks — the bulk presence probe the commit-gate closure audit
+    /// hands a chunked file's whole chunk list to (`audit_utils`'s recipe descent). Returns the
+    /// absent subset in an unspecified order (a parallel backend finishes its probes out of order).
+    ///
+    /// The default answers it serially with [`exists`](ObjectStore::exists), which is right for a
+    /// store whose presence check is cheap — the in-memory fake, a filesystem mirror. The S3 backend
+    /// overrides it with a bounded-concurrency batch of `HEAD`s: there a probe is a network round
+    /// trip and a changed multi-gigabyte file lists thousands of chunks, so a serial walk of them
+    /// would blow API Gateway's hard 29-second integration timeout while a parallel one clears in a
+    /// second or two.
+    fn objects_missing(&self, hashes: &[String]) -> Result<Vec<String>, String> {
+        let mut missing = Vec::new();
+
+        for hash in hashes {
+            if !self.exists(hash)? {
+                missing.push(hash.clone());
+            }
+        }
+
+        Ok(missing)
+    }
+
     /// The uncompressed object bytes, or `None` if absent.
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String>;
 

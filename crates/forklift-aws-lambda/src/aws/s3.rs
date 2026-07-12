@@ -151,6 +151,16 @@ const MAX_STAGED_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// impose to a small constant rather than an unbounded retry loop.
 const MAX_PROMOTE_ATTEMPTS: u32 = 3;
 
+/// How many chunk-presence probes [`ObjectStore::objects_missing`] runs against S3 at once. Each is
+/// one `HeadObject` round trip; a changed large file lists thousands of chunks, and API Gateway caps
+/// the whole ref-update invocation at 29 seconds. 64 in flight keeps the batch well inside that
+/// budget for the realistic 1–2 GiB case (~1–2k chunks clear in ~1–2 s at typical in-region `HEAD`
+/// latency) while staying comfortably under the SDK's HTTP connection pool and S3's per-prefix
+/// request rate — so it neither starves throughput nor invites `503 SlowDown`. It is a concurrency
+/// *width*, not a spawn count: [`futures`]' `buffer_unordered` polls that many futures on the one
+/// blocking thread the head already runs on, which is why each probe may borrow `&self`.
+const MISSING_PROBE_CONCURRENCY: usize = 64;
+
 /// The canonical key of an object — the only prefix `exists`/`get`/`access` read, and the
 /// only prefix hash-verified writes target.
 fn object_key(hash: &str) -> String {
@@ -454,6 +464,29 @@ impl S3ObjectStore {
 impl ObjectStore for S3ObjectStore {
     fn exists(&self, hash: &str) -> Result<bool, String> {
         self.bridge.block_on(self.key_exists(&object_key(hash)))
+    }
+
+    /// The bulk presence probe, run as a bounded-concurrency batch of `HeadObject`s rather than the
+    /// default's serial loop — the whole point of the seam on this head. `buffer_unordered` drives
+    /// up to [`MISSING_PROBE_CONCURRENCY`] `HEAD`s at a time on the single blocking thread the head
+    /// runs on (no task is spawned, so each future borrows `&self` freely). A single `HEAD` failure
+    /// aborts the batch with that error; the absent hashes come back in completion order (which the
+    /// caller sorts before reporting).
+    fn objects_missing(&self, hashes: &[String]) -> Result<Vec<String>, String> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        self.bridge.block_on(async {
+            stream::iter(hashes.iter())
+                .map(|hash| async move {
+                    let present = self.key_exists(&object_key(hash)).await?;
+
+                    Ok::<Option<String>, String>((!present).then(|| hash.clone()))
+                })
+                .buffer_unordered(MISSING_PROBE_CONCURRENCY)
+                .try_filter_map(|absent| async move { Ok(absent) })
+                .try_collect()
+                .await
+        })
     }
 
     fn get(&self, hash: &str) -> Result<Option<Vec<u8>>, String> {
@@ -767,6 +800,21 @@ mod tests {
         assert!(STREAMING_THRESHOLD_BYTES < MAX_STAGED_OBJECT_BYTES);
         // The hard cap matches S3's own single-PUT maximum (documented in the module docs).
         assert_eq!(MAX_STAGED_OBJECT_BYTES, 5 * 1024 * 1024 * 1024);
+    }
+
+    /// The presence-probe concurrency stays a sane width — enough to clear a realistic large file's
+    /// chunk list well inside API Gateway's 29 s ceiling, not so wide it churns the connection pool
+    /// or invites S3 throttling. A wall-clock assertion is impossible here (no real S3), so this
+    /// pins the *width* the module docs justify; the probe's actual semantics — returns exactly the
+    /// absent subset, order-independent — are covered against the in-memory fake, which shares the
+    /// seam through the trait default.
+    #[allow(clippy::assertions_on_constants)]
+    #[test]
+    fn the_presence_probe_concurrency_is_a_sane_width() {
+        assert!(
+            (32..=128).contains(&MISSING_PROBE_CONCURRENCY),
+            "the presence-probe width must stay in the reviewed 32–128 band"
+        );
     }
 
     #[test]
