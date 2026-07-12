@@ -1183,9 +1183,11 @@ mod tests {
     fn an_old_version_bundle_imports_a_grandfathered_giant() {
         let _scratch = Scratch::new("import-grandfathered-giant");
 
-        // A real object one byte over the ceiling (zeros: cheap to hash and compress).
+        // A real object over the ceiling: the payload itself exceeds MAX_OBJECT_BYTES, so the
+        // object is over-ceiling regardless of how large the prepended object header is (zeros:
+        // cheap to hash and compress).
         let object = LooseObjectBuilder::build_blob(&Blob {
-            content: vec![0u8; object_utils::MAX_OBJECT_BYTES],
+            content: vec![0u8; object_utils::MAX_OBJECT_BYTES + 1],
         });
         let raw = object.content.clone();
         assert!(raw.len() > object_utils::MAX_OBJECT_BYTES, "the object must exceed the ceiling");

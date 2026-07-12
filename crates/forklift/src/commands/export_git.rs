@@ -214,12 +214,21 @@ impl<'a> Exporter<'a> {
             return Ok(hash.clone());
         }
 
+        // A per-process atomic counter, not just the pid, is part of the temp name: two calls to
+        // `convert_chunked_blob` in the same process (even sequentially, since the previous temp
+        // is removed before this one is created) must never share a name, and this matches the
+        // naming convention `object_utils`/`file_utils` use for their own temp files.
+        static TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let write_id = TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let temp_path = std::env::temp_dir().join(format!(
-            "forklift-export-{}-{}.tmp", std::process::id(), recipe_hash
+            "forklift-export-{}-{}-{}.tmp", std::process::id(), write_id, recipe_hash
         ));
 
         let assemble = || -> Result<(), String> {
-            let file = std::fs::File::create(&temp_path)
+            // `create_new` refuses to open an existing path (including a planted symlink) rather
+            // than following/truncating it — a shared, world-writable /tmp is not a safe place to
+            // open-by-name-and-truncate.
+            let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&temp_path)
                 .map_err(|e| format!("Error while creating a temp file for git export: {}", e))?;
             let mut writer = std::io::BufWriter::new(file);
             object_utils::assemble_chunked_file(recipe_hash, &mut writer)?;

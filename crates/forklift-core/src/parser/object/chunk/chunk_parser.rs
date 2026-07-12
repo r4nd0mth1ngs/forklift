@@ -15,7 +15,9 @@ use crate::util::chunk_utils::MAX_CHUNK_BYTES;
 /// * `Ok(Chunk)`   - The parsed chunk object.
 /// * `Err(String)` - If the chunk's payload exceeds the per-chunk ceiling.
 pub fn parse_chunk(offset: usize, content: &[u8]) -> Result<Chunk, String> {
-    let payload = &content[offset..];
+    let payload = content.get(offset..).ok_or_else(|| format!(
+        "Chunk object is truncated: the header ends past the object's {} bytes.", content.len()
+    ))?;
 
     if payload.len() > MAX_CHUNK_BYTES {
         return Err(format!(
@@ -25,4 +27,21 @@ pub fn parse_chunk(offset: usize, content: &[u8]) -> Result<Chunk, String> {
     }
 
     Ok(Chunk { content: payload.to_vec() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An `offset` past the end of `content` must be refused with an `Err`, not panic (the
+    /// parser sits on an untrusted-input boundary).
+    #[test]
+    fn an_offset_past_the_end_is_refused_not_a_panic() {
+        let content = vec![1u8, 2, 3];
+        let error = match parse_chunk(content.len() + 1, &content) {
+            Err(e) => e,
+            Ok(_) => panic!("an offset past the end must be refused"),
+        };
+        assert!(error.contains("truncated"), "unexpected error: {}", error);
+    }
 }
