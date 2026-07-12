@@ -67,7 +67,10 @@ pub enum ObjectWriteResult {
 pub enum BatchResult {
     /// The bundle-format stream (the head serves it itself).
     Bundle(Vec<u8>),
-    /// Follow this presigned URL for the bundle (`307`).
+    /// Follow this presigned URL for the bundle. The router answers `303` (not `307`/`308`):
+    /// this request was a `POST`, but the target is always a presigned `GET`, so the client
+    /// must switch methods rather than replay the `POST` — which would fail signature
+    /// verification against a `GET`-only presigned URL.
     Redirect(String),
 }
 
@@ -516,8 +519,9 @@ impl<O: ObjectStore, R: RefStore> Head<O, R> {
     ///
     /// The bundle is the one *response* that has no small bound — it is as large as the
     /// objects asked for — so a store that can offload it hands back a presigned `GET`
-    /// (`307`) rather than squeezing megabytes back through the control plane. Same
-    /// medicine as the upload path, in the other direction.
+    /// rather than squeezing megabytes back through the control plane. Same medicine as the
+    /// upload path, in the other direction — except the router answers `303`, not `307`, since
+    /// this request is a `POST` and the presigned target only ever accepts `GET`.
     pub fn batch(&self, hashes: &[String]) -> HeadResult<BatchResult> {
         self.reject_oversized_batch(hashes.len())?;
 
