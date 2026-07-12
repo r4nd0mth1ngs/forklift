@@ -14,6 +14,14 @@ bodies are raw bytes (`application/octet-stream`). Every endpoint lives under a 
 prefix: `/v1/…`. Errors use conventional status codes with a JSON body
 `{"error": "<human-readable message>"}`.
 
+**Classified refusals** (the error taxonomy in `MACHINE_INTERFACE.md`) add two **optional**
+fields to that body: `code` — the stable refusal code string — and `next_step` — its
+machine-actionable recovery step. When a server-side operation fails with a classified refusal,
+the head sets them so a client classifies it with the same code and exit code as a local refusal;
+`error` is the human message. Both are **additive**: an older head omits them, and a client that
+does not understand them ignores them (a plain error simply has no `code`). Example:
+`{"error":"…","code":"out_of_scope","next_step":"…"}`.
+
 **Base URLs and multi-warehouse serving.** The `/v1/…` paths hang off whatever base
 URL the client was configured with (`remote.url`); the base may carry a path prefix
 that names the warehouse, and clients treat it as opaque. The server head serves a

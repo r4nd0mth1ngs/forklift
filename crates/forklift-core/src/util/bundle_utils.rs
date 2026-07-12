@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use crate::error::CoreError;
 use crate::globals::forklift_root;
 use crate::util::{audit_utils, delta_utils, file_utils, object_utils, pallet_utils, scope_utils, sign_utils};
 
@@ -249,7 +250,9 @@ fn write_tree_closure<W: Write>(encoder: &mut zstd::stream::Encoder<'_, W>,
         // bundle, then the chunks loose), never inside a bundle. Refuse loudly rather than ship one
         // silently incomplete.
         if file.item_type.is_chunked() {
-            return Err(scope_utils::chunked_transport_refusal(&path));
+            // This walker stays `Result<_, String>` (the migration frontier); reframe the typed
+            // refusal via the bridge shim so its code survives to the command boundary.
+            return Err(scope_utils::chunked_transport_refusal(&path).into());
         }
 
         emit_blob(encoder, &file.hash, &path, emitted_depth, latest_blob_at_path, stats)?;
@@ -330,7 +333,7 @@ fn emit_blob<W: Write>(encoder: &mut zstd::stream::Encoder<'_, W>,
 /// far end after streaming it). Checked here, right after an object's bytes are loaded and before
 /// a single byte is written into the bundle stream — so a warehouse holding one anywhere in the
 /// closure fails loudly at the source, before writing anything a consumer could partially import.
-fn refuse_if_transporting_over_ceiling(what: &str, len: usize) -> Result<(), String> {
+fn refuse_if_transporting_over_ceiling(what: &str, len: usize) -> Result<(), CoreError> {
     scope_utils::refuse_if_over_object_ceiling(what, len)
 }
 

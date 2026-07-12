@@ -26,6 +26,7 @@
 
 use std::path::{Path, PathBuf};
 use crate::globals::{self, bay_root};
+use crate::error::{CoreError, RefusalCode};
 
 /// The bay-local file that records a bay's materialization scope (under `<bay_root>/`).
 const FILE_NAME_BAY_SCOPE: &str = "scope";
@@ -35,37 +36,33 @@ const FILE_NAME_BAY_SCOPE: &str = "scope";
 const FOLDER_NAME_CONFIG: &str = "config";
 const FILE_NAME_FETCH_SCOPE: &str = "fetch-scope";
 
-/// The stable machine-branchable error codes this feature contributes to the §7.4 error
-/// taxonomy (add, never repurpose). A scope refusal is carried from `forklift-core` (which
-/// never prints and cannot build the CLI's `ForkliftError`) to the CLI as a sentinel-framed
-/// string; the CLI decodes it into a classified error + exit code. See [`refusal`].
-pub const CODE_OUT_OF_SCOPE: &str = "out_of_scope";
-pub const CODE_OUT_OF_SCOPE_CONFLICT: &str = "out_of_scope_conflict";
-pub const CODE_SCOPE_PATH_TYPE_CHANGED: &str = "scope_path_type_changed";
-pub const CODE_SPARSE_WORKSPACE: &str = "sparse_workspace";
-pub const CODE_NON_ORIGIN_LIFT: &str = "non_origin_lift";
-pub const CODE_NARROW_UNCLEAN: &str = "narrow_unclean";
-pub const CODE_SCOPE_PRUNE_BLOCKED: &str = "scope_prune_blocked";
+/// The stable machine-branchable refusal codes this feature contributes to the §7.4 error
+/// taxonomy, as their code strings — kept as re-exports of the typed [`RefusalCode`] (the source
+/// of truth lives in [`crate::error`]) so existing references keep resolving. A scope refusal is a
+/// typed [`CoreError::Refusal`] the head classifies by [`RefusalCode`]; see [`refusal`].
+pub const CODE_OUT_OF_SCOPE: &str = RefusalCode::OutOfScope.as_str();
+pub const CODE_OUT_OF_SCOPE_CONFLICT: &str = RefusalCode::OutOfScopeConflict.as_str();
+pub const CODE_SCOPE_PATH_TYPE_CHANGED: &str = RefusalCode::ScopePathTypeChanged.as_str();
+pub const CODE_SPARSE_WORKSPACE: &str = RefusalCode::SparseWorkspace.as_str();
+pub const CODE_NON_ORIGIN_LIFT: &str = RefusalCode::NonOriginLift.as_str();
+pub const CODE_NARROW_UNCLEAN: &str = RefusalCode::NarrowUnclean.as_str();
+pub const CODE_SCOPE_PRUNE_BLOCKED: &str = RefusalCode::ScopePruneBlocked.as_str();
 
-/// Not a scope/sparse-workspace code — large-file chunk transport (§9.4b) has no home of its
-/// own for a `forklift-core` → CLI classified refusal, and this module's sentinel-framing
-/// ([`refusal`]/[`decode_refusal`]) is the only such facility in the codebase (the same
-/// piggy-backing precedent `CODE_NON_ORIGIN_LIFT` already set). Reused here rather than
-/// duplicated.
-pub const CODE_CHUNKED_TRANSPORT_UNSUPPORTED: &str = "chunked_transport_unsupported";
+/// Large-file chunk transport (§9.4b): a chunked file cannot ride a bundle, and lifting one to a
+/// remote that does not advertise chunking support would let its `gc` collect the chunks. Its own
+/// refusal code, re-exported from the typed [`RefusalCode`].
+pub const CODE_CHUNKED_TRANSPORT_UNSUPPORTED: &str = RefusalCode::ChunkedTransportUnsupported.as_str();
 
-/// Not a scope/sparse-workspace code either — same piggy-backing precedent as
-/// `CODE_CHUNKED_TRANSPORT_UNSUPPORTED` above. A **grandfathered** object above the whole-object
-/// ceiling (authored, or imported via an old-version bundle, before the ceiling existed) is
-/// readable and checkout-able locally forever — the ceiling gates writes and imports only — but
-/// nothing accepts it on the wire, and there is no migration that would preserve its signed
-/// identity (a blob's hash is pinned inside a signed tree; re-chunking it would mint a different
-/// hash and so a different, unsigned tree). Refusing client-side, before anything is written into
-/// a bundle or sent over a lift, is the honest failure at the source.
-pub const CODE_OVERSIZED_TRANSPORT_UNSUPPORTED: &str = "oversized_transport_unsupported";
+/// A **grandfathered** object above the whole-object ceiling (authored, or imported via an
+/// old-version bundle, before the ceiling existed) is readable and checkout-able locally forever —
+/// the ceiling gates writes and imports only — but nothing accepts it on the wire, and there is no
+/// migration that would preserve its signed identity (a blob's hash is pinned inside a signed
+/// tree; re-chunking it would mint a different hash and so a different, unsigned tree). Refusing
+/// client-side, before anything is written into a bundle or sent over a lift, is the honest
+/// failure at the source. Re-exported from the typed [`RefusalCode`].
+pub const CODE_OVERSIZED_TRANSPORT_UNSUPPORTED: &str = RefusalCode::OversizedTransportUnsupported.as_str();
 
-/// Not a scope/sparse-workspace code either — same piggy-backing precedent as the two codes
-/// above. A lift whose commit needs more than one paginated batch (§9.4b Stage 3, W3) — more than
+/// A lift whose commit needs more than one paginated batch (§9.4b Stage 3, W3) — more than
 /// `MAX_MISSING_BATCH` distinct staged objects — requires a remote that understands the additive
 /// `more` field, which shipped *with* chunking support, not before it: a pre-chunking staging head
 /// has no such field and ignores an unrecognized one (`#[serde(default)]` reads it as `false`), so
@@ -73,15 +70,14 @@ pub const CODE_OVERSIZED_TRANSPORT_UNSUPPORTED: &str = "oversized_transport_unsu
 /// batch still needed staged. This is not specific to any chunked file — a plain lift touching
 /// enough distinct small tracked files hits the identical cap — so the check (and this code) is
 /// keyed on the staged object count alone, checked right after negotiation and before a single
-/// byte is uploaded (a naive commit-time check would waste the whole upload first).
-pub const CODE_COMMIT_PAGINATION_UNSUPPORTED: &str = "commit_pagination_unsupported";
+/// byte is uploaded (a naive commit-time check would waste the whole upload first). Re-exported
+/// from the typed [`RefusalCode`].
+pub const CODE_COMMIT_PAGINATION_UNSUPPORTED: &str = RefusalCode::CommitPaginationUnsupported.as_str();
 
-/// The framing that marks a scope refusal string so the CLI can classify it without
-/// parsing prose. `\u{1f}` (ASCII Unit Separator) never appears in a message or a
-/// warehouse path, so the framing is unambiguous; a plain error the CLI does not recognize
-/// simply degrades to the generic classification.
-pub const REFUSAL_PREFIX: &str = "\u{1f}scope\u{1f}";
-pub const REFUSAL_FIELD_SEPARATOR: char = '\u{1f}';
+/// The bridge-shim framing that lets a still-`Result<_, String>` segment carry a refusal across
+/// the migration frontier — re-exported from [`crate::error`], which owns the encoding now. See
+/// the [`crate::error`] module docs.
+pub use crate::error::{REFUSAL_PREFIX, REFUSAL_FIELD_SEPARATOR};
 
 /// Where a user-pallet content path sits relative to the materialization scope (design
 /// §3.1). Every scope-aware walk branches on the three cases, never on a single predicate.
@@ -359,62 +355,34 @@ pub fn is_warehouse_sparse() -> Result<bool, String> {
     Ok(!read_fetch_scope()?.is_full())
 }
 
-/// Build a classified scope-refusal string (design §7.4 taxonomy). It carries the stable
-/// `code`, the human `message` and a machine-actionable `next_step`, framed so the CLI can
-/// decode it into a `ForkliftError` with the matching exit code. `forklift-core` never
-/// prints and cannot depend on the CLI's error type, so this string is the seam.
+/// Build a classified scope refusal (design §7.4 taxonomy) as a typed [`CoreError::Refusal`]: the
+/// stable [`RefusalCode`], the human `message` and a machine-actionable `next_step`. The head
+/// classifies it into its exit code by the code — no string parsing. `forklift-core` never prints
+/// and cannot depend on the head's error type, so this typed value is the seam. See
+/// [`crate::error`] for how it crosses a still-String segment.
 ///
 /// # Arguments
-/// * `code`      - One of the `CODE_*` constants in this module.
+/// * `code`      - The stable [`RefusalCode`].
 /// * `message`   - The human explanation.
 /// * `next_step` - The machine-actionable recovery step.
-pub fn refusal(code: &str, message: impl Into<String>, next_step: impl Into<String>) -> String {
-    format!(
-        "{}{}{}{}{}{}",
-        REFUSAL_PREFIX,
-        code,
-        REFUSAL_FIELD_SEPARATOR,
-        sanitize_for_framing(&message.into()),
-        REFUSAL_FIELD_SEPARATOR,
-        sanitize_for_framing(&next_step.into())
-    )
+pub fn refusal(code: RefusalCode, message: impl Into<String>, next_step: impl Into<String>) -> CoreError {
+    CoreError::refusal(code, message, next_step)
 }
 
-/// Strip ASCII control characters (including `\u{1f}`, the field separator) out of text
-/// before it is interpolated into a refusal frame. `message`/`next_step` are built by
-/// formatting in caller-supplied text — often a path — and `WarehousePath::from_user_input`'s
-/// control-character guard only covers paths a person typed; a path read back off disk (a
-/// tree or inventory entry) never passes through that constructor and can carry `\u{1f}`
-/// itself. Sanitizing here, at the one place every refusal is framed, keeps the frame
-/// decodable regardless of where the text originated, rather than relying on every call site
-/// to have scrubbed its input first.
-fn sanitize_for_framing(text: &str) -> String {
-    text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
-}
-
-/// Decode a scope-refusal string built by [`refusal`] into `(code, message, next_step)`.
-/// Returns `None` for any string that is not a scope refusal (which the caller classifies
-/// generically). Used by the CLI's error boundary.
-pub fn decode_refusal(message: &str) -> Option<(&str, &str, &str)> {
-    let rest = message.strip_prefix(REFUSAL_PREFIX)?;
-    let mut parts = rest.splitn(3, REFUSAL_FIELD_SEPARATOR);
-
-    let code = parts.next()?;
-    let human = parts.next()?;
-    let next_step = parts.next()?;
-
-    Some((code, human, next_step))
-}
+/// Decode a sentinel-framed refusal string into `(code, message, next_step)`. Re-exported from
+/// [`crate::error`], which owns the framing now; retained here for the call sites (the wire's
+/// `error_of`, existing tests) that reference the scope path.
+pub use crate::error::deframe as decode_refusal;
 
 /// A ready-made `scope_path_type_changed` refusal for a spine path whose entry flipped
 /// between a directory and a file at the target revision (design §3.1). The spine's whole
 /// job is to carry the hash forward assuming the path is still a directory; a type flip
 /// breaks that assumption in a way a sparse workspace cannot safely reason about.
-pub fn type_changed_refusal(path: &str) -> String {
+pub fn type_changed_refusal(path: &str) -> CoreError {
     let next_step = "Re-scope the bay (or widen it to include the path), or resolve in a full workspace.";
 
     refusal(
-        CODE_SCOPE_PATH_TYPE_CHANGED,
+        RefusalCode::ScopePathTypeChanged,
         format!(
             "The path \"{}\" is no longer a directory (or is now one) at this revision; the \
             sparse scope is no longer valid there. {}",
@@ -425,11 +393,11 @@ pub fn type_changed_refusal(path: &str) -> String {
 }
 
 /// A ready-made `out_of_scope` refusal for a path argument outside the bay's scope.
-pub fn out_of_scope_refusal(path: &str) -> String {
+pub fn out_of_scope_refusal(path: &str) -> CoreError {
     let next_step = "Widen the bay's scope to include the path, or run the command in a full workspace.";
 
     refusal(
-        CODE_OUT_OF_SCOPE,
+        RefusalCode::OutOfScope,
         format!("The path \"{}\" is outside this bay's materialization scope. {}", path, next_step),
         next_step,
     )
@@ -440,11 +408,11 @@ pub fn out_of_scope_refusal(path: &str) -> String {
 /// merge base. A one-sided out-of-scope change is resolved by hash without the
 /// content; a genuine two-sided conflict cannot be — the bay has no content to reconcile — so
 /// it refuses rather than guess.
-pub fn out_of_scope_conflict_refusal(path: &str) -> String {
+pub fn out_of_scope_conflict_refusal(path: &str) -> CoreError {
     let next_step = "Widen the bay's scope to include the path and retry, or resolve the merge in a full workspace.";
 
     refusal(
-        CODE_OUT_OF_SCOPE_CONFLICT,
+        RefusalCode::OutOfScopeConflict,
         format!(
             "The path \"{}\" changed on both sides outside this bay's materialization scope; a \
             scoped bay cannot merge it without the content. {}",
@@ -456,9 +424,9 @@ pub fn out_of_scope_conflict_refusal(path: &str) -> String {
 
 /// A ready-made `sparse_workspace` refusal for a whole-tree verb that does not yet support
 /// running in a scoped bay.
-pub fn sparse_workspace_refusal(verb: &str, next_step: &str) -> String {
+pub fn sparse_workspace_refusal(verb: &str, next_step: &str) -> CoreError {
     refusal(
-        CODE_SPARSE_WORKSPACE,
+        RefusalCode::SparseWorkspace,
         format!("\"{}\" is not supported in a scoped (sparse) bay yet. {}", verb, next_step),
         next_step,
     )
@@ -475,7 +443,7 @@ pub fn sparse_workspace_refusal(verb: &str, next_step: &str) -> String {
 /// # Arguments
 /// * `path`      - The subtree that was asked to be narrowed away.
 /// * `blocked_by` - What kind of uncommitted work is blocking it (for the message).
-pub fn narrow_unclean_refusal(path: &str, blocked_by: &str) -> String {
+pub fn narrow_unclean_refusal(path: &str, blocked_by: &str) -> CoreError {
     let next_step = format!(
         "Stack or restore the changes under \"{}\" (or move untracked files out of the way), \
         then narrow again.",
@@ -483,7 +451,7 @@ pub fn narrow_unclean_refusal(path: &str, blocked_by: &str) -> String {
     );
 
     refusal(
-        CODE_NARROW_UNCLEAN,
+        RefusalCode::NarrowUnclean,
         format!(
             "\"{}\" has {} that narrow would otherwise delete; narrow refuses to discard \
             uncommitted work. {}",
@@ -502,14 +470,14 @@ pub fn narrow_unclean_refusal(path: &str, blocked_by: &str) -> String {
 /// # Arguments
 /// * `path`      - The path the prune was asked to free.
 /// * `blockers`  - The checkout(s) still materializing it (for the message).
-pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> String {
+pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> CoreError {
     let next_step = format!(
         "Narrow {} off \"{}\" first (that is bay-local and frees nothing), then prune.",
         blockers, path
     );
 
     refusal(
-        CODE_SCOPE_PRUNE_BLOCKED,
+        RefusalCode::ScopePruneBlocked,
         format!(
             "\"{}\" is still materialized by {}; pruning it would break that checkout. {}",
             path, blockers, next_step
@@ -527,14 +495,14 @@ pub fn scope_prune_blocked_refusal(path: &str, blockers: &str) -> String {
 /// # Arguments
 /// * `origin` - The remote this warehouse was fetched (scoped) against.
 /// * `other`  - The currently configured remote it is trying to lift to.
-pub fn non_origin_lift_refusal(origin: &str, other: &str) -> String {
+pub fn non_origin_lift_refusal(origin: &str, other: &str) -> CoreError {
     let next_step = format!(
         "Point \"remote.url\" back at \"{}\", or run a full (unscoped) franchise against \"{}\".",
         origin, other
     );
 
     refusal(
-        CODE_NON_ORIGIN_LIFT,
+        RefusalCode::NonOriginLift,
         format!(
             "This is a sparse workspace, fetched against \"{}\"; lifting to \"{}\" may fail \
             because that remote may lack out-of-scope objects this workspace never verified \
@@ -557,12 +525,12 @@ pub fn non_origin_lift_refusal(origin: &str, other: &str) -> String {
 ///
 /// # Arguments
 /// * `path` - The warehouse path of the chunked file that blocked the bundle.
-pub fn chunked_transport_refusal(path: &str) -> String {
+pub fn chunked_transport_refusal(path: &str) -> CoreError {
     let next_step = "Move this warehouse's history to the peer over the wire (lower/franchise/lift \
         to a chunk-aware remote), which carries chunked files per object; a bundle cannot.".to_string();
 
     refusal(
-        CODE_CHUNKED_TRANSPORT_UNSUPPORTED,
+        RefusalCode::ChunkedTransportUnsupported,
         format!(
             "\"{}\" is a large file stored in chunks, and a bundle never carries a chunked file's \
             chunks. {}",
@@ -583,12 +551,12 @@ pub fn chunked_transport_refusal(path: &str) -> String {
 ///
 /// # Arguments
 /// * `path` - The warehouse path of the chunked file that blocked the lift.
-pub fn chunked_remote_refusal(path: &str) -> String {
+pub fn chunked_remote_refusal(path: &str) -> CoreError {
     let next_step = "Upgrade the remote to a version that supports chunked large files, or keep \
         this file under the chunking threshold.".to_string();
 
     refusal(
-        CODE_CHUNKED_TRANSPORT_UNSUPPORTED,
+        RefusalCode::ChunkedTransportUnsupported,
         format!(
             "\"{}\" is a large file stored in chunks, and this remote does not support chunked \
             large files. {}",
@@ -607,11 +575,11 @@ pub fn chunked_remote_refusal(path: &str) -> String {
 ///
 /// # Arguments
 /// * `staged_count` - How many distinct objects `upload-targets` staged for this lift.
-pub fn commit_pagination_unsupported_refusal(staged_count: usize) -> String {
+pub fn commit_pagination_unsupported_refusal(staged_count: usize) -> CoreError {
     let next_step = "Upgrade the remote to a version that supports paginated commits.".to_string();
 
     refusal(
-        CODE_COMMIT_PAGINATION_UNSUPPORTED,
+        RefusalCode::CommitPaginationUnsupported,
         format!(
             "This lift needs to stage {} objects, above the {}-object cap a single commit batch \
             supports, and this remote does not advertise support for paginated commits. {}",
@@ -634,13 +602,13 @@ pub fn commit_pagination_unsupported_refusal(staged_count: usize) -> String {
 /// # Arguments
 /// * `what` - What is being refused (a path, a hash, or both — whatever the caller has in hand).
 /// * `len`  - The object's actual byte length.
-pub fn oversized_transport_refusal(what: &str, len: u64) -> String {
+pub fn oversized_transport_refusal(what: &str, len: u64) -> CoreError {
     let next_step = "This object predates the whole-object size limit. It stays readable and \
         checkout-able locally, but no migration exists that would preserve its signed identity, \
         so it cannot be sent to a remote or into a bundle.".to_string();
 
     refusal(
-        CODE_OVERSIZED_TRANSPORT_UNSUPPORTED,
+        RefusalCode::OversizedTransportUnsupported,
         format!(
             "{} is {} bytes, above the {}-byte whole-object ceiling. {}",
             what, len, crate::util::object_utils::MAX_OBJECT_BYTES, next_step
@@ -658,9 +626,9 @@ pub fn oversized_transport_refusal(what: &str, len: u64) -> String {
 /// * `len`  - The object's actual byte length.
 ///
 /// # Returns
-/// * `Ok(())`      - If `len` is within the ceiling.
-/// * `Err(String)` - The `oversized_transport_unsupported` refusal, otherwise.
-pub fn refuse_if_over_object_ceiling(what: &str, len: usize) -> Result<(), String> {
+/// * `Ok(())`         - If `len` is within the ceiling.
+/// * `Err(CoreError)` - The `oversized_transport_unsupported` refusal, otherwise.
+pub fn refuse_if_over_object_ceiling(what: &str, len: usize) -> Result<(), CoreError> {
     if len <= crate::util::object_utils::MAX_OBJECT_BYTES {
         return Ok(());
     }
@@ -757,25 +725,35 @@ mod tests {
         assert!(MaterializationScope::full().subset_of(&MaterializationScope::full()));
     }
 
-    #[test]
-    fn refusal_round_trips_through_its_framing() {
-        let refusal = refusal(CODE_OUT_OF_SCOPE, "message here", "do this next");
-        let (code, message, next_step) = decode_refusal(&refusal).unwrap();
+    /// Destructure a refusal into `(code, message, next_step)` for the assertions below — the
+    /// constructors now return a typed [`CoreError::Refusal`], so tests read the fields directly
+    /// instead of decoding a string.
+    fn parts(error: &CoreError) -> (RefusalCode, &str, &str) {
+        match error {
+            CoreError::Refusal { code, message, next_step } => (*code, message, next_step),
+            CoreError::Other(other) => panic!("expected a refusal, got Other({:?})", other),
+        }
+    }
 
-        assert_eq!(code, CODE_OUT_OF_SCOPE);
+    #[test]
+    fn refusal_carries_its_typed_code_and_text() {
+        let refusal = refusal(RefusalCode::OutOfScope, "message here", "do this next");
+        let (code, message, next_step) = parts(&refusal);
+
+        assert_eq!(code, RefusalCode::OutOfScope);
         assert_eq!(message, "message here");
         assert_eq!(next_step, "do this next");
 
-        // A plain error is not a scope refusal.
-        assert!(decode_refusal("something ordinary went wrong").is_none());
+        // A plain error is not a refusal.
+        assert_eq!(CoreError::from("something ordinary went wrong"), CoreError::Other("something ordinary went wrong".to_string()));
     }
 
     #[test]
     fn a_narrow_unclean_refusal_carries_the_stable_code_and_names_the_path() {
         let refusal = narrow_unclean_refusal("docs", "untracked file(s) (docs/draft.md)");
-        let (code, message, next_step) = decode_refusal(&refusal).unwrap();
+        let (code, message, next_step) = parts(&refusal);
 
-        assert_eq!(code, CODE_NARROW_UNCLEAN);
+        assert_eq!(code, RefusalCode::NarrowUnclean);
         assert!(message.contains("docs"), "the path is named: {}", message);
         assert!(message.contains("untracked file(s)"), "the blocker is named: {}", message);
         assert!(next_step.contains("docs"), "the recovery names the path: {}", next_step);
@@ -784,9 +762,9 @@ mod tests {
     #[test]
     fn a_non_origin_lift_refusal_carries_the_stable_code_and_names_both_remotes() {
         let refusal = non_origin_lift_refusal("http://origin.example", "http://other.example");
-        let (code, message, next_step) = decode_refusal(&refusal).unwrap();
+        let (code, message, next_step) = parts(&refusal);
 
-        assert_eq!(code, CODE_NON_ORIGIN_LIFT);
+        assert_eq!(code, RefusalCode::NonOriginLift);
         assert!(message.contains("http://origin.example"), "the origin is named: {}", message);
         assert!(message.contains("http://other.example"), "the target is named: {}", message);
         assert!(next_step.contains("http://origin.example"), "the recovery names the origin: {}", next_step);
@@ -795,9 +773,9 @@ mod tests {
     #[test]
     fn a_chunked_transport_refusal_carries_the_stable_code_and_names_the_path() {
         let refusal = chunked_transport_refusal("big.bin");
-        let (code, message, next_step) = decode_refusal(&refusal).unwrap();
+        let (code, message, next_step) = parts(&refusal);
 
-        assert_eq!(code, CODE_CHUNKED_TRANSPORT_UNSUPPORTED);
+        assert_eq!(code, RefusalCode::ChunkedTransportUnsupported);
         assert!(message.contains("big.bin"), "the path is named: {}", message);
         assert!(message.contains("chunks"), "the message explains why: {}", message);
         assert!(!next_step.is_empty());
@@ -808,9 +786,9 @@ mod tests {
         let refusal = oversized_transport_refusal(
             "\"big.bin\" (object aaaa)", crate::util::object_utils::MAX_OBJECT_BYTES as u64 + 1
         );
-        let (code, message, next_step) = decode_refusal(&refusal).unwrap();
+        let (code, message, next_step) = parts(&refusal);
 
-        assert_eq!(code, CODE_OVERSIZED_TRANSPORT_UNSUPPORTED);
+        assert_eq!(code, RefusalCode::OversizedTransportUnsupported);
         assert!(message.contains("big.bin"), "what is named: {}", message);
         assert!(message.contains("ceiling"), "the message explains why: {}", message);
         assert!(next_step.contains("signed identity"), "the recovery states no migration exists: {}", next_step);
@@ -828,22 +806,21 @@ mod tests {
             "object x", crate::util::object_utils::MAX_OBJECT_BYTES + 1
         ).expect_err("one byte over the ceiling must refuse");
 
-        let (code, _, _) = decode_refusal(&error).unwrap();
-        assert_eq!(code, CODE_OVERSIZED_TRANSPORT_UNSUPPORTED);
+        let (code, _, _) = parts(&error);
+        assert_eq!(code, RefusalCode::OversizedTransportUnsupported);
     }
 
     #[test]
-    fn refusal_survives_a_control_character_in_interpolated_text() {
+    fn refusal_sanitizes_a_control_character_in_interpolated_text() {
         // A path sourced from disk (a tree/inventory entry), not `WarehousePath::from_user_input`,
-        // can carry the framing separator itself. The frame must still decode cleanly, with the
-        // control character stripped rather than corrupting the field boundaries.
+        // can carry the framing separator itself. Sanitizing at construction keeps the message
+        // render-safe and frame-safe, with the control character stripped rather than dropped.
         let hostile_path = "src/\u{1f}api";
 
         let refusal = out_of_scope_refusal(hostile_path);
-        let (code, message, next_step) = decode_refusal(&refusal)
-            .expect("a refusal built from a hostile path must still decode");
+        let (code, message, next_step) = parts(&refusal);
 
-        assert_eq!(code, CODE_OUT_OF_SCOPE);
+        assert_eq!(code, RefusalCode::OutOfScope);
         assert!(!message.contains('\u{1f}'), "message still carries the control char: {:?}", message);
         assert!(!next_step.contains('\u{1f}'), "next_step still carries the control char: {:?}", next_step);
         assert!(message.contains("src/ api"), "control char should be replaced, not vanish: {:?}", message);
@@ -852,9 +829,9 @@ mod tests {
     #[test]
     fn a_scope_prune_blocked_refusal_carries_the_stable_code_and_names_the_blocker() {
         let refusal = scope_prune_blocked_refusal("docs", "bay \"reviewer\"");
-        let (code, message, next_step) = decode_refusal(&refusal).unwrap();
+        let (code, message, next_step) = parts(&refusal);
 
-        assert_eq!(code, CODE_SCOPE_PRUNE_BLOCKED);
+        assert_eq!(code, RefusalCode::ScopePruneBlocked);
         assert!(message.contains("docs"), "the path is named: {}", message);
         assert!(message.contains("bay \"reviewer\""), "the blocker is named: {}", message);
         assert!(next_step.contains("Narrow"), "the recovery says how to unblock: {}", next_step);

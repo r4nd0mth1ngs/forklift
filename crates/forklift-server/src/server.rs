@@ -461,7 +461,32 @@ fn parse_operator_tokens(path: &str) -> Result<HashMap<String, String>, String> 
 
 /// Build the JSON error response of a handler error.
 fn error_response(error: HandlerError) -> Response {
-    (error.0, Json(ErrorResponse { error: error.1 })).into_response()
+    (error.0, Json(error_body(error.1))).into_response()
+}
+
+/// Build the JSON error body, threading a classified refusal's stable code (§7.4) onto the wire.
+/// A `forklift-core` refusal reaches this head as a sentinel-framed message; decoding it here sets
+/// the additive `code`/`next_step` fields machine-readably and puts the de-framed human text in
+/// `error` — so a server-side refusal classifies on the client with the same code and exit code as
+/// a local one, and the raw frame never leaks into the body. A plain message passes through with no
+/// code (an older client simply ignores the absent fields).
+///
+/// Trust-boundary note: `deframe` decodes *any* handler message that happens to start with the
+/// sentinel prefix, regardless of where that `String` originated. That is safe today only because
+/// every framed message is refusal text minted by this codebase's own sanitized constructors
+/// (`CoreError::refusal`/its bridge shim) and returned solely to the requester whose own action
+/// triggered it — never third-party or attacker-supplied content. Keep it that way: a future error
+/// path that let outside-influenced text reach byte zero of a handler's message could spoof a
+/// `code`/`next_step` pair here.
+fn error_body(message: String) -> ErrorResponse {
+    match forklift_core::error::deframe(&message) {
+        Some((code, human, next_step)) => ErrorResponse {
+            error: human.to_string(),
+            code: Some(code.to_string()),
+            next_step: Some(next_step.to_string()),
+        },
+        None => ErrorResponse { error: message, code: None, next_step: None },
+    }
 }
 
 /// Map an internal storage error to a 500.
@@ -1842,8 +1867,34 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use forklift_core::globals::{StorageRootScope, FOLDER_NAME_FORKLIFT_ROOT};
     use forklift_core::model::operator::Operator;
-    use forklift_core::util::{office_utils, warehouse_utils};
+    use forklift_core::util::{office_utils, scope_utils, warehouse_utils};
     use forklift_core::util::office_utils::{IdentityClass, OfficeState, Role, TrustAnchor, UserRecord};
+
+    /// A classified refusal a core operation raised reaches this head as a sentinel-framed message;
+    /// `error_body` threads its stable code and next step onto the wire (additive) with the de-framed
+    /// human text in `error` — the raw frame never leaks (fixing the latent leak where a framed
+    /// refusal string went verbatim into the body).
+    #[test]
+    fn error_body_threads_a_refusal_code_onto_the_wire() {
+        let framed: String = scope_utils::chunked_transport_refusal("big.bin").into();
+        assert!(framed.contains('\u{1f}'), "the core error reaches the head framed");
+
+        let body = error_body(framed);
+        assert_eq!(body.code.as_deref(), Some(scope_utils::CODE_CHUNKED_TRANSPORT_UNSUPPORTED));
+        assert!(body.next_step.is_some());
+        assert!(body.error.contains("big.bin"), "the de-framed human message: {}", body.error);
+        assert!(!body.error.contains('\u{1f}'), "the raw frame never leaks: {:?}", body.error);
+    }
+
+    /// A plain (unframed) error passes through with no code — an older client ignores the absent
+    /// field, and the body is byte-identical to before this change.
+    #[test]
+    fn error_body_leaves_a_plain_error_uncoded() {
+        let body = error_body("something ordinary went wrong".to_string());
+        assert_eq!(body.error, "something ordinary went wrong");
+        assert!(body.code.is_none());
+        assert!(body.next_step.is_none());
+    }
 
     // ---------------------------------------------------------------------------------
     // Shared test plumbing

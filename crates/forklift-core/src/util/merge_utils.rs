@@ -900,7 +900,7 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
         // refuse rather than guess, before touching content. Never fires in a full bay
         // or a valid scoped bay (a spine path is always a directory there).
         if scope.requires_directory(&path) {
-            return Err(scope_utils::type_changed_refusal(&path));
+            return Err(scope_utils::type_changed_refusal(&path).into());
         }
 
         // Nothing to do when both sides agree, or their side is unchanged since the base.
@@ -943,7 +943,7 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
         // that is a genuine conflict the bay has no content to reconcile — refuse before any
         // blob load, so no absent out-of-scope object is ever dereferenced.
         if out_of_scope {
-            return Err(scope_utils::out_of_scope_conflict_refusal(&path));
+            return Err(scope_utils::out_of_scope_conflict_refusal(&path).into());
         }
 
         // Both sides changed the file (relative to the base) in different ways.
@@ -1050,7 +1050,7 @@ fn merge_directory(base: Option<&crate::model::tree_item::TreeItem>,
                 }));
             } else {
                 // Both sides changed it (o != b, t != b, o != t) — refuse before any load.
-                return Err(scope_utils::out_of_scope_conflict_refusal(&child_key));
+                return Err(scope_utils::out_of_scope_conflict_refusal(&child_key).into());
             }
 
             continue;

@@ -205,14 +205,62 @@ pub struct ResolveResponse {
 }
 
 /// The JSON body every error status carries.
+///
+/// `error` is the human message. `code` and `next_step` are **additive** (§7.4 error taxonomy):
+/// when a server-side operation fails with a classified refusal, the head sets the stable refusal
+/// `code` and its recovery `next_step` here so the client can classify it with the same code and
+/// exit code as a local refusal. Both are absent for an unclassified error and on an older head
+/// that predates them (`#[serde(default)]` reads them as `None`); a client that does not understand
+/// them ignores them. See `docs/format/REMOTE_PROTOCOL.md`.
 #[derive(Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
+
+    /// The stable refusal code (a `RefusalCode` string), when the failure is a classified refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+
+    /// The machine-actionable recovery step that accompanies `code`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<String>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// New client × **old** server: an old error body has no `code`/`next_step`, so a new client
+    /// must read them as absent (`#[serde(default)]`) rather than fail to parse.
+    #[test]
+    fn error_response_without_code_reads_as_none() {
+        let body: ErrorResponse = serde_json::from_str(r#"{ "error": "boom" }"#)
+            .expect("an old-shape error body parses");
+        assert_eq!(body.error, "boom");
+        assert!(body.code.is_none());
+        assert!(body.next_step.is_none());
+    }
+
+    /// An uncoded error serializes to the **byte-identical** old shape — the additive fields are
+    /// skipped when absent, so an old client sees exactly the body it always did.
+    #[test]
+    fn an_uncoded_error_serializes_to_the_old_shape() {
+        let body = ErrorResponse { error: "boom".to_string(), code: None, next_step: None };
+        assert_eq!(serde_json::to_string(&body).unwrap(), r#"{"error":"boom"}"#);
+    }
+
+    /// A coded error round-trips its additive fields.
+    #[test]
+    fn a_coded_error_round_trips() {
+        let body = ErrorResponse {
+            error: "outside scope".to_string(),
+            code: Some("out_of_scope".to_string()),
+            next_step: Some("widen it".to_string()),
+        };
+        let json = serde_json::to_string(&body).unwrap();
+        let back: ErrorResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.code.as_deref(), Some("out_of_scope"));
+        assert_eq!(back.next_step.as_deref(), Some("widen it"));
+    }
 
     /// New client × **old** server: an old head's handshake has no `chunking` field, so a
     /// chunk-aware client must read it as `false` (and then refuse to lift chunked content there).

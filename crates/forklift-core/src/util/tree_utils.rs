@@ -318,7 +318,7 @@ fn splice_spine_level(head: Option<&TreeItem>,
             ScopeClass::OutOfScope =>
                 splice_out_of_scope_entry(&mut tree, name, item, overrides.get(&child_key)),
             ScopeClass::InScope | ScopeClass::Spine =>
-                return Err(scope_utils::type_changed_refusal(&child_key)),
+                return Err(scope_utils::type_changed_refusal(&child_key).into()),
         }
     }
 
@@ -333,13 +333,14 @@ fn splice_spine_level(head: Option<&TreeItem>,
     if let Some((name, _)) = dock_files.iter().next() {
         let child_key = join_key(key, name);
 
+        // Frontier: reframe the typed refusal for this still-String walker (bridge shim).
         return Err(match scope.classify(&child_key) {
             ScopeClass::InScope | ScopeClass::Spine => scope_utils::type_changed_refusal(&child_key),
             // Not producible by the current materialize/load model (the working tree only ever
             // holds content on the path to an in-scope prefix) — refused defensively rather
             // than silently spliced into a signed tree unsealed.
             ScopeClass::OutOfScope => scope_utils::out_of_scope_refusal(&child_key),
-        });
+        }.into());
     }
 
     // Head subtrees: out-of-scope ones are copied verbatim (or resolved by the merge skeleton);

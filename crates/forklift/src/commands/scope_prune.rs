@@ -1,4 +1,5 @@
 use serde::Serialize;
+use forklift_core::error::CoreError;
 use forklift_core::util::bay_utils;
 use forklift_core::util::path_utils::WarehousePath;
 use forklift_core::util::scope_utils::{self, MaterializationScope, ScopeClass};
@@ -140,7 +141,7 @@ pub fn handle_command(paths: Vec<String>, dry_run: bool) -> Result<(), String> {
 /// checkout's materialization scope is always a subset of the fetch scope; after the prune the
 /// fetch scope shrinks, so a checkout whose scope is no longer a subset is one that still needs
 /// a path the prune would free. All blockers are named at once.
-fn guard_materialization_scopes(pruned: &[String], post_prune: &MaterializationScope) -> Result<(), String> {
+fn guard_materialization_scopes(pruned: &[String], post_prune: &MaterializationScope) -> Result<(), CoreError> {
     let mut blockers: Vec<String> = Vec::new();
 
     if !scope_utils::read_main_tree_scope()?.subset_of(post_prune) {
