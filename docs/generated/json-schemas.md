@@ -2244,7 +2244,7 @@ A command not listed here either reports only the generic human-message shape `{
       "type": "array"
     },
     "binary": {
-      "description": "Whether a blob is binary (contains a NUL byte) — `content` is then omitted\nrather than carrying lossily-mangled bytes. Absent for every other object type.",
+      "description": "Whether a blob is binary — contains a NUL byte, or is not valid UTF-8 (see\n`output::blob_text`) — `content` is then omitted rather than carrying lossily-mangled\nbytes. Absent for every other object type.",
       "type": [
         "boolean",
         "null"
@@ -2512,7 +2512,7 @@ A command not listed here either reports only the generic human-message shape `{
   "description": "A `show` result: a file's content at a revision, or — when it is binary or a chunked\nlarge file — the metadata that explains why there is no `content` instead. The public\nJSON schema (a change here is a schema change; see `crate::output::SCHEMA_VERSION`).",
   "properties": {
     "binary": {
-      "description": "Whether the content is not shown as text: either non-text bytes (a NUL byte\nanywhere) or a chunked large file, which is never assembled just to answer `show`.",
+      "description": "Whether the content is not shown as text: either non-text bytes (a NUL byte anywhere,\nor invalid UTF-8 — see `output::blob_text`) or a chunked large file, which is never\nassembled just to answer `show`.",
       "type": "boolean"
     },
     "chunk_count": {
