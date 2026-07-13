@@ -82,14 +82,16 @@ fn peek_inventory(path: &str, verbose: bool) -> Result<(), String> {
 }
 
 /// A `--json` inventory peek.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct PeekInventory {
+pub(crate) struct PeekInventory {
     items: Vec<PeekInventoryItem>,
 }
 
 /// One inventory entry.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct PeekInventoryItem {
+pub(crate) struct PeekInventoryItem {
     state: String,
     hash: String,
     name: String,
@@ -197,8 +199,9 @@ fn peek_object_json(object: ParsedObject) -> Result<(), String> {
 }
 
 /// A `--json` object peek: the fields relevant to the object's type are set.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct PeekObject {
+pub(crate) struct PeekObject {
     object_type: String,
 
     /// A blob's content as text.
@@ -265,23 +268,26 @@ impl PeekObject {
 }
 
 /// One entry of a tree object.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct PeekTreeEntry {
+pub(crate) struct PeekTreeEntry {
     item_type: String,
     hash: String,
     name: String,
 }
 
 /// One chunk of a recipe object.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct PeekChunk {
+pub(crate) struct PeekChunk {
     hash: String,
     size: u64,
 }
 
 /// One action of a parcel object.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct PeekAction {
+pub(crate) struct PeekAction {
     action: String,
     operator: String,
     timestamp: String,
@@ -427,4 +433,14 @@ fn print_parcel_action(action: &ParcelAction) {
             println!("{}\n", **description);
         }
     });
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("PeekInventory", schemars::schema_for!(PeekInventory)),
+        ("PeekObject", schemars::schema_for!(PeekObject)),
+    ]
 }

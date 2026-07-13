@@ -29,8 +29,9 @@ pub fn handle_command(all: bool) -> Result<(), String> {
 }
 
 /// The result of a compaction.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Compacted {
+pub(crate) struct Compacted {
     /// Whether this was a full repack (existing packs rewritten, garbage dropped).
     all: bool,
 
@@ -81,4 +82,13 @@ impl CommandOutput for Compacted {
             output::human_bytes(self.bytes_packed),
         );
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Compacted", schemars::schema_for!(Compacted)),
+    ]
 }

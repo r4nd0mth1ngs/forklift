@@ -730,6 +730,13 @@ mod tests {
         // or is on the human-only allow-list — but never neither, and never both.
         for command in cli.get_subcommands() {
             let name = command.get_name();
+
+            // Hidden dev-only diagnostics (e.g. `__docgen`, feature-gated and never part of a
+            // release build) are not part of the CLI/MCP contract this test enforces.
+            if name.starts_with("__") {
+                continue;
+            }
+
             let prefix = name.replace('-', "_");
             let covered = tools.iter().any(|tool| *tool == prefix || tool.starts_with(&format!("{}_", prefix)));
             let human_only = HUMAN_ONLY.contains(&name);

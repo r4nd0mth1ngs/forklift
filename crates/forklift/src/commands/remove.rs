@@ -30,11 +30,21 @@ pub fn handle_command(subject: &str) -> Result<(), String> {
 
 /// The path a `remove` staged for removal. Human output stays silent; `--json` gets
 /// a confirmation envelope.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Removed {
+pub(crate) struct Removed {
     path: String,
 }
 
 impl CommandOutput for Removed {
     fn render_human(&self) {}
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Removed", schemars::schema_for!(Removed)),
+    ]
 }

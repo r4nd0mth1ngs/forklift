@@ -135,16 +135,18 @@ pub async fn handle_command(revision: &str, message: Option<String>) -> Result<(
 
 /// What a cherry-pick did. `Conflicts` is the only outcome that leaves work for the operator
 /// (resolve, load, stack); `Applied` is complete.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-enum CherryPickOutcome {
+pub(crate) enum CherryPickOutcome {
     Applied,
     Conflicts,
 }
 
 /// The result of a cherry-pick.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct CherryPicked {
+pub(crate) struct CherryPicked {
     outcome: CherryPickOutcome,
 
     /// The parcel that was picked.
@@ -214,4 +216,13 @@ impl CommandOutput for CherryPicked {
             }
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("CherryPicked", schemars::schema_for!(CherryPicked)),
+    ]
 }

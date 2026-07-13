@@ -96,8 +96,9 @@ async fn create_pallet(name: &str, revision: Option<&str>) -> Result<(), String>
 }
 
 /// A newly created pallet.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Palletized {
+pub(crate) struct Palletized {
     pallet: String,
 
     /// The head the new pallet points at (`null` when created unborn from an unborn
@@ -174,8 +175,9 @@ fn list_pallets(all: bool) -> Result<(), String> {
 }
 
 /// The list of pallets, marking the current one.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct PalletList {
+pub(crate) struct PalletList {
     /// The current pallet (HEAD equivalent).
     current: String,
 
@@ -192,8 +194,9 @@ struct PalletList {
 }
 
 /// One pallet in the list.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct PalletEntry {
+pub(crate) struct PalletEntry {
     name: String,
     current: bool,
 
@@ -226,4 +229,14 @@ impl CommandOutput for PalletList {
             }
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("Palletized", schemars::schema_for!(Palletized)),
+        ("PalletList", schemars::schema_for!(PalletList)),
+    ]
 }

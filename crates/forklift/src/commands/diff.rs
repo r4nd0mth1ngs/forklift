@@ -826,8 +826,9 @@ fn join_key(key: &str, name: &str) -> String {
 
 /// The `--json` diff: the changed-file set. The line-by-line hunks stay a human
 /// display (a program reads content by hash when it needs it, and stays token-cheap).
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct DiffReport {
+pub(crate) struct DiffReport {
     /// What was compared: `worktree`, `staged` or `pallets`.
     mode: &'static str,
 
@@ -835,8 +836,9 @@ struct DiffReport {
 }
 
 /// One changed file in a `--json` diff.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct DiffFileSummary {
+pub(crate) struct DiffFileSummary {
     kind: ChangeKind,
     path: String,
 
@@ -858,4 +860,13 @@ impl DiffFileSummary {
 impl CommandOutput for DiffReport {
     // Only reached under `--json`; the human diff renders inline in each mode above.
     fn render_human(&self) {}
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("DiffReport", schemars::schema_for!(DiffReport)),
+    ]
 }

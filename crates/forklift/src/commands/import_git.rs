@@ -761,8 +761,9 @@ fn sanitize_pallet_name(branch: &str) -> String {
 }
 
 /// The result of a git import.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct ImportReport {
+pub(crate) struct ImportReport {
     commits: usize,
     trees: usize,
     blobs: usize,
@@ -789,8 +790,9 @@ struct ImportReport {
 }
 
 /// The packed-store summary (a slim view of `pack_utils::IngestStats`).
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct Packed {
+pub(crate) struct Packed {
     /// Objects written into packs.
     objects: usize,
 
@@ -834,4 +836,13 @@ impl CommandOutput for ImportReport {
             it anchors the imported history as the legacy boundary."
         );
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("ImportReport", schemars::schema_for!(ImportReport)),
+    ]
 }
