@@ -352,8 +352,8 @@ signed office record — so authorship stays forge-proof, and `--class
 under whose supervision".
 
 With `--json`, each entry also carries `parents` — every parent of that parcel, in
-stacking order, `[]` for a root — which is what a caller building a graph (rather than
-just reading a log) walks:
+their stored (canonical) order — base-first for a consolidation — `[]` for a root —
+which is what a caller building a graph (rather than just reading a log) walks:
 
 ```json
 { "parcel": "<hash>", "parents": ["<base>", "<other>"], "consolidates": ["<base>", "<other>"], "actions": [/* … */] }
