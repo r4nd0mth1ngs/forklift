@@ -220,6 +220,7 @@ forklift diff --staged              # inventory vs pallet head (what stack would
 forklift diff main feature          # two revisions, tree vs tree
 forklift diff main feature src/     # ...limited to a path
 forklift diff --verbose             # include unchanged context lines
+forklift diff :empty main           # main's root parcel vs nothing: every file is "added"
 ```
 
 Binary files are reported, not printed. Whitespace-only changes are shown faint
@@ -229,6 +230,15 @@ reports the changed-file set (path + kind) rather than every line.
 A large file (stored in chunks — see below) is a binary as far as diff is concerned:
 a changed one reports as `(binary contents; not shown line by line)`, never assembled
 or line-diffed.
+
+The two-revision form accepts anything `show` and `history` do — a pallet name, an
+`@`-qualified meta pallet, or a parcel hash prefix — plus one reserved token,
+`:empty`, meaning the empty tree. It exists for a root parcel, which has no real
+"before": `diff :empty <revision>` compares it against a clean slate, so every file
+it introduces lists as `Added` instead of `diff` refusing for want of a second
+revision. `:empty` can never collide with a real revision — a pallet/meta name is
+restricted to ASCII letters, digits, `.`, `_`, `-` and `/`, and a hash prefix is hex
+digits only, so neither grammar can ever contain a `:`.
 
 ### `restore` — discard changes (`r`)
 
@@ -317,7 +327,31 @@ forklift peek --inventory src -v     # ...with full stat detail
 
 A debugging/inspection tool: it decodes any object by hash (a blob's text, a
 tree's entries, a parcel's tree/parents/actions/description) or dumps a folder's
-inventory shard.
+inventory shard. With `--json`, a binary blob (a NUL byte anywhere, or bytes that
+are not valid UTF-8) reports `"binary": true` and omits `content` instead of
+mangling raw bytes through a lossy text conversion.
+
+### `show` — a file's content at a revision
+
+```sh
+forklift show main:src/app.rs               # the file as of main's head
+forklift show a1b2c3:src/app.rs             # ...at a parcel hash prefix instead
+forklift show main:logs/build:latest.txt    # a path may itself contain ":" — only
+                                             # the first ":" splits revision from path
+```
+
+The one-invocation equivalent of resolving a revision, walking its tree to a path
+and peeking the blob by hash yourself — a single call in and out for a caller like
+an editor's review panel. The argument is `<revision>:<path>`, split on the *first*
+`:` — a revision (a pallet name, an `@`-qualified meta pallet, or a hash prefix)
+can never contain `:`, so the split is unambiguous even when the path does.
+
+A large file (stored in chunks) reports its metadata — content hash, total size,
+chunk count — instead of assembling it; non-text content (a NUL byte anywhere, or
+bytes that are not valid UTF-8) reports binary. Either way `content` is absent and
+`binary` is `true`. In human mode a short notice prints instead of raw bytes; in
+`--json` mode see [`docs/MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md) for the
+exact shape.
 
 ---
 
@@ -1075,8 +1109,8 @@ nudge you toward the real names as you go):
 | `restore --staged` | `unload` | | | |
 
 The mapping isn't always one-to-one in *behavior* (e.g. `commit` runs `stack`, which commits
-what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag` and `cherry-pick`
-keep their git names outright. For the review workflow, git's "pull request" is
+what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag`, `show` and
+`cherry-pick` keep their git names outright. For the review workflow, git's "pull request" is
 [`haul`](#haul--pull-requests-reviewable-merge-proposals).
 
 | Command | Alias | Does |
@@ -1096,6 +1130,7 @@ keep their git names outright. For the review workflow, git's "pull request" is
 | `stack` | `s` | Record the inventory as a new parcel |
 | `undo` | | Soft-reset the last stack |
 | `peek` | `pk` | Inspect an object or inventory |
+| `show` | | Print a file's content at a revision (`<revision>:<path>`) |
 | `history` | `hi` | Walk the parcel graph |
 | `blame` | `bl` | Attribute each line to its author (with identity class) |
 | `audit` | `a` | Verify signed history offline |
@@ -1125,30 +1160,13 @@ keep their git names outright. For the review workflow, git's "pull request" is
 
 ## 11. Exit codes
 
-Errors set a deterministic exit code so scripts branch without parsing prose:
+Errors set a deterministic exit code so scripts branch without parsing prose. `0` is
+success and `2` is clap's own usage/argument error; every other code is one of forklift's
+own classified failures.
 
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | Generic error |
-| 2 | Usage / argument error |
-| 3 | Not a warehouse |
-| 4 | Conflict (working state blocks the operation) |
-| 5 | Diverged (a remote ref moved under a lift) |
-| 6 | Warehouse locked (another forklift process holds it) |
-| 7 | Out of scope (a path argument is outside a scoped bay's scope) |
-| 8 | Scope path type changed (a scoped bay's spine path flipped dir↔file) |
-| 9 | Sparse workspace (a whole-tree verb is not supported in a scoped bay yet) |
-| 10 | Out of scope conflict (a scoped bay merge hit an out-of-scope entry changed on both sides) |
-| 11 | Non-origin lift (a sparse workspace tried to lift to a remote other than its origin) |
-| 12 | Narrow unclean (`narrow` would delete a subtree that still holds uncommitted work) |
-| 13 | Scope prune blocked (`scope-prune` would free a path a checkout still materializes) |
-| 14 | Chunked transport unsupported (a chunked large file can't go into a bundle, or is being lifted to a remote that doesn't support chunking) |
-| 15 | Oversized transport unsupported (an object predates the size limit and can't be sent to a remote or bundle) |
-| 16 | Commit pagination unsupported (a lift needs a paginated commit and the remote doesn't support it yet) |
-| 19 | Empty history (`history` was asked to walk a pallet that has nothing stacked on it yet) |
-
-(17 and 18 are reserved for future features and are not yet assigned to any code.)
+The full, always-current table — generated from the same enum the binary itself
+branches on, so it can never fall behind — is
+[`../generated/errors.md`](../generated/errors.md).
 
 With `--json`, the same classification appears as `error.code` in the output
 envelope. See [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md).

@@ -253,8 +253,9 @@ fn is_directory_in_tree(root_tree_hash: &str, key: &str) -> Result<bool, String>
 }
 
 /// The result of a franchise: what was imported and which pallet was checked out.
+#[cfg_attr(feature = "docgen", derive(schemars::JsonSchema))]
 #[derive(Serialize)]
-struct FranchiseReport {
+pub(crate) struct FranchiseReport {
     remote: String,
     directory: String,
 
@@ -329,4 +330,13 @@ impl CommandOutput for FranchiseReport {
             );
         }
     }
+}
+
+
+/// The `--json` `data` schema(s) this command can emit (see `docs/generated/json-schemas.md`).
+#[cfg(feature = "docgen")]
+pub(crate) fn __docgen_schemas() -> Vec<(&'static str, schemars::Schema)> {
+    vec![
+        ("FranchiseReport", schemars::schema_for!(FranchiseReport)),
+    ]
 }

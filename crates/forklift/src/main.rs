@@ -5,6 +5,8 @@ use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
 pub mod cli;
 pub mod commands;
+#[cfg(feature = "docgen")]
+pub mod docgen;
 pub mod output;
 pub mod pager;
 pub mod passphrase;
@@ -215,6 +217,7 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Scope { action } => commands::scope::handle_command(action),
         Command::ScopePrune { paths, dry_run } => commands::scope_prune::handle_command(paths, dry_run),
         Command::Shift { pallet } => commands::shift::handle_command(&pallet).await,
+        Command::Show { target } => commands::show::handle_command(&target),
         Command::Stack { description } => commands::stack::handle_command(description).await,
         Command::Tag { action } => commands::tag::handle_command(action).await,
         Command::Stocktake { summary } => commands::stocktake::handle_command(summary).await,
@@ -222,5 +225,16 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Unload { path } => commands::unload::handle_command(&path),
         Command::Version => commands::version::handle_command(),
         Command::SelfUpdate { check } => commands::self_update::handle_command(check).await,
+        #[cfg(feature = "docgen")]
+        Command::Docgen { target } => {
+            use crate::cli::DocgenTarget;
+            match target {
+                DocgenTarget::Errors => {
+                    print!("{}", docgen::render_errors());
+                    Ok(())
+                }
+                DocgenTarget::JsonSchemas => docgen::render_json_schemas().map(|out| print!("{}", out)),
+            }
+        }
     }
 }
