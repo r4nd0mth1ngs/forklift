@@ -30,8 +30,8 @@ use crate::output::{self, CommandOutput};
 /// A large import lands hundreds of thousands of objects at once, which is exactly the case
 /// the loose object store is slowest in — writing (and later compacting away) one file per
 /// object is the measured wall of a big import. So import writes native packs directly,
-/// delta-compressing successive versions of a file on the way in — the user gets a dense
-/// warehouse without the store ever existing in its loose worst case. `--no-compact` opts
+/// delta-compressing successive versions of files and directory trees on the way in — the user
+/// gets a dense warehouse without the store ever existing in its loose worst case. `--no-compact` opts
 /// out and stores loose objects instead.
 ///
 /// # Arguments
@@ -253,6 +253,11 @@ struct Converter {
     /// there, re-readable from the batch pipe when its bytes have left the cache.
     latest_blob_at_path: HashMap<String, String>,
 
+    /// The newest tree seen at each directory path, by *forklift* hash. A directory usually
+    /// changes one entry per commit, so successive versions delta extremely well — this is
+    /// what `compact`'s size-window fallback catches for the loose path, done exactly here.
+    latest_tree_at_path: HashMap<String, String>,
+
     /// Each stored blob's delta-chain depth (by forklift hash), so chains stay bounded.
     stored_depth: HashMap<String, u32>,
 
@@ -288,6 +293,7 @@ impl Converter {
             warnings: Vec::new(),
             ingest: pack_direct.then(StoreIngest::new).transpose()?,
             latest_blob_at_path: HashMap::new(),
+            latest_tree_at_path: HashMap::new(),
             stored_depth: HashMap::new(),
             base_cache: HashMap::new(),
             base_cache_bytes: 0,
@@ -364,7 +370,14 @@ impl Converter {
     /// are revisited, and each blob is considered exactly where history changed it.
     fn convert_tree(&mut self, git_hash: &str, path_prefix: &str) -> Result<String, String> {
         if let Some(hash) = self.trees.get(git_hash) {
-            return Ok(hash.clone());
+            // Already imported (an identical directory elsewhere in history) — nothing to
+            // store, but it is now the newest version at *this* path, so a later version
+            // here deltas against it.
+            let hash = hash.clone();
+            if self.ingest.is_some() {
+                self.latest_tree_at_path.insert(path_prefix.to_string(), hash.clone());
+            }
+            return Ok(hash);
         }
 
         let mut tree = TreeItem::new(String::new(), String::new(), DirEntryType::Tree);
@@ -397,11 +410,50 @@ impl Converter {
         }
 
         let mut object = LooseObjectBuilder::build_tree(&tree);
-        self.store_object(&mut object)?;
+        self.store_tree(&mut object, path_prefix)?;
 
         self.trees.insert(git_hash.to_string(), object.hash.clone());
 
         Ok(object.hash)
+    }
+
+    /// Store one built tree — in pack-direct mode as a delta against the previous version of
+    /// the same directory when that saves space. Tree bases come only from the bounded cache
+    /// (an ingested tree is not re-readable before publication); a miss just stores in full.
+    fn store_tree(&mut self, object: &mut LooseObject, path: &str) -> Result<(), String> {
+        if self.ingest.is_none() {
+            object.store()?;
+            return Ok(());
+        }
+
+        let base = self.tree_base_for(path);
+        let ingest = self.ingest.as_mut().expect("pack-direct mode was just checked");
+        let stored = ingest.store_with_base(object, base.as_ref().map(|(hash, bytes, depth)| {
+            IngestBase { hash, bytes, depth: *depth }
+        }))?;
+
+        let depth = match stored {
+            IngestStored::Delta { depth } => {
+                self.deltas += 1;
+                depth
+            }
+            _ => 0,
+        };
+        self.stored_depth.insert(object.hash.clone(), depth);
+        self.cache_base(&tree_cache_key(&object.hash), Arc::new(std::mem::take(&mut object.content)));
+        self.latest_tree_at_path.insert(path.to_string(), object.hash.clone());
+
+        Ok(())
+    }
+
+    /// The delta base for the next version of the directory at `path`, when its bytes are
+    /// still cached.
+    fn tree_base_for(&self, path: &str) -> Option<(String, Arc<Vec<u8>>, u32)> {
+        let base_hash = self.latest_tree_at_path.get(path)?;
+        let bytes = Arc::clone(self.base_cache.get(&tree_cache_key(base_hash))?);
+        let depth = self.stored_depth.get(base_hash).copied().unwrap_or(0);
+
+        Some((base_hash.clone(), bytes, depth))
     }
 
     /// Convert one git blob — in pack-direct mode as a delta against the previous version at
@@ -412,7 +464,9 @@ impl Converter {
             // but it is now the newest version at *this* path, so a later version here
             // deltas against it.
             let hash = hash.clone();
-            self.latest_blob_at_path.insert(path.to_string(), git_hash.to_string());
+            if self.ingest.is_some() {
+                self.latest_blob_at_path.insert(path.to_string(), git_hash.to_string());
+            }
             return Ok(hash);
         }
 
@@ -423,7 +477,7 @@ impl Converter {
         let stored = if self.ingest.is_some() {
             let base = self.delta_base_for(path)?;
             let ingest = self.ingest.as_mut().expect("pack-direct mode was just checked");
-            ingest.store_blob(&object, base.as_ref().map(|(hash, bytes, depth)| {
+            ingest.store_with_base(&object, base.as_ref().map(|(hash, bytes, depth)| {
                 IngestBase { hash, bytes, depth: *depth }
             }))?
         } else {
@@ -491,6 +545,12 @@ impl Converter {
         self.base_cache_bytes += bytes.len();
         self.base_cache.insert(git_hash.to_string(), bytes);
     }
+}
+
+/// The base-cache key for a tree's bytes. Blobs key the shared cache by *git* hash; prefixing
+/// tree entries (keyed by forklift hash) keeps the two namespaces from ever colliding.
+fn tree_cache_key(fork_hash: &str) -> String {
+    format!("t/{}", fork_hash)
 }
 
 /// Join a tree path prefix and a child name (the root prefix is empty).

@@ -279,7 +279,7 @@ contention.** Two things decide almost every row:
   compress 4%. Parallelism could never help — the dominant cost was exactly the small-file-write
   pattern that *regressed* under threads in `materialize`. The structural win shipped instead
   (2026-07-13): import appends objects **straight into native packs** (`StoreIngest`),
-  delta-compressing successive versions of a file on the way in, which removes both the loose
+  delta-compressing successive versions of files and directory trees on the way in, which removes both the loose
   store wall *and* the post-import `compact` pass that used to read it all back. The remaining
   floor is the serial pipe.
 

@@ -2038,8 +2038,8 @@ fn import_git_auto_compacts_unless_no_compact() {
     let out = packed.run(&["import-git", "."]);
     assert_success(&out);
     assert!(stdout(&out).contains("Packed the imported store"), "import should pack the store: {}", stdout(&out));
-    assert!(stdout(&out).contains("1 delta-compressed"),
-            "the second version of a.txt should be a path delta: {}", stdout(&out));
+    assert!(stdout(&out).contains("2 delta-compressed"),
+            "the second versions of a.txt and of the root tree should be path deltas: {}", stdout(&out));
     assert_eq!(count_loose_objects(&packed.root.join(".forklift/objects")), 0, "no loose objects should remain after import");
     assert!(packed.root.join(".forklift/objects/pack").is_dir(), "a pack folder should exist after import");
     // Reads work against the packed store immediately.

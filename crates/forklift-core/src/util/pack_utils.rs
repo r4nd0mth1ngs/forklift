@@ -2271,7 +2271,7 @@ pub enum IngestStored {
     Delta { depth: u32 },
 }
 
-/// A delta base candidate for [`StoreIngest::store_blob`]: the previous version at the same
+/// A delta base candidate for [`StoreIngest::store_with_base`]: the previous version at the same
 /// path, with its decompressed object bytes and current chain depth.
 pub struct IngestBase<'a> {
     pub hash: &'a str,
@@ -2333,13 +2333,14 @@ impl StoreIngest {
         Ok(IngestStored::Full)
     }
 
-    /// Store one built blob — as a delta against the previous version at its path when that
-    /// pays, otherwise in full. The policy is the bundle builder's: never delta an over-large
-    /// target (the read-side bomb ceiling), never extend a maximal chain, and never keep a
-    /// delta that is not actually smaller than the object it encodes.
-    pub fn store_blob(&mut self,
-                      object: &LooseObject,
-                      base: Option<IngestBase<'_>>) -> Result<IngestStored, String> {
+    /// Store one built object with per-path versions (a blob, or a tree of one directory) — as
+    /// a delta against the previous version at its path when that pays, otherwise in full. The
+    /// policy is the bundle builder's: never delta an over-large target (the read-side bomb
+    /// ceiling), never extend a maximal chain, and never keep a delta that is not actually
+    /// smaller than the object it encodes.
+    pub fn store_with_base(&mut self,
+                           object: &LooseObject,
+                           base: Option<IngestBase<'_>>) -> Result<IngestStored, String> {
         let Some(hash_bytes) = self.admit(object)? else {
             return Ok(IngestStored::AlreadyPresent);
         };
@@ -2701,9 +2702,9 @@ mod tests {
         });
 
         let mut ingest = StoreIngest::new().unwrap();
-        assert_eq!(ingest.store_blob(&base_object, None).unwrap(), IngestStored::Full);
+        assert_eq!(ingest.store_with_base(&base_object, None).unwrap(), IngestStored::Full);
 
-        let stored = ingest.store_blob(&target_object, Some(IngestBase {
+        let stored = ingest.store_with_base(&target_object, Some(IngestBase {
             hash: &base_object.hash,
             bytes: &base_object.content,
             depth: 0,
@@ -2711,7 +2712,7 @@ mod tests {
         assert_eq!(stored, IngestStored::Delta { depth: 1 });
 
         // Re-ingesting either version is a no-op (the loose store's exists-check equivalent).
-        assert_eq!(ingest.store_blob(&base_object, None).unwrap(), IngestStored::AlreadyPresent);
+        assert_eq!(ingest.store_with_base(&base_object, None).unwrap(), IngestStored::AlreadyPresent);
 
         let stats = ingest.finish().unwrap();
         assert_eq!(stats.objects, 2);

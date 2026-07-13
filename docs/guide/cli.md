@@ -61,9 +61,9 @@ legacy boundary (a later `audit` then tolerates the imported parcels as legacy).
 forklift with one command.
 
 The imported objects are written **straight into native packs**, delta-compressing
-successive versions of a file on the way in — the store arrives dense, without ever
-existing as one loose file per object (the slowest shape a big import can take). Pass
-`--no-compact` to store loose objects instead.
+successive versions of files and directory trees on the way in — the store arrives dense,
+without ever existing as one loose file per object (the slowest shape a big import can
+take). Pass `--no-compact` to store loose objects instead.
 
 A large history lands hundreds of thousands of loose objects at once — the case the store
 is slowest and largest in — so import **packs the store on the way out** ([`compact`](#compact--pack-the-object-store),
