@@ -16,6 +16,7 @@ machine/agent interface).
 |----------|------|
 | A user learning the CLI | [`cli.md`](cli.md) — every command, by workflow, with examples |
 | Setting up signing, users, or agents | [`trust-and-identity.md`](trust-and-identity.md) |
+| Working with friends peer-to-peer, no server | [`p2p-tor.md`](p2p-tor.md) — collaborate over Tor onion services |
 | Running a forklift server | [`../SERVER.md`](../SERVER.md) |
 | Driving forklift from a script or AI agent | [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md) |
 | Contributing to forklift itself | [`contributing.md`](contributing.md) |

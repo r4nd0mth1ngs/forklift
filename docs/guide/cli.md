@@ -1059,8 +1059,10 @@ value. Known keys:
 | `operator.name` | Your display name (local only — never written on-chain). |
 | `operator.identifier` | Your on-chain operator id (opaque; a UUID is minted if unset). |
 | `operator.profile` | The named profile this warehouse acts under (see `profile`). |
-| `remote.url` | The remote warehouse URL (for `lift`/`lower`). |
+| `remote.url` | The remote warehouse URL (for `lift`/`lower`). Can be a Tor `.onion` — see [`p2p-tor.md`](p2p-tor.md). |
 | `remote.token` | The bearer token, when the remote requires one. |
+| `remote.tor` | Reach the remote over Tor: `auto` (default — only `.onion` remotes), `on` (every remote), `off` (never). |
+| `remote.torProxy` | The Tor SOCKS proxy (default `socks5h://127.0.0.1:9050`). |
 | `maintenance.auto` | Auto-compact after mutating commands (`false`/`0`/`off`/`no` to disable; default on). |
 | `maintenance.loose` | Loose-object count that triggers an auto incremental compact (default 6700). |
 | `maintenance.packs` | Pack count that triggers an auto consolidating repack (default 20). |

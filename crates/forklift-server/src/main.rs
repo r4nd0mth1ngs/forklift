@@ -12,6 +12,7 @@
 use clap::{Parser, Subcommand};
 
 mod server;
+mod tor;
 
 #[derive(Parser)]
 #[command(
@@ -25,6 +26,9 @@ struct Cli {
     command: Command,
 }
 
+// `Serve` carries every serve flag inline (clap needs them flat for `#[arg]`), so it dwarfs the
+// other variants — irrelevant for a CLI command parsed once at startup and never held in bulk.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Serve one warehouse (--root) or a folder of warehouses (--warehouses)
@@ -57,6 +61,28 @@ enum Command {
         /// Rebuild the served bundle after this many accepted lifts (default: never)
         #[arg(long)]
         rebuild_after_lifts: Option<u32>,
+
+        /// Publish the bound address as a Tor onion service and print the shareable .onion
+        /// URL (peer-to-peer transport; needs a running `tor` with a ControlPort)
+        #[arg(long)]
+        tor: bool,
+
+        /// The Tor control address to publish through (default 127.0.0.1:9051)
+        #[arg(long)]
+        tor_control: Option<String>,
+
+        /// The Tor control password, when the control port uses HashedControlPassword
+        #[arg(long)]
+        tor_control_password: Option<String>,
+
+        /// The virtual port the onion exposes (default 80, so peers omit the port)
+        #[arg(long)]
+        tor_onion_port: Option<u16>,
+
+        /// Persist the onion key here for one stable .onion across restarts
+        /// (default: a fresh ephemeral address each run)
+        #[arg(long)]
+        tor_onion_key: Option<String>,
 
         /// A TOML config file with the same keys as these flags; flags override it
         #[arg(long)]
@@ -100,8 +126,13 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Serve { root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, config } =>
-            serve(root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts, config).await,
+        Command::Serve {
+            root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts,
+            tor, tor_control, tor_control_password, tor_onion_port, tor_onion_key, config,
+        } => serve(ServeArgs {
+            root, warehouses, addr, token, tokens, max_body_mb, rebuild_after_lifts,
+            tor, tor_control, tor_control_password, tor_onion_port, tor_onion_key, config,
+        }).await,
         Command::Prepare { root } => prepare(&root),
         Command::Bundle { root } => bundle(&root),
         Command::Gc { root, grace_hours } => gc(&root, grace_hours),
@@ -113,29 +144,45 @@ async fn main() {
     }
 }
 
+/// The `serve` subcommand's flags, mirrored from the `Command::Serve` variant so the merge with
+/// the config file stays one readable struct rather than a dozen positional arguments.
+struct ServeArgs {
+    root: Option<String>,
+    warehouses: Option<String>,
+    addr: Option<String>,
+    token: Option<String>,
+    tokens: Option<String>,
+    max_body_mb: Option<u64>,
+    rebuild_after_lifts: Option<u32>,
+    tor: bool,
+    tor_control: Option<String>,
+    tor_control_password: Option<String>,
+    tor_onion_port: Option<u16>,
+    tor_onion_key: Option<String>,
+    config: Option<String>,
+}
+
 /// Merge the flags with the config file (flags win) and serve.
-#[allow(clippy::too_many_arguments)]
-async fn serve(root: Option<String>,
-               warehouses: Option<String>,
-               addr: Option<String>,
-               token: Option<String>,
-               tokens: Option<String>,
-               max_body_mb: Option<u64>,
-               rebuild_after_lifts: Option<u32>,
-               config: Option<String>) -> Result<(), String> {
-    let file = match config {
+async fn serve(args: ServeArgs) -> Result<(), String> {
+    let file = match args.config {
         Some(path) => parse_config(&path)?,
         None => ConfigFile::default(),
     };
 
     let options = server::ServeOptions {
-        root: root.or(file.root),
-        warehouses: warehouses.or(file.warehouses),
-        addr: addr.or(file.addr).unwrap_or("127.0.0.1:9418".to_string()),
-        token: token.or(file.token),
-        tokens: tokens.or(file.tokens),
-        max_body_mb: max_body_mb.or(file.max_body_mb),
-        rebuild_after_lifts: rebuild_after_lifts.or(file.rebuild_after_lifts),
+        root: args.root.or(file.root),
+        warehouses: args.warehouses.or(file.warehouses),
+        addr: args.addr.or(file.addr).unwrap_or("127.0.0.1:9418".to_string()),
+        token: args.token.or(file.token),
+        tokens: args.tokens.or(file.tokens),
+        max_body_mb: args.max_body_mb.or(file.max_body_mb),
+        rebuild_after_lifts: args.rebuild_after_lifts.or(file.rebuild_after_lifts),
+        // The flag can only turn Tor on; the config file can too. Absent on both = off.
+        tor: args.tor || file.tor,
+        tor_control: args.tor_control.or(file.tor_control),
+        tor_control_password: args.tor_control_password.or(file.tor_control_password),
+        tor_onion_port: args.tor_onion_port.or(file.tor_onion_port),
+        tor_onion_key: args.tor_onion_key.or(file.tor_onion_key),
         authentication_hook: file.authentication_hook,
         admission_hook: file.admission_hook,
         events_hook: file.events_hook,
@@ -171,6 +218,11 @@ struct ConfigFile {
     tokens: Option<String>,
     max_body_mb: Option<u64>,
     rebuild_after_lifts: Option<u32>,
+    tor: bool,
+    tor_control: Option<String>,
+    tor_control_password: Option<String>,
+    tor_onion_port: Option<u16>,
+    tor_onion_key: Option<String>,
     authentication_hook: Option<server::HookEndpoint>,
     admission_hook: Option<server::HookEndpoint>,
     events_hook: Option<server::HookEndpoint>,
@@ -219,6 +271,11 @@ fn parse_config(path: &str) -> Result<ConfigFile, String> {
         tokens: string_of("tokens"),
         max_body_mb: integer_of("max_body_mb").map(|v| v as u64),
         rebuild_after_lifts: integer_of("rebuild_after_lifts").map(|v| v as u32),
+        tor: doc.get("tor").and_then(|item| item.as_bool()).unwrap_or(false),
+        tor_control: string_of("tor_control"),
+        tor_control_password: string_of("tor_control_password"),
+        tor_onion_port: integer_of("tor_onion_port").map(|v| v as u16),
+        tor_onion_key: string_of("tor_onion_key"),
         authentication_hook: hook_of("authentication")?,
         admission_hook: hook_of("admission")?,
         events_hook: hook_of("events")?,

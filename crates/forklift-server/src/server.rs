@@ -197,6 +197,23 @@ pub struct ServeOptions {
     /// Rebuild a warehouse's bundle after this many accepted lifts; `None` = never.
     pub rebuild_after_lifts: Option<u32>,
 
+    /// Publish the bound address as a Tor onion service (the peer-to-peer transport, §4.7),
+    /// so peers reach it over Tor with no fixed IP or port-forwarding.
+    pub tor: bool,
+
+    /// The Tor control address to publish through (`None` = `127.0.0.1:9051`).
+    pub tor_control: Option<String>,
+
+    /// The Tor control password, when the control port uses `HashedControlPassword`.
+    pub tor_control_password: Option<String>,
+
+    /// The virtual port the onion exposes (`None` = 80, which lets clients omit the port).
+    pub tor_onion_port: Option<u16>,
+
+    /// Persist the onion key at this path for a stable address across restarts
+    /// (`None` = a fresh ephemeral address each run).
+    pub tor_onion_key: Option<String>,
+
     /// `authentication` hook: credential → operator identifier (hot, fail closed).
     pub authentication_hook: Option<HookEndpoint>,
 
@@ -373,6 +390,45 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 
     use std::io::Write;
     std::io::stdout().flush().ok();
+
+    // Publish the onion service *after* binding (the target port is now known) and hold it for
+    // the whole serve: it lives exactly as long as this value, so dropping it at shutdown tears
+    // the address down. Failure to publish fails the serve — an operator who asked for `--tor`
+    // wants the address, not a silent clearnet-only fallback.
+    let _onion = if options.tor {
+        // Onion traffic exits the Tor daemon on the local host, so an all-interfaces bind is
+        // reached at loopback; a specific-interface bind is dialed as-is.
+        let target = if bound.ip().is_unspecified() {
+            std::net::SocketAddr::new(std::net::IpAddr::from([127, 0, 0, 1]), bound.port())
+        } else {
+            bound
+        };
+
+        let key = match &options.tor_onion_key {
+            Some(path) => crate::tor::OnionKey::Persistent(std::path::Path::new(path)),
+            None => crate::tor::OnionKey::Ephemeral,
+        };
+
+        let service = crate::tor::publish(
+            options.tor_control.as_deref().unwrap_or(crate::tor::DEFAULT_CONTROL_ADDR),
+            options.tor_control_password.as_deref(),
+            options.tor_onion_port.unwrap_or(80),
+            target,
+            key,
+        )?;
+
+        println!("forklift-server onion service at {}", service.url());
+        println!(
+            "  a peer franchises it with: forklift franchise {} <dir>{}",
+            service.url(),
+            if auth_configured { " --token <token>" } else { "" }
+        );
+        std::io::stdout().flush().ok();
+
+        Some(service)
+    } else {
+        None
+    };
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
