@@ -60,10 +60,13 @@ legacy boundary (a later `audit` then tolerates the imported parcels as legacy).
 (gitlinks) are skipped with a warning. For agents, this means a project can be moved onto
 forklift with one command.
 
-A large history lands hundreds of thousands of loose objects at once — the case the store
-is slowest and largest in — so import **packs the store on the way out** ([`compact`](#compact--pack-the-object-store),
-so you never have to remember to). Pass `--no-compact` to skip it and leave the objects
-loose (e.g. to inspect the raw store or benchmark the loose baseline).
+A large history lands hundreds of thousands of objects at once — the case the loose store
+is slowest and largest in — so the imported objects are written **straight into native
+packs** ([`compact`](#compact--pack-the-object-store)'s format, without the detour through
+one loose file per object), delta-compressing successive versions of files and directory
+trees on the way in. The store arrives dense and you never have to remember to `compact`
+it. Pass `--no-compact` to store loose objects instead (e.g. to inspect the raw store or
+benchmark the loose baseline).
 
 Refuses in a scoped (sparse) bay (see `bay add --scope` below): importing builds
 every pallet's history straight from the git tree, bypassing the sparse overlay entirely,
@@ -926,8 +929,8 @@ changed-path filter — so `blame` skips parcels that did not touch the file. It
 repairs itself, so you never manage it; building it during `compact` just means it is warm the
 first time you need it.
 
-**You rarely need to run this by hand.** `import-git` compacts on the way out (unless you pass
-`--no-compact`), and afterwards forklift **compacts automatically** in the background of a
+**You rarely need to run this by hand.** `import-git` writes packs directly on the way in
+(unless you pass `--no-compact`), and afterwards forklift **compacts automatically** in the background of a
 mutating command once the store has accumulated enough loose objects or packs to warrant it
 (git's `gc --auto`). It runs synchronously, under that command's lock, so it is correct and
 never races — which means it can add a brief pause when it fires (rarely). Turn it off with
