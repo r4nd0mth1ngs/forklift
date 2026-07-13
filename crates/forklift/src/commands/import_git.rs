@@ -432,18 +432,28 @@ impl Converter {
             IngestBase { hash, bytes, depth: *depth }
         }))?;
 
-        let depth = match stored {
-            IngestStored::Delta { depth } => {
-                self.deltas += 1;
-                depth
-            }
-            _ => 0,
-        };
-        self.stored_depth.insert(object.hash.clone(), depth);
+        self.record_depth(&object.hash.clone(), &stored);
         self.cache_base(&tree_cache_key(&object.hash), Arc::new(std::mem::take(&mut object.content)));
         self.latest_tree_at_path.insert(path.to_string(), object.hash.clone());
 
         Ok(())
+    }
+
+    /// Record a just-stored object's delta-chain depth. An object the store *already held* has
+    /// an unknown record shape — it may itself be a delta of any depth — so it is recorded as
+    /// maxed-out: no later version may extend a chain whose true length nobody here knows
+    /// (the read side enforces a hard reconstruction bound, so overshooting it would fail
+    /// reads, not just density).
+    fn record_depth(&mut self, hash: &str, stored: &IngestStored) {
+        let depth = match stored {
+            IngestStored::Delta { depth } => {
+                self.deltas += 1;
+                *depth
+            }
+            IngestStored::Full => 0,
+            IngestStored::AlreadyPresent => u32::MAX,
+        };
+        self.stored_depth.insert(hash.to_string(), depth);
     }
 
     /// The delta base for the next version of the directory at `path`, when its bytes are
@@ -451,7 +461,9 @@ impl Converter {
     fn tree_base_for(&self, path: &str) -> Option<(String, Arc<Vec<u8>>, u32)> {
         let base_hash = self.latest_tree_at_path.get(path)?;
         let bytes = Arc::clone(self.base_cache.get(&tree_cache_key(base_hash))?);
-        let depth = self.stored_depth.get(base_hash).copied().unwrap_or(0);
+        // Unknown depth (a base this run never chained) is maxed-out, never zero: extending a
+        // chain of unknown length could overshoot the read-side reconstruction bound.
+        let depth = self.stored_depth.get(base_hash).copied().unwrap_or(u32::MAX);
 
         Some((base_hash.clone(), bytes, depth))
     }
@@ -486,14 +498,7 @@ impl Converter {
         };
 
         if self.ingest.is_some() {
-            let depth = match stored {
-                IngestStored::Delta { depth } => {
-                    self.deltas += 1;
-                    depth
-                }
-                _ => 0,
-            };
-            self.stored_depth.insert(object.hash.clone(), depth);
+            self.record_depth(&object.hash.clone(), &stored);
             self.cache_base(git_hash, Arc::new(std::mem::take(&mut object.content)));
             self.latest_blob_at_path.insert(path.to_string(), git_hash.to_string());
         }
@@ -526,7 +531,8 @@ impl Converter {
             }
         };
 
-        let depth = self.stored_depth.get(&base_hash).copied().unwrap_or(0);
+        // Unknown depth is maxed-out, never zero (see `tree_base_for`).
+        let depth = self.stored_depth.get(&base_hash).copied().unwrap_or(u32::MAX);
 
         Ok(Some((base_hash, bytes, depth)))
     }
