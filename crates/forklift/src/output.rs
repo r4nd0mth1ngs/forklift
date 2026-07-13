@@ -275,6 +275,91 @@ impl ErrorCode {
         }
     }
 
+    /// Every variant, oldest-first (the order the docs generator renders). Kept in sync with
+    /// the enum by [`ErrorCode::assert_all_covers_every_variant`] below: a variant added to the
+    /// enum without being added here fails that function's exhaustive match to compile.
+    pub const ALL: [ErrorCode; 16] = [
+        ErrorCode::Generic,
+        ErrorCode::NotAWarehouse,
+        ErrorCode::Conflict,
+        ErrorCode::Diverged,
+        ErrorCode::WarehouseLocked,
+        ErrorCode::OutOfScope,
+        ErrorCode::ScopePathTypeChanged,
+        ErrorCode::SparseWorkspace,
+        ErrorCode::OutOfScopeConflict,
+        ErrorCode::NonOriginLift,
+        ErrorCode::NarrowUnclean,
+        ErrorCode::ScopePruneBlocked,
+        ErrorCode::ChunkedTransportUnsupported,
+        ErrorCode::OversizedTransportUnsupported,
+        ErrorCode::CommitPaginationUnsupported,
+        ErrorCode::EmptyHistory,
+    ];
+
+    /// A one-line, present-tense description of the condition — the docs generator's
+    /// "Meaning" column. Plain prose only: no design section numbers or milestone names (this
+    /// text ships in generated user-facing docs).
+    pub fn description(&self) -> &'static str {
+        match self {
+            ErrorCode::Generic => "Anything without a more specific classification yet",
+            ErrorCode::NotAWarehouse => "The command needs a warehouse; this directory is none",
+            ErrorCode::Conflict => "Working state blocks the operation (unresolved / dirty)",
+            ErrorCode::Diverged => "A remote ref moved under a lift — lower, retry",
+            ErrorCode::WarehouseLocked => "Another forklift process holds the warehouse lock",
+            ErrorCode::OutOfScope => "A path argument is outside a scoped (sparse) bay's scope",
+            ErrorCode::ScopePathTypeChanged =>
+                "A scoped bay's spine path flipped dir\u{2194}file; scope no longer valid",
+            ErrorCode::SparseWorkspace =>
+                "A whole-tree verb is not supported in a scoped (sparse) bay yet",
+            ErrorCode::OutOfScopeConflict =>
+                "A scoped bay merge hit an out-of-scope entry changed on both sides",
+            ErrorCode::NonOriginLift =>
+                "A sparse workspace tried to lift to a remote other than its origin",
+            ErrorCode::NarrowUnclean =>
+                "\"narrow\" would delete a subtree that still holds uncommitted work",
+            ErrorCode::ScopePruneBlocked =>
+                "\"scope-prune\" would free a path a checkout still materializes",
+            ErrorCode::ChunkedTransportUnsupported =>
+                "A chunked large file can't go into a bundle, or is being lifted to a remote \
+                 that doesn't support chunking",
+            ErrorCode::OversizedTransportUnsupported =>
+                "An object predates the size limit and can't be sent to a remote or bundle",
+            ErrorCode::CommitPaginationUnsupported =>
+                "A lift needs a paginated commit (many objects) and the remote doesn't support \
+                 it yet",
+            ErrorCode::EmptyHistory =>
+                "\"history\" was asked to walk a pallet that has nothing stacked on it yet",
+        }
+    }
+
+    /// Exhaustive over every `ErrorCode` variant and otherwise a no-op: exists purely so that
+    /// adding a variant to the enum without adding it to [`ErrorCode::ALL`] (and this match) is a
+    /// compile error, not a docs generator that silently stops one variant short — which is
+    /// exactly the bug this whole feature exists to fix (the CLI guide's exit-code table used to
+    /// stop at 12 while the enum had grown to 16 codes).
+    #[allow(dead_code)]
+    fn assert_all_covers_every_variant(code: ErrorCode) {
+        match code {
+            ErrorCode::Generic => {}
+            ErrorCode::NotAWarehouse => {}
+            ErrorCode::Conflict => {}
+            ErrorCode::Diverged => {}
+            ErrorCode::WarehouseLocked => {}
+            ErrorCode::OutOfScope => {}
+            ErrorCode::ScopePathTypeChanged => {}
+            ErrorCode::SparseWorkspace => {}
+            ErrorCode::OutOfScopeConflict => {}
+            ErrorCode::NonOriginLift => {}
+            ErrorCode::NarrowUnclean => {}
+            ErrorCode::ScopePruneBlocked => {}
+            ErrorCode::ChunkedTransportUnsupported => {}
+            ErrorCode::OversizedTransportUnsupported => {}
+            ErrorCode::CommitPaginationUnsupported => {}
+            ErrorCode::EmptyHistory => {}
+        }
+    }
+
     /// Map a core [`RefusalCode`] to its CLI `ErrorCode`. This is the single, **exhaustive** point
     /// where the core taxonomy meets the head's exit-code table (§7.4/§7.8): the `match` is total
     /// over `RefusalCode`, so adding a refusal code in `forklift-core` without wiring its exit code

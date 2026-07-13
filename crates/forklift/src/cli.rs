@@ -758,6 +758,27 @@ pub enum Command {
     #[command(visible_alias = "v")]
     Version,
 
+    /// [internal] Print a generated documentation fragment (`bin/gen-docs` only)
+    ///
+    /// Not part of the public CLI surface: only compiled in with the `docgen` feature, which
+    /// a release build never enables, and hidden from help either way. `bin/gen-docs` is the
+    /// only intended caller.
+    #[cfg(feature = "docgen")]
+    #[command(name = "__docgen", hide = true)]
+    Docgen {
+        #[arg(value_enum)]
+        target: DocgenTarget,
+    },
+}
+
+/// Which generated documentation fragment `forklift __docgen` prints to stdout.
+#[cfg(feature = "docgen")]
+#[derive(Clone, clap::ValueEnum)]
+pub enum DocgenTarget {
+    /// The error-code / exit-code reference table (`docs/generated/errors.md`).
+    Errors,
+    /// Every command's `--json` `data` payload schema (`docs/generated/json-schemas.md`).
+    JsonSchemas,
 }
 
 #[derive(Subcommand)]

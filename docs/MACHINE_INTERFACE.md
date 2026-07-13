@@ -39,7 +39,8 @@ Failure envelope (also sets the exit code below):
 command's `data` shape changes incompatibly, so a consumer can pin it — and it *is* the
 capability-detection mechanism: check the version before relying on a field, rather than
 sniffing for the field's presence. A command's `data` shape is documented by the struct
-it emits (in `crates/forklift/src/commands/`).
+it emits (in `crates/forklift/src/commands/`) — the generated, exhaustive reference for
+every one of them is [`generated/json-schemas.md`](generated/json-schemas.md).
 
 **Version 2** (current): `history` entries carry `parents` (every parcel's parents, in
 stored order, always present — `[]` for a root); the `empty_history` error code exists
@@ -153,31 +154,15 @@ Every failure carries a stable `code` an agent can branch on, and the process ex
 with a deterministic status so a script can branch without parsing prose. `2`
 is reserved for argument/usage errors (clap); `0` is success.
 
-| `code`                    | exit | Meaning                                                          |
-|---------------------------|------|-------------------------------------------------------------------|
-| `error`                   | 1    | Anything without a more specific classification yet               |
-| `not_a_warehouse`         | 3    | The command needs a warehouse; this directory is none             |
-| `conflict`                | 4    | Working state blocks the operation (unresolved / dirty)           |
-| `diverged`                | 5    | A remote ref moved under a lift — lower, retry                     |
-| `warehouse_locked`        | 6    | Another forklift process holds the warehouse lock                 |
-| `out_of_scope`            | 7    | A path argument is outside a scoped (sparse) bay's scope          |
-| `scope_path_type_changed` | 8    | A scoped bay's spine path flipped dir↔file; scope no longer valid |
-| `sparse_workspace`        | 9    | A whole-tree verb is not supported in a scoped (sparse) bay yet   |
-| `out_of_scope_conflict`   | 10   | A scoped bay merge hit an out-of-scope entry changed on both sides |
-| `non_origin_lift`         | 11   | A sparse workspace tried to lift to a remote other than its origin |
-| `narrow_unclean`          | 12   | `narrow` would delete a subtree that still holds uncommitted work  |
-| `scope_prune_blocked`     | 13   | `scope-prune` would free a path a checkout still materializes       |
-| `chunked_transport_unsupported` | 14   | A chunked large file can't go into a bundle, or is being lifted to a remote that doesn't support chunking |
-| `oversized_transport_unsupported` | 15 | An object predates the size limit and can't be sent to a remote or bundle |
-| `commit_pagination_unsupported` | 16 | A lift needs a paginated commit (many objects) and the remote doesn't support it yet |
-| `empty_history`           | 19   | `history` was asked to walk a pallet that has nothing stacked on it yet            |
+The full table — generated from the `ErrorCode` enum the binary itself branches on, so
+it can never fall behind as codes are added — is
+[`generated/errors.md`](generated/errors.md).
 
 The codes and exit numbers are a contract: they get added to, never repurposed. A single
 `match` in the head (over `forklift-core`'s `RefusalCode`) maps a refusal to its exit code, so a
 new code cannot ship without an exit code wired to it. `empty_history` is the one exception to
 that match — a head-only condition `forklift-core` never raises, classified directly in the head
-(`crates/forklift/src/output.rs`) rather than through a `RefusalCode`. Exit codes 17 and 18 are
-reserved for future features and are not yet assigned to any code.
+(`crates/forklift/src/output.rs`) rather than through a `RefusalCode`.
 
 A refusal a **remote** raises carries the same code: the server tags its JSON error body with the
 stable `code` (see `format/REMOTE_PROTOCOL.md`), and the client classifies it with the same code

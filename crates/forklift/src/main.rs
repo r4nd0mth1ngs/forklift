@@ -5,6 +5,8 @@ use crate::output::{ErrorCode, ForkliftError, OutputMode};
 
 pub mod cli;
 pub mod commands;
+#[cfg(feature = "docgen")]
+pub mod docgen;
 pub mod output;
 pub mod pager;
 pub mod passphrase;
@@ -223,5 +225,14 @@ async fn dispatch(cli: Cli) -> Result<(), String> {
         Command::Unload { path } => commands::unload::handle_command(&path),
         Command::Version => commands::version::handle_command(),
         Command::SelfUpdate { check } => commands::self_update::handle_command(check).await,
+        #[cfg(feature = "docgen")]
+        Command::Docgen { target } => {
+            use crate::cli::DocgenTarget;
+            match target {
+                DocgenTarget::Errors => print!("{}", docgen::render_errors()),
+                DocgenTarget::JsonSchemas => print!("{}", docgen::render_json_schemas()),
+            }
+            Ok(())
+        }
     }
 }

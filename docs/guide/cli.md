@@ -1158,30 +1158,13 @@ what you've `load`ed — it doesn't stage for you). `diff`, `restore`, `tag`, `s
 
 ## 11. Exit codes
 
-Errors set a deterministic exit code so scripts branch without parsing prose:
+Errors set a deterministic exit code so scripts branch without parsing prose. `0` is
+success and `2` is clap's own usage/argument error; every other code is one of forklift's
+own classified failures.
 
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | Generic error |
-| 2 | Usage / argument error |
-| 3 | Not a warehouse |
-| 4 | Conflict (working state blocks the operation) |
-| 5 | Diverged (a remote ref moved under a lift) |
-| 6 | Warehouse locked (another forklift process holds it) |
-| 7 | Out of scope (a path argument is outside a scoped bay's scope) |
-| 8 | Scope path type changed (a scoped bay's spine path flipped dir↔file) |
-| 9 | Sparse workspace (a whole-tree verb is not supported in a scoped bay yet) |
-| 10 | Out of scope conflict (a scoped bay merge hit an out-of-scope entry changed on both sides) |
-| 11 | Non-origin lift (a sparse workspace tried to lift to a remote other than its origin) |
-| 12 | Narrow unclean (`narrow` would delete a subtree that still holds uncommitted work) |
-| 13 | Scope prune blocked (`scope-prune` would free a path a checkout still materializes) |
-| 14 | Chunked transport unsupported (a chunked large file can't go into a bundle, or is being lifted to a remote that doesn't support chunking) |
-| 15 | Oversized transport unsupported (an object predates the size limit and can't be sent to a remote or bundle) |
-| 16 | Commit pagination unsupported (a lift needs a paginated commit and the remote doesn't support it yet) |
-| 19 | Empty history (`history` was asked to walk a pallet that has nothing stacked on it yet) |
-
-(17 and 18 are reserved for future features and are not yet assigned to any code.)
+The full, always-current table — generated from the same enum the binary itself
+branches on, so it can never fall behind — is
+[`../generated/errors.md`](../generated/errors.md).
 
 With `--json`, the same classification appears as `error.code` in the output
 envelope. See [`../MACHINE_INTERFACE.md`](../MACHINE_INTERFACE.md).
