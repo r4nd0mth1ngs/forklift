@@ -1059,8 +1059,10 @@ value. Known keys:
 | `operator.name` | Your display name (local only — never written on-chain). |
 | `operator.identifier` | Your on-chain operator id (opaque; a UUID is minted if unset). |
 | `operator.profile` | The named profile this warehouse acts under (see `profile`). |
-| `remote.url` | The remote warehouse URL (for `lift`/`lower`). |
+| `remote.url` | The remote warehouse URL (for `lift`/`lower`). Can be a Tor `.onion` — see [Reaching a remote over Tor](#reaching-a-remote-over-tor). |
 | `remote.token` | The bearer token, when the remote requires one. |
+| `remote.tor` | Reach the remote over Tor: `auto` (default — only `.onion` remotes), `on` (every remote), `off` (never). |
+| `remote.torProxy` | The Tor SOCKS proxy (default `socks5h://127.0.0.1:9050`). |
 | `maintenance.auto` | Auto-compact after mutating commands (`false`/`0`/`off`/`no` to disable; default on). |
 | `maintenance.loose` | Loose-object count that triggers an auto incremental compact (default 6700). |
 | `maintenance.packs` | Pack count that triggers an auto consolidating repack (default 20). |
@@ -1086,6 +1088,32 @@ loss — can never lose or truncate committed data. Set it to `0`, `off`, `false
 or `no` to skip all fsyncing: markedly faster for **bulk, disposable** work (large
 imports, CI, throwaway fixtures) where a mid-run crash just means re-running the
 whole operation. Leave it on for any warehouse whose history you intend to keep.
+
+### Reaching a remote over Tor
+
+Forklift can reach a remote through Tor — the payoff is **NAT traversal**: collaborate with a
+remote that has **no fixed IP and no port-forwarding**, because a Tor `.onion` address is
+reachable from anywhere on the Tor network. Tor is the mechanism, not the point.
+
+By default (`remote.tor = auto`) this is invisible and opt-in per remote: a `.onion` remote is
+routed through your local Tor SOCKS proxy automatically, and every other remote is dialed
+directly and unchanged. So an onion URL Just Works while a plain `http(s)` remote behaves
+exactly as before.
+
+```sh
+forklift config remote.torProxy socks5h://127.0.0.1:9150   # e.g. Tor Browser's SOCKS port
+forklift config --global remote.tor on                     # route every remote through Tor
+```
+
+- `remote.tor` — `auto` (default, onion-only), `on` (every remote — e.g. reach a clearnet
+  remote anonymously), or `off` (never, even a `.onion`).
+- `remote.torProxy` — where your local `tor` listens; default `socks5h://127.0.0.1:9050`. The
+  `socks5h` scheme resolves the host **at the proxy**, which is what lets an opaque `.onion`
+  name (it has no DNS record) resolve inside the Tor network.
+
+You need a local `tor` daemon running for this; nothing here uses the Tor Browser. The
+transport adds **no new dependency** — it flips on the SOCKS5 client already vendored in the
+HTTP stack.
 
 ---
 

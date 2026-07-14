@@ -48,6 +48,20 @@ pub const KEY_REMOTE_TOKEN: &str = "remote.token";
 /// franchise, which has the whole closure and can lift anywhere.
 pub const KEY_REMOTE_ORIGIN: &str = "remote.origin";
 
+/// Whether to reach the remote through a Tor SOCKS proxy — the peer-to-peer transport
+/// (DESIGN.html §4.7). `auto` (the default when unset) routes through Tor only when the
+/// remote is an onion service (its host ends in `.onion`), so a plain remote is untouched
+/// and a `.onion` one Just Works; `on` always routes through Tor (e.g. to reach a clearnet
+/// remote anonymously); `off` never does, even for an onion host. See
+/// `crate::util::remote_utils::TorMode`.
+pub const KEY_REMOTE_TOR: &str = "remote.tor";
+
+/// The Tor SOCKS proxy the client dials when [`KEY_REMOTE_TOR`] applies (default
+/// `socks5h://127.0.0.1:9050`, the address a stock local `tor` listens on). The `socks5h`
+/// scheme resolves the hostname *at the proxy*, which is what lets an opaque `.onion` name —
+/// which has no DNS record — resolve inside the Tor network rather than failing locally.
+pub const KEY_REMOTE_TOR_PROXY: &str = "remote.torProxy";
+
 /// Whether background object-store maintenance (auto-compaction) runs after mutating
 /// commands. Anything falsey (`false`/`0`/`off`/`no`) turns it off; default is on.
 pub const KEY_MAINTENANCE_AUTO: &str = "maintenance.auto";
@@ -60,9 +74,10 @@ pub const KEY_MAINTENANCE_PACKS: &str = "maintenance.packs";
 
 /// The configuration keys Forklift understands, in `section.key` form.
 /// Setting a key outside this list is rejected (it would silently do nothing).
-pub const KNOWN_KEYS: [&str; 9] = [
+pub const KNOWN_KEYS: [&str; 11] = [
     KEY_OPERATOR_NAME, KEY_OPERATOR_IDENTIFIER, KEY_OPERATOR_PROFILE, KEY_REMOTE_URL, KEY_REMOTE_TOKEN,
-    KEY_REMOTE_ORIGIN, KEY_MAINTENANCE_AUTO, KEY_MAINTENANCE_LOOSE, KEY_MAINTENANCE_PACKS,
+    KEY_REMOTE_ORIGIN, KEY_REMOTE_TOR, KEY_REMOTE_TOR_PROXY, KEY_MAINTENANCE_AUTO, KEY_MAINTENANCE_LOOSE,
+    KEY_MAINTENANCE_PACKS,
 ];
 
 /// The global-config section that holds the named profiles (`[profile.<name>]`).
