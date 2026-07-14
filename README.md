@@ -11,6 +11,7 @@ Detailed guides live in [`docs/guide/`](docs/guide/README.md):
 
 - **[User guide](docs/guide/cli.md)** — every CLI command, organized by workflow, with examples.
 - **[Trust & identity](docs/guide/trust-and-identity.md)** — signing, users, roles, agents, key protection.
+- **[Peer-to-peer over Tor](docs/guide/p2p-tor.md)** — work on a warehouse with friends with no server, over Tor onion services.
 - **[Machine & agent interface](docs/MACHINE_INTERFACE.md)** — `--json`, stable errors, the MCP server.
 - **[VCS comparison](docs/COMPARISON.md)** — honest comparison of Forklift vs. git, jujutsu, sapling, and pijul.
 - **[Running a server](docs/SERVER.md)** — self-host a forklift remote.

@@ -171,6 +171,23 @@ Pin a version for controlled rollouts with `FORKLIFT_VERSION=v0.1.0`, or point
 `FORKLIFT_BASE_URL` at a mirror for air-gapped hosts. The serverless (Lambda) head follows the
 same principle — you ship a new function version rather than self-mutating.
 
+## Peer-to-peer over Tor
+
+Pass `--tor` to publish the bound address as a **Tor onion service** — reachable from anywhere
+with no fixed IP, port-forwarding or NAT configuration, so a small group can share a warehouse
+peer-to-peer with no hosted server:
+
+```sh
+forklift-server serve --root . --addr 127.0.0.1:0 --tor --token <secret>
+# prints:  forklift-server onion service at http://<onion>.onion
+```
+
+Needs a running `tor` with a `ControlPort` (default `127.0.0.1:9051`; cookie or
+`--tor-control-password` auth). Add `--tor-onion-key <path>` to persist the key and keep one
+stable `.onion` across restarts. Peers connect with `forklift franchise http://<onion>.onion …`
+— the client routes `.onion` remotes through Tor automatically. Full walkthrough:
+[`guide/p2p-tor.md`](guide/p2p-tor.md).
+
 ## TLS and hardening
 
 Terminate TLS at a reverse proxy — this is the supported deployment:
